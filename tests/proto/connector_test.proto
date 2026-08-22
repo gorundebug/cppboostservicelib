@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package servicelib.test;
+
+service ConnectorTest {
+  rpc Unary(EchoRequest) returns (EchoResponse);
+  rpc ClientStreaming(stream EchoRequest) returns (EchoResponse);
+  rpc ServerStreaming(EchoRequest) returns (stream EchoResponse);
+  rpc BidirectionalStreaming(stream EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  string value = 1;
+}
+
+message EchoResponse {
+  string value = 1;
+}

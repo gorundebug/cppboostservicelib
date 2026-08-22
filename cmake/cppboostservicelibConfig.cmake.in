@@ -1,0 +1,72 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Boost 1.75 COMPONENTS json)
+find_dependency(Threads)
+find_dependency(yaml-cpp 0.7)
+if(@CPPBOOSTSERVICELIB_ENABLE_GRPC@)
+  find_dependency(Protobuf CONFIG)
+  find_dependency(gRPC CONFIG)
+  find_dependency(asio-grpc CONFIG)
+endif()
+if(@CPPBOOSTSERVICELIB_ENABLE_KAFKA@)
+  find_package(RdKafka CONFIG QUIET)
+  if(NOT TARGET RdKafka::rdkafka)
+    find_path(_cppboostservicelib_rdkafka_include
+        NAMES librdkafka/rdkafka.h rdkafka.h)
+    find_library(_cppboostservicelib_rdkafka_library NAMES rdkafka)
+    if(NOT _cppboostservicelib_rdkafka_include OR
+       NOT _cppboostservicelib_rdkafka_library)
+      set(cppboostservicelib_FOUND FALSE)
+      set(cppboostservicelib_NOT_FOUND_MESSAGE
+          "librdkafka headers or library were not found")
+      return()
+    endif()
+    add_library(RdKafka::rdkafka UNKNOWN IMPORTED)
+    set_target_properties(RdKafka::rdkafka PROPERTIES
+        IMPORTED_LOCATION "${_cppboostservicelib_rdkafka_library}"
+        INTERFACE_INCLUDE_DIRECTORIES
+            "${_cppboostservicelib_rdkafka_include}")
+    unset(_cppboostservicelib_rdkafka_include)
+    unset(_cppboostservicelib_rdkafka_library)
+  endif()
+endif()
+if(@CPPBOOSTSERVICELIB_ENABLE_OTEL@)
+  find_dependency(opentelemetry-cpp CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/cppboostservicelibTargets.cmake")
+
+if(@CPPBOOSTSERVICELIB_ENABLE_GRPC@ AND NOT TARGET servicelib::grpc)
+  add_library(servicelib::grpc INTERFACE IMPORTED)
+  set_property(TARGET servicelib::grpc PROPERTY INTERFACE_LINK_LIBRARIES
+      servicelib::servicelib asio-grpc::asio-grpc gRPC::grpc++)
+endif()
+
+if(@CPPBOOSTSERVICELIB_ENABLE_KAFKA@ AND NOT TARGET servicelib::kafka)
+  add_library(servicelib::kafka INTERFACE IMPORTED)
+  set_property(TARGET servicelib::kafka PROPERTY INTERFACE_LINK_LIBRARIES
+      servicelib::servicelib RdKafka::rdkafka)
+endif()
+
+if(@CPPBOOSTSERVICELIB_ENABLE_OTEL@ AND NOT TARGET servicelib::otel)
+  add_library(servicelib::otel INTERFACE IMPORTED)
+  set_property(TARGET servicelib::otel PROPERTY INTERFACE_LINK_LIBRARIES
+      servicelib::servicelib
+      opentelemetry-cpp::trace
+      opentelemetry-cpp::logs
+      opentelemetry-cpp::otlp_grpc_exporter
+      opentelemetry-cpp::otlp_grpc_log_record_exporter
+      opentelemetry-cpp::ostream_span_exporter)
+endif()
+
+if(TARGET yaml-cpp::yaml-cpp)
+  set(_cppboostservicelib_yaml_target yaml-cpp::yaml-cpp)
+else()
+  set(_cppboostservicelib_yaml_target yaml-cpp)
+endif()
+set_property(TARGET servicelib::servicelib APPEND PROPERTY
+    INTERFACE_LINK_LIBRARIES
+    Boost::headers Boost::json Threads::Threads
+    ${_cppboostservicelib_yaml_target})
+unset(_cppboostservicelib_yaml_target)

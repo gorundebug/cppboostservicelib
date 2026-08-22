@@ -1,0 +1,32 @@
+name: cppboostservicelib
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build libboost-dev libboost-json1.83-dev libyaml-cpp-dev ${{ matrix.compiler }}
+      - run: cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+      - run: cmake --build build/ci --parallel
+      - run: ctest --test-dir build/ci --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [asan-ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build libboost-dev libboost-json1.83-dev libyaml-cpp-dev
+      - run: cmake --preset ${{ matrix.preset }}
+      - run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - run: ctest --preset ${{ matrix.preset }}

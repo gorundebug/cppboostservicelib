@@ -1,0 +1,18 @@
+# Revisions are deliberately centralized. Updating one requires running the
+# clean-machine build, connector integration suite and comparative benchmark.
+set(CPPBOOSTSERVICELIB_BOOST_REPOSITORY "https://github.com/boostorg/boost" CACHE STRING "Pinned Boost repository")
+set(CPPBOOSTSERVICELIB_BOOST_VERSION "1.89.0" CACHE STRING "Pinned Boost")
+set(CPPBOOSTSERVICELIB_GRPC_REPOSITORY "https://github.com/grpc/grpc" CACHE STRING "Pinned gRPC repository")
+set(CPPBOOSTSERVICELIB_GRPC_VERSION "v1.71.0" CACHE STRING "Pinned gRPC")
+set(CPPBOOSTSERVICELIB_PROTOBUF_REPOSITORY "https://github.com/protocolbuffers/protobuf" CACHE STRING "Pinned protobuf repository")
+set(CPPBOOSTSERVICELIB_PROTOBUF_VERSION "v29.3" CACHE STRING "Pinned protobuf")
+set(CPPBOOSTSERVICELIB_ASIO_GRPC_REPOSITORY "https://github.com/Tradias/asio-grpc" CACHE STRING "Pinned asio-grpc repository")
+set(CPPBOOSTSERVICELIB_ASIO_GRPC_VERSION "v3.5.0" CACHE STRING "Pinned asio-grpc")
+set(CPPBOOSTSERVICELIB_YAML_CPP_REPOSITORY "https://github.com/jbeder/yaml-cpp" CACHE STRING "Pinned yaml-cpp repository")
+set(CPPBOOSTSERVICELIB_YAML_CPP_VERSION "0.8.0" CACHE STRING "Pinned yaml-cpp")
+set(CPPBOOSTSERVICELIB_RDKAFKA_REPOSITORY "https://github.com/confluentinc/librdkafka" CACHE STRING "Pinned librdkafka repository")
+set(CPPBOOSTSERVICELIB_RDKAFKA_VERSION "v2.8.0" CACHE STRING "Pinned librdkafka")
+set(CPPBOOSTSERVICELIB_OPENTELEMETRY_REPOSITORY "https://github.com/open-telemetry/opentelemetry-cpp" CACHE STRING "Pinned OpenTelemetry C++ repository")
+set(CPPBOOSTSERVICELIB_OPENTELEMETRY_VERSION "v1.20.0" CACHE STRING "Pinned OpenTelemetry C++")
+set(CPPBOOSTSERVICELIB_GOOGLETEST_REPOSITORY "https://github.com/google/googletest" CACHE STRING "Pinned GoogleTest repository")
+set(CPPBOOSTSERVICELIB_GOOGLETEST_VERSION "v1.15.2" CACHE STRING "Pinned GoogleTest")
