@@ -123,11 +123,11 @@ elseif(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "LOCAL")
 elseif(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "FETCH")
   set(BOOST_INCLUDE_LIBRARIES asio beast json CACHE STRING "" FORCE)
   FetchContent_Declare(boost
-      URL "${CPPBOOSTSERVICELIB_BOOST_REPOSITORY}/releases/download/boost-${CPPBOOSTSERVICELIB_BOOST_VERSION}/boost-${CPPBOOSTSERVICELIB_BOOST_VERSION}-cmake.tar.xz")
+      URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/boostorg/boost/releases/download/boost-${CPPBOOSTSERVICELIB_BOOST_VERSION}/boost-${CPPBOOSTSERVICELIB_BOOST_VERSION}-cmake.tar.xz")
   set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(yaml-cpp
-      URL "${CPPBOOSTSERVICELIB_YAML_CPP_REPOSITORY}/archive/refs/tags/${CPPBOOSTSERVICELIB_YAML_CPP_VERSION}.tar.gz"
+      URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/jbeder/yaml-cpp/archive/refs/tags/${CPPBOOSTSERVICELIB_YAML_CPP_VERSION}.tar.gz"
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
   FetchContent_MakeAvailable(boost yaml-cpp)
   set(CPPBOOSTSERVICELIB_BOOST_BUILD_INCLUDE_DIR "${boost_SOURCE_DIR}")
@@ -143,7 +143,7 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
   if(NOT TARGET GTest::gtest_main)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(googletest
-        URL "${CPPBOOSTSERVICELIB_GOOGLETEST_REPOSITORY}/archive/refs/tags/${CPPBOOSTSERVICELIB_GOOGLETEST_VERSION}.tar.gz"
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/google/googletest/archive/refs/tags/${CPPBOOSTSERVICELIB_GOOGLETEST_VERSION}.tar.gz"
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
     FetchContent_MakeAvailable(googletest)
   endif()
@@ -183,10 +183,10 @@ if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
     set(gRPC_BUILD_GRPC_PHP_PLUGIN OFF CACHE BOOL "" FORCE)
     set(gRPC_BUILD_GRPC_PYTHON_PLUGIN OFF CACHE BOOL "" FORCE)
     set(gRPC_BUILD_GRPC_RUBY_PLUGIN OFF CACHE BOOL "" FORCE)
-    # Use the revisions recorded by the pinned gRPC release for its tightly
-    # coupled C/C++ dependencies. Fetching every gRPC submodule also downloads
-    # large, unused repositories such as googleapis and makes a clean-machine
-    # quickstart needlessly slow.
+    # Use immutable archives and the revisions recorded by the pinned gRPC
+    # release for its tightly coupled C/C++ dependencies. Besides avoiding
+    # unused submodules such as googleapis, URL downloads can be served by the
+    # optional shared Nexus raw proxy instead of reaching GitHub again.
     set(gRPC_ABSL_PROVIDER module CACHE STRING "" FORCE)
     set(gRPC_CARES_PROVIDER module CACHE STRING "" FORCE)
     set(gRPC_PROTOBUF_PROVIDER module CACHE STRING "" FORCE)
@@ -200,22 +200,45 @@ if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
     set(gRPC_SSL_PROVIDER package CACHE STRING "" FORCE)
     set(gRPC_ZLIB_PROVIDER package CACHE STRING "" FORCE)
     FetchContent_Declare(grpc
-        GIT_REPOSITORY "${CPPBOOSTSERVICELIB_GRPC_REPOSITORY}"
-        GIT_TAG "${CPPBOOSTSERVICELIB_GRPC_VERSION}"
-        GIT_SHALLOW TRUE
-        GIT_PROGRESS ${CPPBOOSTSERVICELIB_FETCH_PROGRESS}
-        GIT_SUBMODULES
-          third_party/abseil-cpp
-          third_party/cares/cares
-          third_party/protobuf
-          third_party/re2
-        GIT_SUBMODULES_RECURSE FALSE)
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/grpc/grpc/archive/refs/tags/${CPPBOOSTSERVICELIB_GRPC_VERSION}.tar.gz"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+    FetchContent_GetProperties(grpc)
+    if(NOT grpc_POPULATED)
+      FetchContent_Populate(grpc)
+    endif()
+    FetchContent_Declare(grpc-abseil
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/abseil/abseil-cpp/archive/${CPPBOOSTSERVICELIB_GRPC_ABSEIL_REVISION}.tar.gz"
+        SOURCE_DIR "${grpc_SOURCE_DIR}/third_party/abseil-cpp"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+    FetchContent_Declare(grpc-cares
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/c-ares/c-ares/archive/${CPPBOOSTSERVICELIB_GRPC_CARES_REVISION}.tar.gz"
+        SOURCE_DIR "${grpc_SOURCE_DIR}/third_party/cares/cares"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+    FetchContent_Declare(grpc-protobuf
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/protocolbuffers/protobuf/archive/${CPPBOOSTSERVICELIB_GRPC_PROTOBUF_REVISION}.tar.gz"
+        SOURCE_DIR "${grpc_SOURCE_DIR}/third_party/protobuf"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+    FetchContent_Declare(grpc-re2
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/google/re2/archive/${CPPBOOSTSERVICELIB_GRPC_RE2_REVISION}.tar.gz"
+        SOURCE_DIR "${grpc_SOURCE_DIR}/third_party/re2"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+    FetchContent_Declare(grpc-opencensus-proto
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/census-instrumentation/opencensus-proto/archive/refs/tags/${CPPBOOSTSERVICELIB_GRPC_OPENCENSUS_PROTO_VERSION}.tar.gz"
+        SOURCE_DIR "${grpc_SOURCE_DIR}/third_party/opencensus-proto"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+    foreach(_servicelib_grpc_dependency IN ITEMS
+            grpc-abseil grpc-cares grpc-protobuf grpc-re2
+            grpc-opencensus-proto)
+      FetchContent_GetProperties(${_servicelib_grpc_dependency})
+      if(NOT ${_servicelib_grpc_dependency}_POPULATED)
+        FetchContent_Populate(${_servicelib_grpc_dependency})
+      endif()
+    endforeach()
     FetchContent_Declare(asio-grpc
-        GIT_REPOSITORY "${CPPBOOSTSERVICELIB_ASIO_GRPC_REPOSITORY}"
-        GIT_TAG "${CPPBOOSTSERVICELIB_ASIO_GRPC_VERSION}"
-        GIT_SHALLOW TRUE
-        GIT_PROGRESS ${CPPBOOSTSERVICELIB_FETCH_PROGRESS})
-    FetchContent_MakeAvailable(grpc asio-grpc)
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/Tradias/asio-grpc/archive/refs/tags/${CPPBOOSTSERVICELIB_ASIO_GRPC_VERSION}.tar.gz"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+    add_subdirectory("${grpc_SOURCE_DIR}" "${grpc_BINARY_DIR}")
+    FetchContent_MakeAvailable(asio-grpc)
   endif()
 
   # Installed gRPC exports namespaced targets; its source-tree build exposes
@@ -271,10 +294,8 @@ if(CPPBOOSTSERVICELIB_ENABLE_KAFKA)
     set(RDKAFKA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(RDKAFKA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(librdkafka
-        GIT_REPOSITORY "${CPPBOOSTSERVICELIB_RDKAFKA_REPOSITORY}"
-        GIT_TAG "${CPPBOOSTSERVICELIB_RDKAFKA_VERSION}"
-        GIT_SHALLOW TRUE
-        GIT_PROGRESS ${CPPBOOSTSERVICELIB_FETCH_PROGRESS})
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/confluentinc/librdkafka/archive/refs/tags/${CPPBOOSTSERVICELIB_RDKAFKA_VERSION}.tar.gz"
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
     FetchContent_MakeAvailable(librdkafka)
     _servicelib_normalize_librdkafka_cmake_config(
         "${librdkafka_BINARY_DIR}/generated/config.h")
@@ -337,6 +358,21 @@ if(CPPBOOSTSERVICELIB_ENABLE_OTEL)
     set(CMAKE_FIND_PACKAGE_PREFER_CONFIG TRUE)
     set(BUILD_TESTING OFF)
     _servicelib_prepare_otel_package_bridge()
+    if(NOT OTELCPP_PROTO_PATH)
+      set(_servicelib_otel_proto_source
+          "${CMAKE_BINARY_DIR}/_deps/opentelemetry-cpp-build/opentelemetry-proto-prefix/src/opentelemetry-proto")
+      FetchContent_Declare(opentelemetry-proto-source
+          URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/open-telemetry/opentelemetry-proto/archive/refs/tags/${CPPBOOSTSERVICELIB_OPENTELEMETRY_PROTO_VERSION}.tar.gz"
+          SOURCE_DIR "${_servicelib_otel_proto_source}"
+          DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+      FetchContent_GetProperties(opentelemetry-proto-source)
+      if(NOT opentelemetry-proto-source_POPULATED)
+        FetchContent_Populate(opentelemetry-proto-source)
+      endif()
+      set(OTELCPP_PROTO_PATH "${_servicelib_otel_proto_source}" CACHE PATH
+          "Pinned OpenTelemetry proto source" FORCE)
+      unset(_servicelib_otel_proto_source)
+    endif()
     # Use the immutable release archive instead of a recursive Git checkout.
     # The upstream repository declares development-only submodules (including
     # vcpkg) that are not needed by the CMake OTLP build but make a clean
@@ -358,7 +394,7 @@ if(CPPBOOSTSERVICELIB_ENABLE_OTEL)
           -P ${CMAKE_CURRENT_LIST_DIR}/PatchOpenTelemetryHostTools.cmake)
     endif()
     FetchContent_Declare(opentelemetry-cpp
-        URL "${CPPBOOSTSERVICELIB_OPENTELEMETRY_REPOSITORY}/archive/refs/tags/${CPPBOOSTSERVICELIB_OPENTELEMETRY_VERSION}.tar.gz"
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/open-telemetry/opentelemetry-cpp/archive/refs/tags/${CPPBOOSTSERVICELIB_OPENTELEMETRY_VERSION}.tar.gz"
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
         ${_servicelib_otel_patch_command})
     FetchContent_MakeAvailable(opentelemetry-cpp)
