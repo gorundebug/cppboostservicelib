@@ -226,12 +226,29 @@ if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
         URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/census-instrumentation/opencensus-proto/archive/refs/tags/${CPPBOOSTSERVICELIB_GRPC_OPENCENSUS_PROTO_VERSION}.tar.gz"
         SOURCE_DIR "${grpc_SOURCE_DIR}/third_party/opencensus-proto"
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
-    foreach(_servicelib_grpc_dependency IN ITEMS
-            grpc-abseil grpc-cares grpc-protobuf grpc-re2
-            grpc-opencensus-proto)
-      FetchContent_GetProperties(${_servicelib_grpc_dependency})
-      if(NOT ${_servicelib_grpc_dependency}_POPULATED)
-        FetchContent_Populate(${_servicelib_grpc_dependency})
+    # A prepared gRPC source cache already contains these dependencies.  The
+    # cache is intentionally mounted read-only by consumers, so do not ask
+    # FetchContent to extract the same archives over the populated tree.
+    # Populate only the pieces that are genuinely absent from a fresh gRPC
+    # release archive.
+    foreach(_servicelib_grpc_dependency_and_marker IN ITEMS
+            "grpc-abseil|third_party/abseil-cpp/absl/base/config.h"
+            "grpc-cares|third_party/cares/cares/include/ares.h"
+            "grpc-protobuf|third_party/protobuf/src/google/protobuf/message.h"
+            "grpc-re2|third_party/re2/re2/re2.h"
+            "grpc-opencensus-proto|third_party/opencensus-proto/src/opencensus/proto/trace/v1/trace.proto")
+      string(REPLACE "|" ";" _servicelib_grpc_dependency_parts
+             "${_servicelib_grpc_dependency_and_marker}")
+      list(GET _servicelib_grpc_dependency_parts 0
+           _servicelib_grpc_dependency)
+      list(GET _servicelib_grpc_dependency_parts 1
+           _servicelib_grpc_dependency_marker)
+      if(NOT EXISTS
+         "${grpc_SOURCE_DIR}/${_servicelib_grpc_dependency_marker}")
+        FetchContent_GetProperties(${_servicelib_grpc_dependency})
+        if(NOT ${_servicelib_grpc_dependency}_POPULATED)
+          FetchContent_Populate(${_servicelib_grpc_dependency})
+        endif()
       endif()
     endforeach()
     FetchContent_Declare(asio-grpc
