@@ -209,7 +209,6 @@ inline constexpr std::array kDataConnectorImplementationMap{
     std::pair{"python/apscheduler"sv, DataConnectorImplementation::kPythonAPScheduler},
     std::pair{"rust/croner"sv, DataConnectorImplementation::kRustCroner},
     std::pair{"node/croner"sv, DataConnectorImplementation::kNodeCroner},
-    std::pair{"cpp/libcron"sv, DataConnectorImplementation::kCppLibcron},
     std::pair{"temporal/go"sv, DataConnectorImplementation::kTemporalGo},
     std::pair{"temporal/python"sv, DataConnectorImplementation::kTemporalPython},
     std::pair{"temporal/typescript"sv, DataConnectorImplementation::kTemporalTypeScript}};
