@@ -38,6 +38,31 @@ struct TestConfig final : servicelib::config::IConfig {
       const override { return {}; }
 };
 
+struct TemporalTopologyConfig final : servicelib::config::IConfig {
+  std::vector<const servicelib::config::ServiceConfig*> GetServices()
+      const override { return {}; }
+  std::vector<servicelib::config::StreamConfigRef> GetStreams()
+      const override { return {}; }
+  std::vector<servicelib::config::DataConnectorConfigRef> GetDataConnectors()
+      const override { return {cronConnector, temporalConnector}; }
+  std::vector<servicelib::config::EndpointConfigRef> GetEndpoints()
+      const override { return {cronEndpoint, temporalEndpoint}; }
+  std::vector<const servicelib::config::PoolConfig*> GetPools()
+      const override { return {}; }
+  std::vector<const servicelib::config::LinkConfig*> GetLinks()
+      const override { return {&durableLink}; }
+  std::vector<const servicelib::config::ModuleConfig*> GetModules()
+      const override { return {}; }
+  std::vector<const servicelib::config::TypeConfig*> GetTypes()
+      const override { return {}; }
+
+  servicelib::config::CronDataConnectorConfig cronConnector;
+  servicelib::config::TemporalDataConnectorConfig temporalConnector;
+  servicelib::config::CronEndpointConfig cronEndpoint;
+  servicelib::config::TemporalEndpointConfig temporalEndpoint;
+  servicelib::config::LinkConfig durableLink;
+};
+
 TestConfig MakeConfig(servicelib::config::TypeTag<TestConfig>) {
   return {};
 }
@@ -119,6 +144,110 @@ int main() {
          DataConnectorImplementation::kAsioGRPC);
   assert(ParseImplementation("librdkafka") ==
          DataConnectorImplementation::kLibrdkafka);
+
+  const auto topology = YAML::Load(R"(
+cronConnector:
+  id: 31
+  name: local-scheduler
+  implementation: node/croner
+temporalConnector:
+  id: 32
+  name: temporal
+  implementation: temporal/go
+  address: temporal:7233
+  namespace: servicegen
+  identity: automation-service
+  maxConcurrentActivities: 12
+  maxConcurrentWorkflows: 7
+cronEndpoint:
+  id: 41
+  name: hourly-trigger
+  idDataConnector: 31
+  enabled: true
+  schedule: "0 * * * *"
+  timezone: Europe/Moscow
+  overlapPolicy: Skip
+  missedRunPolicy: FireOnce
+temporalEndpoint:
+  id: 42
+  name: durable-trigger
+  idDataConnector: 32
+  enabled: true
+  taskQueue: automation
+  schedule: "15 * * * *"
+  scheduleId: hourly-automation
+  timezone: UTC
+  overlapPolicy: Allow
+  missedRunPolicy: Skip
+  workflowExecutionTimeout: 60000
+  activityStartToCloseTimeout: 10000
+  activityHeartbeatTimeout: 1000
+  maximumAttempts: 5
+link:
+  from: 51
+  to: 52
+  callSemantics: DurableCall
+  idDataConnector: 32
+)");
+  const servicelib::config::YamlValue topologyValue(topology);
+  const auto cronConnector = topologyValue["cronConnector"]
+                                 .As<servicelib::config::CronDataConnectorConfig>();
+  assert(cronConnector.GetType() == servicelib::api::DataConnectorType::kCron);
+  assert(cronConnector.id == 31);
+  const auto temporalConnector = topologyValue["temporalConnector"]
+                                     .As<servicelib::config::TemporalDataConnectorConfig>();
+  assert(temporalConnector.namespaceName == "servicegen");
+  assert(temporalConnector.maxConcurrentActivities == 12);
+  const auto cronEndpoint = topologyValue["cronEndpoint"]
+                                .As<servicelib::config::CronEndpointConfig>();
+  assert(cronEndpoint.enabled);
+  assert(cronEndpoint.schedule == "0 * * * *");
+  assert(cronEndpoint.missedRunPolicy ==
+         servicelib::api::ScheduleMissedRunPolicy::kFireOnce);
+  const auto temporalEndpoint = topologyValue["temporalEndpoint"]
+                                    .As<servicelib::config::TemporalEndpointConfig>();
+  assert(temporalEndpoint.taskQueue == "automation");
+  assert(temporalEndpoint.maximumAttempts == 5);
+  const auto durableLink =
+      topologyValue["link"].As<servicelib::config::LinkConfig>();
+  assert(durableLink.callSemantics.has_value());
+  assert(durableLink.callSemantics->durableCall.has_value());
+  assert(durableLink.callSemantics->durableCall->idDataConnector == 32);
+
+  TemporalTopologyConfig topologyConfig;
+  topologyConfig.cronConnector.id = 31;
+  topologyConfig.cronConnector.name = "local-scheduler";
+  topologyConfig.temporalConnector.id = 32;
+  topologyConfig.temporalConnector.name = "temporal";
+  topologyConfig.cronEndpoint.id = 41;
+  topologyConfig.cronEndpoint.name = "hourly-trigger";
+  topologyConfig.cronEndpoint.idDataConnector = 31;
+  topologyConfig.temporalEndpoint.id = 42;
+  topologyConfig.temporalEndpoint.name = "durable-trigger";
+  topologyConfig.temporalEndpoint.idDataConnector = 32;
+  topologyConfig.durableLink.from = 51;
+  topologyConfig.durableLink.to = 52;
+  topologyConfig.durableLink.callSemantics =
+      servicelib::config::MakeCallSemanticsGroup(
+          servicelib::api::CallSemantics::kDurableCall, {}, 0, false, 32);
+  (void)servicelib::config::RuntimeConfig{topologyConfig};
+  topologyConfig.durableLink.callSemantics->durableCall->idDataConnector = 31;
+  bool rejectedWrongDurableConnector = false;
+  try {
+    (void)servicelib::config::RuntimeConfig{topologyConfig};
+  } catch (const std::runtime_error&) {
+    rejectedWrongDurableConnector = true;
+  }
+  assert(rejectedWrongDurableConnector);
+  topologyConfig.durableLink.callSemantics->durableCall->idDataConnector = 32;
+  topologyConfig.cronEndpoint.idDataConnector = 32;
+  bool rejectedWrongEndpointConnector = false;
+  try {
+    (void)servicelib::config::RuntimeConfig{topologyConfig};
+  } catch (const std::runtime_error&) {
+    rejectedWrongEndpointConnector = true;
+  }
+  assert(rejectedWrongEndpointConnector);
 
   TemporaryDirectory directory;
   const auto base = directory.Write("config.yaml", R"(

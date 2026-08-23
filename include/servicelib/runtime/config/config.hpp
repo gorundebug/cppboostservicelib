@@ -211,6 +211,19 @@ class RuntimeConfig {
           dataConnectorsByID_, dc.GetID(), dc,
           "duplicate data connector id: " + std::to_string(dc.GetID()));
     }
+    for (const auto& ep : config_.GetEndpoints()) {
+      const auto connector = dataConnectorsByID_.find(ep.GetIdDataConnector());
+      if (connector == dataConnectorsByID_.end()) {
+        throw std::runtime_error(
+            "endpoint " + ep.GetName() + " references unknown data connector " +
+            std::to_string(ep.GetIdDataConnector()));
+      }
+      if (connector->second.GetType() != ep.GetType()) {
+        throw std::runtime_error("endpoint " + ep.GetName() +
+                                 " type does not match data connector " +
+                                 connector->second.GetName());
+      }
+    }
     for (const auto* pool : config_.GetPools()) {
       InsertUnique(poolByName_, pool->name, pool,
                    "duplicate pool name: " + pool->name);
@@ -221,6 +234,25 @@ class RuntimeConfig {
     }
     for (const auto* link : config_.GetLinks()) {
       link->Validate();
+      if (link->callSemantics && link->callSemantics->durableCall) {
+        const int connectorId =
+            link->callSemantics->durableCall->idDataConnector;
+        const auto connector = dataConnectorsByID_.find(connectorId);
+        if (connector == dataConnectorsByID_.end()) {
+          throw std::runtime_error(
+              "durable link from=" + std::to_string(link->from) + " to=" +
+              std::to_string(link->to) +
+              " references unknown Temporal data connector " +
+              std::to_string(connectorId));
+        }
+        if (connector->second.GetType() !=
+            servicelib::api::DataConnectorType::kTemporal) {
+          throw std::runtime_error(
+              "durable link from=" + std::to_string(link->from) + " to=" +
+              std::to_string(link->to) +
+              " requires a Temporal data connector");
+        }
+      }
       InsertUnique(linksByID_, LinkID{link->from, link->to}, link,
                    "duplicate link from=" + std::to_string(link->from) +
                        " to=" + std::to_string(link->to));

@@ -49,18 +49,28 @@ struct ParallelCallSemanticsConfig {
   }
 };
 
+struct DurableCallSemanticsConfig {
+  int idDataConnector{};
+
+  servicelib::api::CallSemantics GetType() const noexcept {
+    return servicelib::api::CallSemantics::kDurableCall;
+  }
+};
+
 // Аналог Go CallSemanticsGroup — только одно поле должно быть задано.
 struct CallSemanticsGroup {
   std::optional<FunctionCallSemanticsConfig> functionCall;
   std::optional<TaskPoolCallSemanticsConfig> taskPool;
   std::optional<PriorityTaskPoolCallSemanticsConfig> priorityTaskPool;
   std::optional<ParallelCallSemanticsConfig> parallelCall;
+  std::optional<DurableCallSemanticsConfig> durableCall;
 
   void Validate() const {
     int count = (functionCall.has_value() ? 1 : 0) +
                 (taskPool.has_value() ? 1 : 0) +
                 (priorityTaskPool.has_value() ? 1 : 0) +
-                (parallelCall.has_value() ? 1 : 0);
+                (parallelCall.has_value() ? 1 : 0) +
+                (durableCall.has_value() ? 1 : 0);
     if (count != 1) {
       throw std::runtime_error(
           "exactly one call semantics must be specified, got " +
@@ -94,7 +104,7 @@ struct LinkConfig {
 
 inline CallSemanticsGroup MakeCallSemanticsGroup(
     servicelib::api::CallSemantics type, std::string poolName = {},
-    int priority = 0, bool async = false) {
+    int priority = 0, bool async = false, int idDataConnector = 0) {
   CallSemanticsGroup result;
   switch (type) {
     case servicelib::api::CallSemantics::kFunctionCall:
@@ -109,6 +119,9 @@ inline CallSemanticsGroup MakeCallSemanticsGroup(
       break;
     case servicelib::api::CallSemantics::kParallelCall:
       result.parallelCall.emplace();
+      break;
+    case servicelib::api::CallSemantics::kDurableCall:
+      result.durableCall = DurableCallSemanticsConfig{idDataConnector};
       break;
     case servicelib::api::CallSemantics::kUndefined:
     case servicelib::api::CallSemantics::kInherited:
@@ -153,6 +166,12 @@ inline ParallelCallSemanticsConfig Parse(
   return ParallelCallSemanticsConfig{};
 }
 
+inline DurableCallSemanticsConfig Parse(
+    const YamlValue& value,
+    TypeTag<DurableCallSemanticsConfig>) {
+  return DurableCallSemanticsConfig{value["idDataConnector"].As<int>(0)};
+}
+
 inline CallSemanticsGroup Parse(
     const YamlValue& value,
     TypeTag<CallSemanticsGroup>) {
@@ -176,6 +195,9 @@ inline CallSemanticsGroup Parse(
   if (const auto v = value["parallelCall"]; !v.IsMissing()) {
     result.parallelCall = v.As<ParallelCallSemanticsConfig>();
   }
+  if (const auto v = value["durableCall"]; !v.IsMissing()) {
+    result.durableCall = v.As<DurableCallSemanticsConfig>();
+  }
   return result;
 }
 
@@ -192,7 +214,8 @@ inline LinkConfig Parse(const YamlValue& value,
         result.callSemantics =
             MakeCallSemanticsGroup(type, value["poolName"].As<std::string>(""),
                                    value["priority"].As<int>(0),
-                                   value["async"].As<bool>(false));
+                                   value["async"].As<bool>(false),
+                                   value["idDataConnector"].As<int>(0));
       }
     } else {
       result.callSemantics = v.As<CallSemanticsGroup>();
@@ -200,7 +223,7 @@ inline LinkConfig Parse(const YamlValue& value,
   }
   detail::ParseRemainingProperties(
       value,
-      {"from", "to", "callSemantics", "poolName", "priority", "async"},
+      {"from", "to", "callSemantics", "poolName", "priority", "async", "idDataConnector"},
       result.properties);
   return result;
 }

@@ -73,6 +73,35 @@ struct KafkaDataConnectorConfig {
     }
 };
 
+struct CronDataConnectorConfig {
+    int id{};
+    std::string name;
+    servicelib::api::DataConnectorImplementation implementation{};
+    PropertiesMap properties;
+
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kCron; }
+    const YamlValue* GetProperty(const std::string& propName) const {
+      return detail::FindProperty(properties, propName);
+    }
+};
+
+struct TemporalDataConnectorConfig {
+    int id{};
+    std::string name;
+    servicelib::api::DataConnectorImplementation implementation{};
+    std::string address;
+    std::string namespaceName;
+    std::string identity;
+    int maxConcurrentActivities{};
+    int maxConcurrentWorkflows{};
+    PropertiesMap properties;
+
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kTemporal; }
+    const YamlValue* GetProperty(const std::string& propName) const {
+      return detail::FindProperty(properties, propName);
+    }
+};
+
 struct CustomDataConnectorConfig {
     int id{};
     std::string name;
@@ -92,6 +121,8 @@ class DataConnectorConfigRef {
       std::reference_wrapper<const HttpDataConnectorConfig>,
       std::reference_wrapper<const GrpcDataConnectorConfig>,
       std::reference_wrapper<const KafkaDataConnectorConfig>,
+      std::reference_wrapper<const CronDataConnectorConfig>,
+      std::reference_wrapper<const TemporalDataConnectorConfig>,
       std::reference_wrapper<const CustomDataConnectorConfig>>;
 
  private:
@@ -106,6 +137,8 @@ class DataConnectorConfigRef {
   DataConnectorConfigRef(const HttpDataConnectorConfig& v)   : value_(std::cref(v)) {}
   DataConnectorConfigRef(const GrpcDataConnectorConfig& v)   : value_(std::cref(v)) {}
   DataConnectorConfigRef(const KafkaDataConnectorConfig& v)  : value_(std::cref(v)) {}
+  DataConnectorConfigRef(const CronDataConnectorConfig& v)   : value_(std::cref(v)) {}
+  DataConnectorConfigRef(const TemporalDataConnectorConfig& v) : value_(std::cref(v)) {}
   DataConnectorConfigRef(const CustomDataConnectorConfig& v) : value_(std::cref(v)) {}
 
   int GetID() const {
@@ -216,6 +249,39 @@ inline CustomDataConnectorConfig Parse(
   result.implementation = value["implementation"].As<servicelib::api::DataConnectorImplementation>(
       servicelib::api::DataConnectorImplementation::kUndefined);
   detail::ParseRemainingProperties(value, {"id", "name", "implementation"}, result.properties);
+  return result;
+}
+
+inline CronDataConnectorConfig Parse(
+    const YamlValue& value,
+    TypeTag<CronDataConnectorConfig>) {
+  CronDataConnectorConfig result;
+  result.id = value["id"].As<int>(0);
+  result.name = value["name"].As<std::string>("");
+  result.implementation = value["implementation"].As<servicelib::api::DataConnectorImplementation>(
+      servicelib::api::DataConnectorImplementation::kUndefined);
+  detail::ParseRemainingProperties(value, {"id", "name", "implementation"}, result.properties);
+  return result;
+}
+
+inline TemporalDataConnectorConfig Parse(
+    const YamlValue& value,
+    TypeTag<TemporalDataConnectorConfig>) {
+  TemporalDataConnectorConfig result;
+  result.id = value["id"].As<int>(0);
+  result.name = value["name"].As<std::string>("");
+  result.implementation = value["implementation"].As<servicelib::api::DataConnectorImplementation>(
+      servicelib::api::DataConnectorImplementation::kUndefined);
+  result.address = value["address"].As<std::string>("");
+  result.namespaceName = value["namespace"].As<std::string>("");
+  result.identity = value["identity"].As<std::string>("");
+  result.maxConcurrentActivities = value["maxConcurrentActivities"].As<int>(0);
+  result.maxConcurrentWorkflows = value["maxConcurrentWorkflows"].As<int>(0);
+  detail::ParseRemainingProperties(
+      value,
+      {"id", "name", "implementation", "address", "namespace", "identity",
+       "maxConcurrentActivities", "maxConcurrentWorkflows"},
+      result.properties);
   return result;
 }
 

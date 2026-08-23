@@ -90,6 +90,8 @@ def to_cpp_name(raw: str) -> str:
 
 def generate_enum(name: str, schema: dict) -> str | None:
     varnames = schema.get("x-enum-varnames", [])
+    if schema.get("type") == "string" and not varnames:
+        varnames = [str(value) for value in schema.get("enum", [])]
     if not varnames:
         return None
 
@@ -106,6 +108,8 @@ def generate_enum(name: str, schema: dict) -> str | None:
 
 def generate_parse_block(name: str, schema: dict) -> str | None:
     varnames = schema.get("x-enum-varnames", [])
+    if schema.get("type") == "string" and not varnames:
+        varnames = [str(value) for value in schema.get("enum", [])]
     if not varnames:
         return None
 
@@ -145,7 +149,7 @@ def main() -> None:
     for name, schema in schemas.items():
         if name in SKIP_SCHEMAS:
             continue
-        if "enum" in schema and "x-enum-varnames" in schema:
+        if "enum" in schema:
             block = generate_enum(name, schema)
             if block:
                 enum_blocks.append(block)

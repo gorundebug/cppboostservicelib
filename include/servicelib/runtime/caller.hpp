@@ -423,12 +423,17 @@ std::unique_ptr<Caller<T>> makeCallerFromEnv(
         std::move(params));
   }
 
+  if (semantics->durableCall.has_value()) {
+    throw std::runtime_error(
+        "Temporal DurableCall is not supported by the C++ runtime");
+  }
+
   if (semantics->parallelCall.has_value()) {
     return std::make_unique<ParallelCaller<T>>(consumer, *env,
                                                 std::move(params));
   }
 
-  return std::make_unique<DirectCaller<T>>(consumer, std::move(params));
+  throw std::runtime_error("unsupported call semantics");
 }
 
 }  // namespace servicelib

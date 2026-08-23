@@ -76,6 +76,7 @@ enum class CallSemantics {
   kTaskPool = 3,  // TaskPool
   kPriorityTaskPool = 4,  // PriorityTaskPool
   kParallelCall = 5,  // ParallelCall
+  kDurableCall = 6,  // DurableCall
 };
 
 enum class DataConnectorType {
@@ -84,6 +85,8 @@ enum class DataConnectorType {
   kGRPC = 2,  // gRPC
   kKafka = 3,  // Kafka
   kCustom = 4,  // Custom
+  kCron = 5,  // Cron
+  kTemporal = 6,  // Temporal
 };
 
 enum class ProcessPattern {
@@ -135,6 +138,14 @@ enum class DataConnectorImplementation {
   kNodeHTTP = 16,  // NodeHTTP
   kGrpcJS = 17,  // GrpcJS
   kConfluentKafkaJavaScript = 18,  // ConfluentKafkaJavaScript
+  kGoGocron = 19,  // GoGocron
+  kPythonAPScheduler = 20,  // PythonAPScheduler
+  kRustCroner = 21,  // RustCroner
+  kNodeCroner = 22,  // NodeCroner
+  kCppLibcron = 23,  // CppLibcron
+  kTemporalGo = 24,  // TemporalGo
+  kTemporalPython = 25,  // TemporalPython
+  kTemporalTypeScript = 26,  // TemporalTypeScript
 };
 
 enum class KafkaSecurityProtocol {
@@ -147,6 +158,16 @@ enum class KafkaSaslMechanism {
   kPLAIN = 0,  // PLAIN
   kSCRAMSHA256 = 1,  // SCRAMSHA256
   kSCRAMSHA512 = 2,  // SCRAMSHA512
+};
+
+enum class ScheduleOverlapPolicy {
+  kAllow = 0,  // Allow
+  kSkip = 1,  // Skip
+};
+
+enum class ScheduleMissedRunPolicy {
+  kSkip = 0,  // Skip
+  kFireOnce = 1,  // FireOnce
 };
 
 enum class TypeDefinitionFormat {
@@ -180,9 +201,10 @@ enum class DataType {
   kUint64 = 18,  // uint64
   kAny = 19,  // any
   kError = 20,  // error
-  kArray = 21,  // array
-  kMap = 22,  // map
-  kStruct = 23,  // struct
-  kCustom = 24,  // custom
+  kScheduleTrigger = 21,  // scheduleTrigger
+  kArray = 22,  // array
+  kMap = 23,  // map
+  kStruct = 24,  // struct
+  kCustom = 25,  // custom
 };
 }  // namespace servicelib::api

@@ -32,6 +32,8 @@ struct HttpEndpointConfig {
     std::string functionModule;
     PropertiesMap properties;
 
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kHTTP; }
+
     const YamlValue* GetProperty(const std::string& propName) const {
       return detail::FindProperty(properties, propName);
     }
@@ -50,6 +52,8 @@ struct GrpcEndpointConfig {
     std::string functionInitializerGroup;
     std::string functionModule;
     PropertiesMap properties;
+
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kGRPC; }
 
     const YamlValue* GetProperty(const std::string& propName) const {
       return detail::FindProperty(properties, propName);
@@ -74,6 +78,62 @@ struct KafkaEndpointConfig {
     std::string functionModule;
     PropertiesMap properties;
 
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kKafka; }
+
+    const YamlValue* GetProperty(const std::string& propName) const {
+      return detail::FindProperty(properties, propName);
+    }
+};
+
+struct CronEndpointConfig {
+    int id{};
+    std::string name;
+    int idDataConnector{};
+    bool enabled{};
+    std::string schedule;
+    std::string timezone{"UTC"};
+    servicelib::api::ScheduleOverlapPolicy overlapPolicy{servicelib::api::ScheduleOverlapPolicy::kSkip};
+    servicelib::api::ScheduleMissedRunPolicy missedRunPolicy{servicelib::api::ScheduleMissedRunPolicy::kSkip};
+    std::string functionName;
+    std::string functionPackage;
+    bool publicFunction{};
+    std::string functionDescription;
+    std::string functionInitializerGroup;
+    std::string functionModule;
+    PropertiesMap properties;
+
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kCron; }
+
+    const YamlValue* GetProperty(const std::string& propName) const {
+      return detail::FindProperty(properties, propName);
+    }
+};
+
+struct TemporalEndpointConfig {
+    int id{};
+    std::string name;
+    int idDataConnector{};
+    bool enabled{};
+    std::string taskQueue;
+    std::string schedule;
+    std::string scheduleId;
+    std::string timezone{"UTC"};
+    servicelib::api::ScheduleOverlapPolicy overlapPolicy{servicelib::api::ScheduleOverlapPolicy::kSkip};
+    servicelib::api::ScheduleMissedRunPolicy missedRunPolicy{servicelib::api::ScheduleMissedRunPolicy::kSkip};
+    int workflowExecutionTimeout{};
+    int activityStartToCloseTimeout{};
+    int activityHeartbeatTimeout{};
+    int maximumAttempts{};
+    std::string functionName;
+    std::string functionPackage;
+    bool publicFunction{};
+    std::string functionDescription;
+    std::string functionInitializerGroup;
+    std::string functionModule;
+    PropertiesMap properties;
+
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kTemporal; }
+
     const YamlValue* GetProperty(const std::string& propName) const {
       return detail::FindProperty(properties, propName);
     }
@@ -91,6 +151,8 @@ struct CustomEndpointConfig {
     std::string functionModule;
     PropertiesMap properties;
 
+    servicelib::api::DataConnectorType GetType() const noexcept { return servicelib::api::DataConnectorType::kCustom; }
+
     const YamlValue* GetProperty(const std::string& propName) const {
       return detail::FindProperty(properties, propName);
     }
@@ -103,6 +165,8 @@ class EndpointConfigRef {
       std::reference_wrapper<const HttpEndpointConfig>,
       std::reference_wrapper<const GrpcEndpointConfig>,
       std::reference_wrapper<const KafkaEndpointConfig>,
+      std::reference_wrapper<const CronEndpointConfig>,
+      std::reference_wrapper<const TemporalEndpointConfig>,
       std::reference_wrapper<const CustomEndpointConfig>>;
 
  private:
@@ -117,6 +181,8 @@ class EndpointConfigRef {
   EndpointConfigRef(const HttpEndpointConfig& v)   : value_(std::cref(v)) {}
   EndpointConfigRef(const GrpcEndpointConfig& v)   : value_(std::cref(v)) {}
   EndpointConfigRef(const KafkaEndpointConfig& v)  : value_(std::cref(v)) {}
+  EndpointConfigRef(const CronEndpointConfig& v)   : value_(std::cref(v)) {}
+  EndpointConfigRef(const TemporalEndpointConfig& v) : value_(std::cref(v)) {}
   EndpointConfigRef(const CustomEndpointConfig& v) : value_(std::cref(v)) {}
 
   int GetID() const {
@@ -129,6 +195,10 @@ class EndpointConfigRef {
 
   int GetIdDataConnector() const {
     return Visit([](const auto& c) { return c.idDataConnector; });
+  }
+
+  servicelib::api::DataConnectorType GetType() const {
+    return Visit([](const auto& c) { return c.GetType(); });
   }
 
   template <typename T>
@@ -214,6 +284,62 @@ inline CustomEndpointConfig Parse(const YamlValue& value,
       value,
       {"id", "name", "idDataConnector", "functionName", "functionPackage", "publicFunction",
        "functionDescription", "functionInitializerGroup", "functionModule"},
+      result.properties);
+  return result;
+}
+
+inline CronEndpointConfig Parse(const YamlValue& value,
+                                TypeTag<CronEndpointConfig>) {
+  CronEndpointConfig result;
+  result.id = value["id"].As<int>(0);
+  result.name = value["name"].As<std::string>("");
+  result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.enabled = value["enabled"].As<bool>(false);
+  result.schedule = value["schedule"].As<std::string>("");
+  result.timezone = value["timezone"].As<std::string>("UTC");
+  result.overlapPolicy = value["overlapPolicy"].As<servicelib::api::ScheduleOverlapPolicy>(
+      servicelib::api::ScheduleOverlapPolicy::kSkip);
+  result.missedRunPolicy = value["missedRunPolicy"].As<servicelib::api::ScheduleMissedRunPolicy>(
+      servicelib::api::ScheduleMissedRunPolicy::kSkip);
+  detail::ParseFunctionFields(value, result);
+  detail::ParseRemainingProperties(
+      value,
+      {"id", "name", "idDataConnector", "enabled", "schedule", "timezone",
+       "overlapPolicy", "missedRunPolicy", "functionName", "functionPackage",
+       "publicFunction", "functionDescription", "functionInitializerGroup", "functionModule"},
+      result.properties);
+  return result;
+}
+
+inline TemporalEndpointConfig Parse(
+    const YamlValue& value,
+    TypeTag<TemporalEndpointConfig>) {
+  TemporalEndpointConfig result;
+  result.id = value["id"].As<int>(0);
+  result.name = value["name"].As<std::string>("");
+  result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.enabled = value["enabled"].As<bool>(false);
+  result.taskQueue = value["taskQueue"].As<std::string>("");
+  result.schedule = value["schedule"].As<std::string>("");
+  result.scheduleId = value["scheduleId"].As<std::string>("");
+  result.timezone = value["timezone"].As<std::string>("UTC");
+  result.overlapPolicy = value["overlapPolicy"].As<servicelib::api::ScheduleOverlapPolicy>(
+      servicelib::api::ScheduleOverlapPolicy::kSkip);
+  result.missedRunPolicy = value["missedRunPolicy"].As<servicelib::api::ScheduleMissedRunPolicy>(
+      servicelib::api::ScheduleMissedRunPolicy::kSkip);
+  result.workflowExecutionTimeout = value["workflowExecutionTimeout"].As<int>(0);
+  result.activityStartToCloseTimeout = value["activityStartToCloseTimeout"].As<int>(0);
+  result.activityHeartbeatTimeout = value["activityHeartbeatTimeout"].As<int>(0);
+  result.maximumAttempts = value["maximumAttempts"].As<int>(0);
+  detail::ParseFunctionFields(value, result);
+  detail::ParseRemainingProperties(
+      value,
+      {"id", "name", "idDataConnector", "enabled", "taskQueue", "schedule",
+       "scheduleId", "timezone", "overlapPolicy", "missedRunPolicy",
+       "workflowExecutionTimeout", "activityStartToCloseTimeout",
+       "activityHeartbeatTimeout", "maximumAttempts", "functionName",
+       "functionPackage", "publicFunction", "functionDescription",
+       "functionInitializerGroup", "functionModule"},
       result.properties);
   return result;
 }

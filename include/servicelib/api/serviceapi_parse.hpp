@@ -118,7 +118,8 @@ inline constexpr std::array kCallSemanticsMap{
     std::pair{"FunctionCall"sv, CallSemantics::kFunctionCall},
     std::pair{"TaskPool"sv, CallSemantics::kTaskPool},
     std::pair{"PriorityTaskPool"sv, CallSemantics::kPriorityTaskPool},
-    std::pair{"ParallelCall"sv, CallSemantics::kParallelCall}};
+    std::pair{"ParallelCall"sv, CallSemantics::kParallelCall},
+    std::pair{"DurableCall"sv, CallSemantics::kDurableCall}};
 
 inline CallSemantics Parse(const config::YamlValue& value,
                          config::TypeTag<CallSemantics>) {
@@ -130,7 +131,9 @@ inline constexpr std::array kDataConnectorTypeMap{
     std::pair{"HTTP"sv, DataConnectorType::kHTTP},
     std::pair{"gRPC"sv, DataConnectorType::kGRPC},
     std::pair{"Kafka"sv, DataConnectorType::kKafka},
-    std::pair{"Custom"sv, DataConnectorType::kCustom}};
+    std::pair{"Custom"sv, DataConnectorType::kCustom},
+    std::pair{"Cron"sv, DataConnectorType::kCron},
+    std::pair{"Temporal"sv, DataConnectorType::kTemporal}};
 
 inline DataConnectorType Parse(const config::YamlValue& value,
                          config::TypeTag<DataConnectorType>) {
@@ -201,7 +204,15 @@ inline constexpr std::array kDataConnectorImplementationMap{
     std::pair{"rust/rdkafka"sv, DataConnectorImplementation::kRustRdkafka},
     std::pair{"node/http"sv, DataConnectorImplementation::kNodeHTTP},
     std::pair{"grpc/grpc-js"sv, DataConnectorImplementation::kGrpcJS},
-    std::pair{"confluent/kafka-javascript"sv, DataConnectorImplementation::kConfluentKafkaJavaScript}};
+    std::pair{"confluent/kafka-javascript"sv, DataConnectorImplementation::kConfluentKafkaJavaScript},
+    std::pair{"go/gocron"sv, DataConnectorImplementation::kGoGocron},
+    std::pair{"python/apscheduler"sv, DataConnectorImplementation::kPythonAPScheduler},
+    std::pair{"rust/croner"sv, DataConnectorImplementation::kRustCroner},
+    std::pair{"node/croner"sv, DataConnectorImplementation::kNodeCroner},
+    std::pair{"cpp/libcron"sv, DataConnectorImplementation::kCppLibcron},
+    std::pair{"temporal/go"sv, DataConnectorImplementation::kTemporalGo},
+    std::pair{"temporal/python"sv, DataConnectorImplementation::kTemporalPython},
+    std::pair{"temporal/typescript"sv, DataConnectorImplementation::kTemporalTypeScript}};
 
 inline DataConnectorImplementation Parse(const config::YamlValue& value,
                          config::TypeTag<DataConnectorImplementation>) {
@@ -226,6 +237,24 @@ inline constexpr std::array kKafkaSaslMechanismMap{
 inline KafkaSaslMechanism Parse(const config::YamlValue& value,
                          config::TypeTag<KafkaSaslMechanism>) {
   return detail::ParseEnum(value, kKafkaSaslMechanismMap);
+}
+
+inline constexpr std::array kScheduleOverlapPolicyMap{
+    std::pair{"Allow"sv, ScheduleOverlapPolicy::kAllow},
+    std::pair{"Skip"sv, ScheduleOverlapPolicy::kSkip}};
+
+inline ScheduleOverlapPolicy Parse(const config::YamlValue& value,
+                         config::TypeTag<ScheduleOverlapPolicy>) {
+  return detail::ParseEnum(value, kScheduleOverlapPolicyMap);
+}
+
+inline constexpr std::array kScheduleMissedRunPolicyMap{
+    std::pair{"Skip"sv, ScheduleMissedRunPolicy::kSkip},
+    std::pair{"FireOnce"sv, ScheduleMissedRunPolicy::kFireOnce}};
+
+inline ScheduleMissedRunPolicy Parse(const config::YamlValue& value,
+                         config::TypeTag<ScheduleMissedRunPolicy>) {
+  return detail::ParseEnum(value, kScheduleMissedRunPolicyMap);
 }
 
 inline constexpr std::array kTypeDefinitionFormatMap{
@@ -263,6 +292,7 @@ inline constexpr std::array kDataTypeMap{
     std::pair{"uint64"sv, DataType::kUint64},
     std::pair{"any"sv, DataType::kAny},
     std::pair{"error"sv, DataType::kError},
+    std::pair{"schedule trigger"sv, DataType::kScheduleTrigger},
     std::pair{"array"sv, DataType::kArray},
     std::pair{"map"sv, DataType::kMap},
     std::pair{"struct"sv, DataType::kStruct},
