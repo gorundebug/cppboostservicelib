@@ -20,6 +20,7 @@ option(CPPBOOSTSERVICELIB_BUILD_TESTS "Build framework tests" ON)
 include(cmake/Dependencies.cmake)
 
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # FetchContent dependency targets expose their headers as ordinary include
 # directories. Keep warnings strict for ServiceLib and its consumers, but do
@@ -79,7 +80,8 @@ else()
       $<BUILD_INTERFACE:${CPPBOOSTSERVICELIB_YAML_TARGET}>)
 endif()
 target_link_libraries(cppboostservicelib INTERFACE
-    $<BUILD_INTERFACE:cppboostservicelib_build_options>)
+    $<BUILD_INTERFACE:cppboostservicelib_build_options>
+    OpenSSL::Crypto)
 
 if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
   # Transport dependencies stay in a separate component: HTTP-only consumers
@@ -163,6 +165,13 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
       servicelib::servicelib)
   add_test(NAME cppboostservicelib_config_loader_test
       COMMAND cppboostservicelib_config_loader_test)
+
+  add_executable(cppboostservicelib_schedule_test
+      tests/schedule_test.cpp)
+  target_link_libraries(cppboostservicelib_schedule_test PRIVATE
+      servicelib::servicelib)
+  add_test(NAME cppboostservicelib_schedule_test
+      COMMAND cppboostservicelib_schedule_test)
 
   add_executable(cppboostservicelib_asio_runtime_test
       tests/asio_runtime_test.cpp)
