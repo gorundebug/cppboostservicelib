@@ -31,6 +31,19 @@ options=(
   -o "&:with_tests=${CPPBOOSTSERVICELIB_BUILD_TESTS:-True}"
 )
 
+lockfile=${CPPBOOSTSERVICELIB_CONAN_LOCKFILE:-}
+if [[ -z "$lockfile" ]]; then
+  lockfile="$root/conan/locks/$(basename "$profile").lock"
+fi
+lock_args=()
+if [[ "$lockfile" != "none" ]]; then
+  if [[ ! -f "$lockfile" ]]; then
+    echo "Conan lockfile is missing: $lockfile; run scripts/conan-lock.sh" >&2
+    exit 1
+  fi
+  lock_args=(--lockfile "$lockfile")
+fi
+
 "$root/scripts/conan-configure-remotes.sh"
 "$root/scripts/conan-export-recipes.sh"
 
@@ -40,5 +53,6 @@ exec conan install "$root" \
   -s:h "build_type=$build_type" \
   -s:b "build_type=$build_type" \
   --build=missing \
+  "${lock_args[@]}" \
   "${options[@]}" \
   "${@:2}"

@@ -19,23 +19,34 @@ The practical build, generation, test, benchmark and profiling command index is
 
 ## Initial build
 
-The host must provide CMake, Ninja, a C++20 compiler and Boost headers.
+The canonical dependency-complete build runs Conan 2, CMake and the compiler
+inside Docker; the host needs only Docker:
+
+```bash
+./scripts/test-conan.sh Debug
+./scripts/test-conan.sh Release
+```
+
+Dependency versions originate in ServiceGen's dependency catalog. Generated
+Conan manifests, recipes and the committed platform lockfiles make every
+resolved recipe revision explicit. After an intentional dependency or recipe
+change, refresh all lockfiles in the same Docker toolchain:
+
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  cppboostservicelib-conan-build ./scripts/conan-lock.sh
+```
+
+Host CMake builds remain available for framework development when their
+dependencies are already installed. The same presets are available as
+`release`, `asan`, `ubsan`, `asan-ubsan`, `tsan`, `coverage` and `profiling`.
+Profiling builds retain debug symbols and frame pointers. GDB, LLDB, core-dump
+and profiler commands are documented in [`docs/PROFILING.md`](docs/PROFILING.md).
 
 ```bash
 cmake --preset debug
 cmake --build --preset debug --parallel
 ctest --preset debug
-```
-
-The same workflow is available as `release`, `asan`, `ubsan`,
-`asan-ubsan`, `tsan`, `coverage` and `profiling` presets. Profiling builds
-retain debug symbols and frame pointers. GDB, LLDB, core-dump and profiler
-commands are documented in [`docs/PROFILING.md`](docs/PROFILING.md).
-
-The canonical reproducible build is Docker-based:
-
-```bash
-./scripts/test.sh
 ```
 
 For a host without preinstalled Boost or yaml-cpp, use pinned source archives:

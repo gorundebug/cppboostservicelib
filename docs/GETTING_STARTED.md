@@ -8,9 +8,10 @@ builds below use unrestricted `--parallel`.
 
 The reproducible path needs Git, Docker with the Compose plugin, Python 3 and
 GNU Make. Host builds additionally need CMake 3.24+, Ninja and a C++20 compiler.
-Pinned Docker/FETCH builds compile Boost, protobuf, gRPC, asio-grpc, yaml-cpp,
-librdkafka and OpenTelemetry from the revisions selected by the framework;
-they do not silently use a different system gRPC.
+Pinned Docker/Conan builds provide Boost, protobuf, gRPC, asio-grpc, yaml-cpp,
+librdkafka and OpenTelemetry from committed lockfiles and the revisions selected
+by ServiceGen's dependency catalog; they do not silently use a different
+system gRPC.
 
 ## Framework
 
@@ -19,6 +20,10 @@ From `cppboostservicelib`:
 ```bash
 # Fast framework/unit matrix in its canonical Docker environment.
 ./scripts/test.sh
+
+# Full pinned Conan dependency graph and feature matrix.
+./scripts/test-conan.sh Debug
+./scripts/test-conan.sh Release
 
 # Pinned protobuf/gRPC generation, build and loopback tests.
 ./scripts/test-grpc.sh
@@ -42,7 +47,7 @@ ctest --preset release
 Replace `debug` with `asan`, `ubsan`, `asan-ubsan`, `tsan`, `coverage`,
 `profiling` or `coroutine-diagnostics` when that instrument is required.
 
-For a host without installed dependencies:
+The compatibility FETCH provider remains available during the Conan migration:
 
 ```bash
 cmake -S . -B build/fetch -G Ninja \
