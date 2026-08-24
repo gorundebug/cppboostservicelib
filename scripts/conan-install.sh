@@ -31,6 +31,21 @@ options=(
   -o "&:with_tests=${CPPBOOSTSERVICELIB_BUILD_TESTS:-True}"
 )
 
+# Sanitizers are compiler sub-settings, rather than root-only CMake flags, so
+# every affected dependency gets a distinct package ID. This prevents mixing
+# instrumented consumers with ordinary inline implementations from packages
+# such as Abseil. Keep downloaded source archives outside individual package
+# build folders so Debug, Release and sanitizer variants reuse one source
+# download cache.
+conan_home=$(conan config home)
+install -m 0644 "$root/conan/settings_user.yml" \
+  "$conan_home/settings_user.yml"
+source_download_cache=${CPPBOOSTSERVICELIB_CONAN_SOURCE_CACHE:-$conan_home/source-download-cache}
+mkdir -p "$source_download_cache"
+source_cache_args=(
+  -cc "core.sources:download_cache=$source_download_cache"
+)
+
 lockfile=${CPPBOOSTSERVICELIB_CONAN_LOCKFILE:-}
 if [[ -z "$lockfile" ]]; then
   lockfile="$root/conan/locks/$(basename "$profile").lock"
@@ -53,6 +68,7 @@ exec conan install "$root" \
   -s:h "build_type=$build_type" \
   -s:b "build_type=$build_type" \
   --build=missing \
+  "${source_cache_args[@]}" \
   "${lock_args[@]}" \
   "${options[@]}" \
   "${@:2}"

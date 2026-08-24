@@ -40,18 +40,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
   target_compile_options(cppboostservicelib_build_options INTERFACE
       -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
   if(CPPBOOSTSERVICELIB_ASAN)
-    # Instrument FetchContent transport dependencies as well as ServiceLib.
-    # Coroutine frames cross the gRPC/asio-grpc boundary; partial
-    # instrumentation leaves poisoned frame memory invisible to gRPC and can
-    # report use-after-poison inside ClientContext::TryCancel().
+    # Conan profiles instrument transport dependencies with the same sanitizer
+    # and include compiler.sanitizer in their package IDs. These directory and
+    # interface flags instrument ServiceLib and its generated consumers.
     add_compile_options(
         $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=address>
         $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
     add_link_options(-fsanitize=address)
-    # add_*_options above are directory-scoped and therefore instrument the
-    # framework's FetchContent dependencies. Propagate the same flags through
-    # the public build-options target so sibling consumer targets are both
-    # instrumented and linked with the ASan runtime as well.
+    # Propagate the flags through the public build-options target so sibling
+    # consumer targets are instrumented and linked with the ASan runtime too.
     target_compile_options(cppboostservicelib_build_options INTERFACE
         $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=address>
         $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
@@ -68,9 +65,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         -fsanitize=undefined)
   endif()
   if(CPPBOOSTSERVICELIB_TSAN)
-    # Instrument FetchContent transport dependencies as well as ServiceLib.
-    # Static, non-instrumented gRPC/Abseil code hides its synchronization from
-    # TSan and produces false publication races in EventEngine internals.
+    # Conan profiles apply the same flags to transport dependencies. Static,
+    # non-instrumented gRPC/Abseil code would hide synchronization from TSan.
     add_compile_options(
         $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=thread>
         $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
