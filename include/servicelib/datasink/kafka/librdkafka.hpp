@@ -43,6 +43,8 @@ struct DeliveryResult final {
 class ProducerClient {
  public:
   virtual ~ProducerClient() = default;
+  virtual void start(const config::KafkaDataConnectorConfig&) {}
+  virtual void stop() noexcept {}
   [[nodiscard]] virtual std::optional<std::uint32_t> partitionCount(
       const std::string&) const {
     return std::nullopt;
@@ -54,17 +56,20 @@ class ProducerClient {
 
 class LibrdkafkaProducerClient final : public ProducerClient {
  public:
-  explicit LibrdkafkaProducerClient(
-      const config::KafkaDataConnectorConfig& config,
-      metrics::Metrics& metrics)
-      : statistics_(metrics, "producer"),
-        timeout_(config.dialTimeout > 0
-                     ? std::chrono::milliseconds{
-                           static_cast<std::int64_t>(config.dialTimeout)}
-                     : std::chrono::seconds{30}) {
+  explicit LibrdkafkaProducerClient(metrics::Metrics& metrics)
+      : statistics_(metrics, "producer") {}
+
+  ~LibrdkafkaProducerClient() override { stop(); }
+
+  void start(const config::KafkaDataConnectorConfig& config) override {
+    if (producer_) return;
     if (config.brokers.empty()) {
       throw std::invalid_argument("Kafka producer brokers are empty");
     }
+    timeout_ = config.dialTimeout > 0
+                   ? std::chrono::milliseconds{
+                         static_cast<std::int64_t>(config.dialTimeout)}
+                   : std::chrono::seconds{30};
     auto* kafkaConfig = rd_kafka_conf_new();
     try {
       SetConfig(kafkaConfig, "bootstrap.servers", config.brokers);
@@ -96,7 +101,7 @@ class LibrdkafkaProducerClient final : public ProducerClient {
     }
   }
 
-  ~LibrdkafkaProducerClient() override {
+  void stop() noexcept override {
     if (producer_) {
       rd_kafka_flush(producer_.get(), static_cast<int>(timeout_.count()));
       // rd_kafka_destroy may discard messages that are still queued after a
@@ -111,6 +116,7 @@ class LibrdkafkaProducerClient final : public ProducerClient {
 
   [[nodiscard]] std::optional<std::uint32_t> partitionCount(
       const std::string& topicName) const override {
+    if (!producer_) return std::nullopt;
     struct TopicDeleter final {
       void operator()(rd_kafka_topic_t* value) const noexcept {
         if (value) rd_kafka_topic_destroy(value);
@@ -148,6 +154,11 @@ class LibrdkafkaProducerClient final : public ProducerClient {
 
   DeliveryResult send(std::string topic, std::string key, std::string value,
                       std::optional<std::uint32_t> partition) override {
+    if (!producer_) {
+      return {partition, std::nullopt,
+              std::make_exception_ptr(
+                  std::runtime_error("Kafka producer is not started"))};
+    }
     auto waiter = std::make_shared<DeliveryWaiter>();
     auto opaque = std::make_unique<DeliveryOpaque>(DeliveryOpaque{this, waiter});
     auto* opaquePointer = opaque.get();
@@ -246,7 +257,7 @@ class LibrdkafkaProducerClient final : public ProducerClient {
   }
 
   telemetry::LibrdkafkaStatistics statistics_;
-  std::chrono::milliseconds timeout_;
+  std::chrono::milliseconds timeout_{std::chrono::seconds{30}};
   std::unique_ptr<rd_kafka_t, KafkaDeleter> producer_;
   std::mutex deliveryOpaquesMutex_;
   std::unordered_map<DeliveryOpaque*, std::unique_ptr<DeliveryOpaque>>
@@ -355,21 +366,33 @@ class Endpoint final {
       enabled_.store(false, std::memory_order_release);
       return;
     }
-    servicelib::detail::EnsureKafkaTopic(
-        connectorConfig(environment_, endpointId_), endpoint);
-    if constexpr (requires(Handler& h, const T& value,
-                           std::uint32_t partitions) {
-                    h.partition(value, partitions);
-                  }) {
-      if (const auto actual = producer_.partitionCount(topic_)) {
-        partitionCount_ = *actual;
+    const auto connector = connectorConfig(environment_, endpointId_);
+    producer_.start(connector);
+    producerStarted_ = true;
+    try {
+      servicelib::detail::EnsureKafkaTopic(connector, endpoint);
+      if constexpr (requires(Handler& h, const T& value,
+                             std::uint32_t partitions) {
+                      h.partition(value, partitions);
+                    }) {
+        if (const auto actual = producer_.partitionCount(topic_)) {
+          partitionCount_ = *actual;
+        }
       }
+    } catch (...) {
+      producer_.stop();
+      producerStarted_ = false;
+      throw;
     }
     enabled_.store(true, std::memory_order_release);
   }
   void stop(Context) {
     enabled_.store(false, std::memory_order_release);
     tasks_.CancelAndWait();
+    if (producerStarted_) {
+      producer_.stop();
+      producerStarted_ = false;
+    }
   }
 
   void consume(MessageContext context, Payload<T> payload) {
@@ -496,6 +519,7 @@ class Endpoint final {
   IServiceEnvironment& environment_;
   int endpointId_;
   std::atomic<bool> enabled_{false};
+  bool producerStarted_{false};
   std::string topic_;
   std::uint32_t partitionCount_;
   std::string endpointName_;

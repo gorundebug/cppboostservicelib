@@ -172,6 +172,10 @@ class TestEnvironment final : public servicelib::IRuntimeEnvironment {
 class FakeKafkaProducer final
     : public servicelib::datasink::kafka::ProducerClient {
  public:
+  void start(const servicelib::config::KafkaDataConnectorConfig&) override {
+    ++startCount;
+  }
+  void stop() noexcept override { ++stopCount; }
   [[nodiscard]] std::optional<std::uint32_t> partitionCount(
       const std::string&) const override {
     return actualPartitionCount;
@@ -184,6 +188,8 @@ class FakeKafkaProducer final
   }
   std::optional<std::uint32_t> actualPartitionCount;
   std::string observed;
+  int startCount{};
+  int stopCount{};
 };
 
 struct KafkaSinkHandler final {
@@ -233,6 +239,28 @@ TEST(KafkaDataSink, SendsThroughAdapterAndCollectsDeliveryResult) {
   EXPECT_EQ(producer.observed, "events:key:payload");
   EXPECT_EQ(result, 17);
   endpoint.stop(servicelib::Context{});
+  EXPECT_EQ(producer.startCount, 1);
+  EXPECT_EQ(producer.stopCount, 1);
+}
+
+TEST(KafkaDataSink, DisabledEndpointDoesNotStartProducer) {
+  TestEnvironment environment;
+  environment.config().kafkaEndpoint.enabled = false;
+  FakeKafkaProducer producer;
+  TestSinkEndpointStream<std::string, int> stream{
+      environment, 3,
+      [](servicelib::MessageContext, servicelib::Payload<int>) {}};
+  servicelib::datasink::kafka::Endpoint<std::string, int, KafkaSinkHandler>
+      endpoint{stream, producer, KafkaSinkHandler{4}};
+
+  endpoint.start(servicelib::Context{});
+  endpoint.consume(servicelib::MessageContext{},
+                   servicelib::Payload<std::string>::make("payload"));
+  endpoint.stop(servicelib::Context{});
+
+  EXPECT_EQ(producer.startCount, 0);
+  EXPECT_EQ(producer.stopCount, 0);
+  EXPECT_TRUE(producer.observed.empty());
 }
 
 struct SkippingKafkaSinkHandler final {
@@ -643,7 +671,8 @@ TEST(LibrdkafkaClients, ProduceConsumeAndCommitAgainstBrokerProtocol) {
   cluster.setGroupCoordinator(endpoint.consumerGroup);
 
   servicelib::datasink::kafka::LibrdkafkaProducerClient producer{
-      connector, servicelib::metrics::NoopMetrics::instance()};
+      servicelib::metrics::NoopMetrics::instance()};
+  producer.start(connector);
   const auto first = producer.send("events", "first-key", "first-value", 0);
   ASSERT_FALSE(first.error);
   ASSERT_EQ(first.partition, 0);
@@ -702,7 +731,8 @@ TEST(LibrdkafkaClients, PreservesPartitionOrderAndRunsPartitionsConcurrently) {
   cluster.setGroupCoordinator(group);
 
   servicelib::datasink::kafka::LibrdkafkaProducerClient producer{
-      connector, servicelib::metrics::NoopMetrics::instance()};
+      servicelib::metrics::NoopMetrics::instance()};
+  producer.start(connector);
   EXPECT_EQ(producer.partitionCount("events"), 2);
   ASSERT_FALSE(producer.send("events", "p0-0", "value", 0).error);
   ASSERT_FALSE(producer.send("events", "p0-1", "value", 0).error);
@@ -811,7 +841,8 @@ TEST(LibrdkafkaClients, BrokerLossReturnsErrorAndConsumerRemainsStoppable) {
   cluster.setGroupCoordinator(endpoint.consumerGroup);
 
   servicelib::datasink::kafka::LibrdkafkaProducerClient producer{
-      connector, servicelib::metrics::NoopMetrics::instance()};
+      servicelib::metrics::NoopMetrics::instance()};
+  producer.start(connector);
   const auto beforeLoss =
       producer.send("events", "before-key", "before-value", 0);
   ASSERT_FALSE(beforeLoss.error);
