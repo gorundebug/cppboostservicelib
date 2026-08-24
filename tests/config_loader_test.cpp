@@ -165,7 +165,7 @@ cronEndpoint:
   idDataConnector: 31
   enabled: true
   schedule: "0 * * * *"
-  timezone: Europe/Moscow
+  timezone: UTC
   overlapPolicy: Skip
   missedRunPolicy: FireOnce
 temporalEndpoint:
@@ -213,6 +213,25 @@ link:
   assert(durableLink.callSemantics.has_value());
   assert(durableLink.callSemantics->durableCall.has_value());
   assert(durableLink.callSemantics->durableCall->idDataConnector == 32);
+
+  const servicelib::config::YamlValue nonUtcEndpoint(YAML::Load(R"(
+schedule: "0 * * * *"
+timezone: Europe/Moscow
+)"));
+  bool rejectedNonUtcCron = false;
+  try {
+    (void)nonUtcEndpoint.As<servicelib::config::CronEndpointConfig>();
+  } catch (const std::invalid_argument&) {
+    rejectedNonUtcCron = true;
+  }
+  assert(rejectedNonUtcCron);
+  bool rejectedNonUtcTemporal = false;
+  try {
+    (void)nonUtcEndpoint.As<servicelib::config::TemporalEndpointConfig>();
+  } catch (const std::invalid_argument&) {
+    rejectedNonUtcTemporal = true;
+  }
+  assert(rejectedNonUtcTemporal);
 
   TemporalTopologyConfig topologyConfig;
   topologyConfig.cronConnector.id = 31;
