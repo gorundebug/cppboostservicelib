@@ -22,10 +22,13 @@ RUN --mount=type=cache,id=servicegen-apt-lists-${TARGETARCH},target=/var/lib/apt
        libboost-dev libboost-json1.83-dev libssl-dev libyaml-cpp-dev \
        libjemalloc-dev librdkafka-dev zlib1g-dev
 
-RUN python3 -m venv /opt/conan \
+COPY conan/dependencies_generated.py /tmp/dependencies_generated.py
+RUN CONAN_VERSION="$(python3 /tmp/dependencies_generated.py conan)" \
+    && python3 -m venv /opt/conan \
     && PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
        /opt/conan/bin/pip install --no-cache-dir --index-url "$PIP_INDEX_URL" \
-       conan==2.31.1
+       "conan==$CONAN_VERSION" \
+    && rm -f /tmp/dependencies_generated.py
 
 ENV PATH=/opt/conan/bin:$PATH
 

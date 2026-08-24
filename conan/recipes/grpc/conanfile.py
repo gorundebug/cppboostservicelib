@@ -1,9 +1,7 @@
 """Project-owned recipe for the framework's exact gRPC/Protobuf pair.
 
-Adapted from the Conan Center grpc/1.71.0 recipe.  Conan Center hard-codes
-protobuf/5.27.0 in both the host and build contexts.  The framework contract
-uses protobuf/5.29.3, so keeping the upstream recipe would silently build two
-different Protobuf versions.
+Adapted from the Conan Center recipe. The framework contract supplies its
+exact gRPC/Protobuf pair through servicegen's generated dependency manifest.
 """
 
 import os
@@ -17,6 +15,7 @@ from conan.tools.cmake import cmake_layout, CMake, CMakeToolchain, CMakeDeps
 from conan.tools.files import apply_conandata_patches, copy, export_conandata_patches, get, rename, replace_in_file, rmdir
 from conan.tools.microsoft import check_min_vs, is_msvc
 from conan.tools.scm import Version
+from dependencies_generated import VERSIONS
 
 required_conan_version = ">=2.0.5"
 
@@ -31,6 +30,7 @@ class GrpcConan(ConanFile):
 
     package_type = "library"
     settings = "os", "arch", "compiler", "build_type"
+    exports = "dependencies_generated.py"
 
     options = {
         "shared": [True, False],
@@ -111,10 +111,10 @@ class GrpcConan(ConanFile):
         # transitive_headers=True because grpc headers include abseil headers
         # transitive_libs=True because generated code (grpc_cpp_plugin) require symbols from abseil
         if Version(self.version) > "1.65.0":
-            self.requires("protobuf/5.29.3", transitive_headers=True)
+            self.requires(f"protobuf/{VERSIONS['protobuf']}", transitive_headers=True)
             self.requires("abseil/[>=20240116.1 <=20250127.0]", transitive_headers=True, transitive_libs=True)
         elif Version(self.version) >= "1.62.0" and Version(self.version) <= "1.65.0":
-            self.requires("protobuf/5.29.3", transitive_headers=True)
+            self.requires(f"protobuf/{VERSIONS['protobuf']}", transitive_headers=True)
             self.requires("abseil/[>=20240116.1 <20240117.0]", transitive_headers=True, transitive_libs=True)
         else:
             self.requires("abseil/[>=20230125.3 <=20230802.1]", transitive_headers=True, transitive_libs=True)
@@ -160,7 +160,7 @@ class GrpcConan(ConanFile):
         # cmake >=3.25 required to use `cmake -E env --modify` below
         # note: grpc 1.69.0 requires cmake >=3.16
         self.tool_requires("cmake/[>=3.25 <4]")
-        self.tool_requires("protobuf/5.29.3")
+        self.tool_requires(f"protobuf/{VERSIONS['protobuf']}")
         if cross_building(self):
             # when cross compiling we need pre compiled grpc plugins for protoc
             self.tool_requires(f"grpc/{self.version}")

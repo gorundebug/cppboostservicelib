@@ -1,5 +1,4 @@
-# Adapted from the Conan Center opentelemetry-proto/1.7.0 recipe to package
-# the framework's exact, otherwise unavailable opentelemetry-proto/1.5.0 pin.
+# Adapted from the Conan Center recipe to package the framework's exact pin.
 import os
 
 from conan import ConanFile

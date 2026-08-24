@@ -4,6 +4,12 @@ from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 from conan.tools.files import copy
 from conan.errors import ConanInvalidConfiguration
 import os
+import sys
+from pathlib import Path
+import re
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "conan"))
+from dependencies_generated import VERSIONS
 
 
 required_conan_version = ">=2.8.0"
@@ -11,12 +17,12 @@ required_conan_version = ">=2.8.0"
 
 class CppBoostServiceLibConan(ConanFile):
     name = "cppboostservicelib"
-    version = "0.2.12"
     package_type = "library"
     license = "Apache-2.0"
     url = "https://github.com/gorundebug/cppboostservicelib"
     description = "ServiceLib runtime implemented with Boost.Asio"
     settings = "os", "arch", "compiler", "build_type"
+    exports = "conan/dependencies_generated.py"
     options = {
         "shared": [True, False],
         "fPIC": [True, False],
@@ -43,6 +49,18 @@ class CppBoostServiceLibConan(ConanFile):
         "tests/*",
     )
 
+    def set_version(self):
+        cmake = (Path(self.recipe_folder) / "CMakeLists.txt").read_text()
+        match = re.search(
+            r"project\(cppboostservicelib VERSION ([0-9]+\.[0-9]+\.[0-9]+)",
+            cmake,
+        )
+        if match is None:
+            raise ConanInvalidConfiguration(
+                "cppboostservicelib version is missing from CMakeLists.txt"
+            )
+        self.version = match.group(1)
+
     def config_options(self):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
@@ -68,31 +86,31 @@ class CppBoostServiceLibConan(ConanFile):
         self.options["opentelemetry-cpp"].with_zipkin = False
 
     def requirements(self):
-        self.requires("boost/1.89.0", override=True)
-        self.requires("yaml-cpp/0.8.0")
+        self.requires(f"boost/{VERSIONS['boost']}", override=True)
+        self.requires(f"yaml-cpp/{VERSIONS['yaml-cpp']}")
 
         if self.options.with_tests:
-            self.requires("gtest/1.15.2")
+            self.requires(f"gtest/{VERSIONS['googletest']}")
 
         if self.options.with_grpc or self.options.with_otel:
-            self.requires("protobuf/5.29.3", override=True)
-            self.requires("grpc/1.71.0", override=True)
-            self.requires("asio-grpc/3.5.0")
+            self.requires(f"protobuf/{VERSIONS['protobuf']}", override=True)
+            self.requires(f"grpc/{VERSIONS['grpc']}", override=True)
+            self.requires(f"asio-grpc/{VERSIONS['asio-grpc']}")
 
         if self.options.with_kafka:
-            self.requires("librdkafka/2.8.0")
+            self.requires(f"librdkafka/{VERSIONS['librdkafka']}")
 
         if self.options.with_otel:
-            self.requires("opentelemetry-cpp/1.20.0")
+            self.requires(f"opentelemetry-cpp/{VERSIONS['opentelemetry-cpp']}")
 
         if self.options.with_cron:
-            self.requires("libcron/1.3.3")
+            self.requires(f"libcron/{VERSIONS['libcron']}")
 
     def build_requirements(self):
         if self.options.with_grpc or self.options.with_otel:
-            self.tool_requires("protobuf/5.29.3", override=True)
+            self.tool_requires(f"protobuf/{VERSIONS['protobuf']}", override=True)
         if self.options.with_otel:
-            self.tool_requires("grpc/1.71.0", override=True)
+            self.tool_requires(f"grpc/{VERSIONS['grpc']}", override=True)
 
     def validate(self):
         if self.settings.get_safe("compiler.cppstd"):

@@ -1,5 +1,4 @@
-# Adapted from the Conan Center opentelemetry-cpp/1.21.0 recipe to package the
-# framework's exact, otherwise unavailable opentelemetry-cpp/1.20.0 pin.
+# Adapted from the Conan Center recipe to package the framework's exact pin.
 from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
 from conan.tools.apple import is_apple_os
@@ -7,6 +6,7 @@ from conan.tools.files import get, copy, rmdir, replace_in_file
 from conan.tools.build import check_min_cppstd
 from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 from conan.tools.scm import Version
+from dependencies_generated import VERSIONS
 
 import os
 
@@ -22,6 +22,7 @@ class OpenTelemetryCppConan(ConanFile):
     topics = ("opentelemetry", "telemetry", "tracing", "metrics", "logs")
     package_type = "library"
     settings = "os", "arch", "compiler", "build_type"
+    exports = "dependencies_generated.py"
     options = {
         "fPIC": [True, False],
         "shared": [True, False],
@@ -135,7 +136,9 @@ class OpenTelemetryCppConan(ConanFile):
 
     def build_requirements(self):
         if self._needs_proto:
-            self.tool_requires("opentelemetry-proto/1.5.0")
+            self.tool_requires(
+                f"opentelemetry-proto/{VERSIONS['opentelemetry-proto']}"
+            )
             self.tool_requires("protobuf/<host_version>")
 
         if self.options.with_otlp_grpc:
