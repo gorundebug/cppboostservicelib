@@ -61,7 +61,7 @@ docker run --rm \
     export CCACHE_COMPILERCHECK=content
     ./scripts/conan-install.sh '"$build_type"'
     preset=conan-'"$(printf '%s' "$build_type" | tr '[:upper:]' '[:lower:]')"'
-    cmake --preset "$preset"
+    cmake --fresh --preset "$preset"
     cmake --build --preset "$preset" --parallel
     ctest --preset "$preset" --output-on-failure
   '
