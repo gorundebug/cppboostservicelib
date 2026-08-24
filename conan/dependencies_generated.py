@@ -6,6 +6,7 @@ VERSIONS = {
     "conan": "2.31.1",
     "googletest": "1.15.2",
     "grpc": "1.71.0",
+    "jemalloc": "5.3.1",
     "libcron": "1.3.3",
     "librdkafka": "2.8.0",
     "opentelemetry-cpp": "1.20.0",
