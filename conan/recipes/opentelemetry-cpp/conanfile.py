@@ -304,6 +304,22 @@ class OpenTelemetryCppConan(ConanFile):
             unprefixed_name = lib.replace("opentelemetry_", "")
             self.cpp_info.components[lib].set_property("cmake_target_name", f"opentelemetry-cpp::{unprefixed_name}")
 
+        # Preserve the target names exported by OpenTelemetry's own installed
+        # CMake package.  ServiceLib's installed config must be consumable with
+        # either the upstream package or CMakeDeps without mode-specific names.
+        upstream_targets = {
+            "opentelemetry_exporter_in_memory": "in_memory_span_exporter",
+            "opentelemetry_exporter_ostream_logs": "ostream_log_record_exporter",
+            "opentelemetry_exporter_ostream_span": "ostream_span_exporter",
+            "opentelemetry_exporter_otlp_grpc": "otlp_grpc_exporter",
+            "opentelemetry_exporter_otlp_grpc_log": "otlp_grpc_log_record_exporter",
+        }
+        for component, target in upstream_targets.items():
+            if component in self._otel_libraries:
+                self.cpp_info.components[component].set_property(
+                    "cmake_target_name", f"opentelemetry-cpp::{target}"
+                )
+
         self.cpp_info.components["api"].libs = []
         self.cpp_info.components["api"].defines.append(f"OPENTELEMETRY_ABI_VERSION_NO={2 if self.options.with_abi_v2 else 1}")
         self.cpp_info.components["opentelemetry_common"].requires.append("api")
@@ -363,6 +379,15 @@ class OpenTelemetryCppConan(ConanFile):
             ])
 
         if self.options.with_otlp_grpc:
+            # This archive contains generated gRPC stubs and therefore has
+            # direct static-link dependencies of its own.  Without these edges
+            # CMakeDeps emits it after gRPC/Protobuf, which leaves its symbols
+            # unresolved with the normal one-pass Unix linker.
+            self.cpp_info.components["opentelemetry_proto_grpc"].requires.extend([
+                "opentelemetry_proto",
+                "grpc::grpc++",
+            ])
+
             self.cpp_info.components["opentelemetry_exporter_otlp_grpc_client"].requires.extend([
                 "grpc::grpc++",
                 "opentelemetry_proto",

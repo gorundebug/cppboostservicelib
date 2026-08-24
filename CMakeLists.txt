@@ -187,7 +187,10 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     # Test fixtures intentionally use partial designated initialization for
     # config aggregates whose omitted fields have framework defaults.
-    add_compile_options(-Werror -Wno-missing-field-initializers)
+    # Release normally defines NDEBUG, but several standalone tests deliberately
+    # use the standard assert contract.  Keep assertions enabled for test
+    # targets only so Release verification executes the same checks as Debug.
+    add_compile_options(-UNDEBUG -Werror -Wno-missing-field-initializers)
   endif()
 
   add_test(NAME cppboostservicelib_structure_test
