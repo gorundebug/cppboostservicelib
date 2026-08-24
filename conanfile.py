@@ -64,6 +64,8 @@ class CppBoostServiceLibConan(ConanFile):
         self.options["librdkafka"].zlib = True
         self.options["opentelemetry-cpp"].shared = False
         self.options["opentelemetry-cpp"].with_otlp_grpc = True
+        self.options["opentelemetry-cpp"].with_otlp_http = False
+        self.options["opentelemetry-cpp"].with_zipkin = False
 
     def requirements(self):
         self.requires("boost/1.89.0", override=True)
@@ -81,9 +83,7 @@ class CppBoostServiceLibConan(ConanFile):
             self.requires("librdkafka/2.8.0")
 
         if self.options.with_otel:
-            # Conan Center no longer serves 1.20.0. The pilot uses the next
-            # compatible recipe while a project-owned 1.20.0 recipe is gated.
-            self.requires("opentelemetry-cpp/1.21.0")
+            self.requires("opentelemetry-cpp/1.20.0")
 
         if self.options.with_cron:
             self.requires("libcron/1.3.3")
@@ -136,4 +136,3 @@ class CppBoostServiceLibConan(ConanFile):
         self.cpp_info.set_property("cmake_file_name", "cppboostservicelib")
         self.cpp_info.set_property("cmake_target_name", "servicelib::servicelib")
         self.cpp_info.builddirs = ["lib/cmake/cppboostservicelib"]
-

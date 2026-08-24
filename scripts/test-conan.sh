@@ -50,7 +50,7 @@ docker run --rm \
   -e CPPBOOSTSERVICELIB_ENABLE_CRON=True \
   -e CPPBOOSTSERVICELIB_ENABLE_GRPC=True \
   -e CPPBOOSTSERVICELIB_ENABLE_KAFKA=True \
-  -e CPPBOOSTSERVICELIB_ENABLE_OTEL=False \
+  -e "CPPBOOSTSERVICELIB_ENABLE_OTEL=${CPPBOOSTSERVICELIB_ENABLE_OTEL:-False}" \
   -v "$conan_home_mount" \
   -v cppboostservicelib-conan-ccache:/ccache \
   -v "$root:/workspace" \

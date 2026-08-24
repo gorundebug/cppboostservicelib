@@ -1,0 +1,4 @@
+sources:
+  1.20.0:
+    sha256: 4b6eeb852f075133c21b95948017f13a3e21740e55b921d27e42970a47314297
+    url: https://github.com/open-telemetry/opentelemetry-cpp/archive/v1.20.0.tar.gz
