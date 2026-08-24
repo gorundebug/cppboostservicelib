@@ -60,7 +60,7 @@ target_compile_features(cppboostservicelib INTERFACE cxx_std_20)
 target_include_directories(cppboostservicelib INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "SYSTEM")
+if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
   target_link_libraries(cppboostservicelib INTERFACE
       Boost::headers Boost::json Threads::Threads
       ${CPPBOOSTSERVICELIB_YAML_TARGET})
@@ -84,26 +84,29 @@ target_link_libraries(cppboostservicelib INTERFACE
     OpenSSL::Crypto)
 
 if(CPPBOOSTSERVICELIB_ENABLE_CRON)
-  # libcron v1.3.3 predates the C++20 calendar names and intentionally builds
-  # its own sources as C++17. The object target is embedded in our installable
-  # component, so consumers do not acquire another runtime dependency.
-  add_library(cppboostservicelib_libcron_objects OBJECT
-      ${libcron_SOURCE_DIR}/libcron/src/CronClock.cpp
-      ${libcron_SOURCE_DIR}/libcron/src/CronData.cpp
-      ${libcron_SOURCE_DIR}/libcron/src/CronRandomization.cpp
-      ${libcron_SOURCE_DIR}/libcron/src/CronSchedule.cpp
-      ${libcron_SOURCE_DIR}/libcron/src/Task.cpp)
-  set_target_properties(cppboostservicelib_libcron_objects PROPERTIES
-      CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
-  target_compile_definitions(cppboostservicelib_libcron_objects PRIVATE
-      HAS_UNCAUGHT_EXCEPTIONS)
-  target_include_directories(cppboostservicelib_libcron_objects SYSTEM PRIVATE
-      ${libcron_SOURCE_DIR}/libcron/include
-      ${libcron_date_SOURCE_DIR}/include)
-
-  add_library(cppboostservicelib_cron STATIC
-      src/datasource/cron/libcron.cpp
-      $<TARGET_OBJECTS:cppboostservicelib_libcron_objects>)
+  if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
+    add_library(cppboostservicelib_cron STATIC
+        src/datasource/cron/libcron.cpp)
+  else()
+    # libcron v1.3.3 predates the C++20 calendar names and intentionally
+    # builds its own sources as C++17 in the legacy provider.
+    add_library(cppboostservicelib_libcron_objects OBJECT
+        ${libcron_SOURCE_DIR}/libcron/src/CronClock.cpp
+        ${libcron_SOURCE_DIR}/libcron/src/CronData.cpp
+        ${libcron_SOURCE_DIR}/libcron/src/CronRandomization.cpp
+        ${libcron_SOURCE_DIR}/libcron/src/CronSchedule.cpp
+        ${libcron_SOURCE_DIR}/libcron/src/Task.cpp)
+    set_target_properties(cppboostservicelib_libcron_objects PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    target_compile_definitions(cppboostservicelib_libcron_objects PRIVATE
+        HAS_UNCAUGHT_EXCEPTIONS)
+    target_include_directories(cppboostservicelib_libcron_objects SYSTEM PRIVATE
+        ${libcron_SOURCE_DIR}/libcron/include
+        ${libcron_date_SOURCE_DIR}/include)
+    add_library(cppboostservicelib_cron STATIC
+        src/datasource/cron/libcron.cpp
+        $<TARGET_OBJECTS:cppboostservicelib_libcron_objects>)
+  endif()
   add_library(servicelib::cron ALIAS cppboostservicelib_cron)
   set_target_properties(cppboostservicelib_cron PROPERTIES EXPORT_NAME cron)
   target_compile_features(cppboostservicelib_cron PUBLIC cxx_std_20)
@@ -111,6 +114,9 @@ if(CPPBOOSTSERVICELIB_ENABLE_CRON)
       ${libcron_SOURCE_DIR}/libcron/include
       ${libcron_date_SOURCE_DIR}/include)
   target_link_libraries(cppboostservicelib_cron PUBLIC servicelib::servicelib)
+  if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
+    target_link_libraries(cppboostservicelib_cron PRIVATE libcron::libcron)
+  endif()
 endif()
 
 if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
@@ -120,7 +126,7 @@ if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
   add_library(cppboostservicelib_grpc INTERFACE)
   add_library(servicelib::grpc ALIAS cppboostservicelib_grpc)
   set_target_properties(cppboostservicelib_grpc PROPERTIES EXPORT_NAME grpc)
-  if(NOT CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "SYSTEM")
+  if(NOT CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
     target_include_directories(cppboostservicelib_grpc SYSTEM INTERFACE
         $<BUILD_INTERFACE:${asio-grpc_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${grpc_SOURCE_DIR}/include>
@@ -146,7 +152,7 @@ if(CPPBOOSTSERVICELIB_ENABLE_KAFKA)
   add_library(cppboostservicelib_kafka INTERFACE)
   add_library(servicelib::kafka ALIAS cppboostservicelib_kafka)
   set_target_properties(cppboostservicelib_kafka PROPERTIES EXPORT_NAME kafka)
-  if(NOT CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "SYSTEM")
+  if(NOT CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
     target_include_directories(cppboostservicelib_kafka SYSTEM INTERFACE
         $<BUILD_INTERFACE:${RdKafka_SOURCE_DIR}/src>)
   endif()
