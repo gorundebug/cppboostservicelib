@@ -9,10 +9,28 @@ set_property(CACHE CPPBOOSTSERVICELIB_DEPENDENCY_MODE PROPERTY STRINGS
 option(CPPBOOSTSERVICELIB_ENABLE_GRPC "Build asio-grpc transport" OFF)
 option(CPPBOOSTSERVICELIB_ENABLE_KAFKA "Build librdkafka transport" OFF)
 option(CPPBOOSTSERVICELIB_ENABLE_OTEL "Build OpenTelemetry exporters" OFF)
+option(CPPBOOSTSERVICELIB_ENABLE_CRON "Build the libcron data source" OFF)
 option(CPPBOOSTSERVICELIB_FETCH_PROGRESS
        "Show FetchContent download and Git clone progress" ON)
 if(CPPBOOSTSERVICELIB_FETCH_PROGRESS)
   set(FETCHCONTENT_QUIET OFF)
+endif()
+
+if(CPPBOOSTSERVICELIB_ENABLE_CRON)
+  FetchContent_Declare(libcron
+      URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/PerMalmberg/libcron/archive/refs/tags/${CPPBOOSTSERVICELIB_LIBCRON_VERSION}.tar.gz"
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+  FetchContent_Declare(libcron_date
+      URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/HowardHinnant/date/archive/${CPPBOOSTSERVICELIB_LIBCRON_DATE_REVISION}.tar.gz"
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
+  FetchContent_GetProperties(libcron)
+  if(NOT libcron_POPULATED)
+    FetchContent_Populate(libcron)
+  endif()
+  FetchContent_GetProperties(libcron_date)
+  if(NOT libcron_date_POPULATED)
+    FetchContent_Populate(libcron_date)
+  endif()
 endif()
 
 set(CPPBOOSTSERVICELIB_BOOST_SOURCE_DIR "" CACHE PATH "Local Boost source")

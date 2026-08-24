@@ -43,3 +43,7 @@ set(CPPBOOSTSERVICELIB_OPENTELEMETRY_PROTO_VERSION "v1.5.0" CACHE STRING
     "Pinned OpenTelemetry proto revision")
 set(CPPBOOSTSERVICELIB_GOOGLETEST_REPOSITORY "https://github.com/google/googletest" CACHE STRING "Pinned GoogleTest repository")
 set(CPPBOOSTSERVICELIB_GOOGLETEST_VERSION "v1.15.2" CACHE STRING "Pinned GoogleTest")
+set(CPPBOOSTSERVICELIB_LIBCRON_REPOSITORY "https://github.com/PerMalmberg/libcron" CACHE STRING "Pinned libcron repository")
+set(CPPBOOSTSERVICELIB_LIBCRON_VERSION "v1.3.3" CACHE STRING "Pinned libcron")
+set(CPPBOOSTSERVICELIB_LIBCRON_DATE_REPOSITORY "https://github.com/HowardHinnant/date" CACHE STRING "Pinned libcron date repository")
+set(CPPBOOSTSERVICELIB_LIBCRON_DATE_REVISION "f94b8f36c6180be0021876c4a397a054fe50c6f2" CACHE STRING "Pinned libcron date revision")

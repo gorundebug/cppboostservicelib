@@ -83,6 +83,36 @@ target_link_libraries(cppboostservicelib INTERFACE
     $<BUILD_INTERFACE:cppboostservicelib_build_options>
     OpenSSL::Crypto)
 
+if(CPPBOOSTSERVICELIB_ENABLE_CRON)
+  # libcron v1.3.3 predates the C++20 calendar names and intentionally builds
+  # its own sources as C++17. The object target is embedded in our installable
+  # component, so consumers do not acquire another runtime dependency.
+  add_library(cppboostservicelib_libcron_objects OBJECT
+      ${libcron_SOURCE_DIR}/libcron/src/CronClock.cpp
+      ${libcron_SOURCE_DIR}/libcron/src/CronData.cpp
+      ${libcron_SOURCE_DIR}/libcron/src/CronRandomization.cpp
+      ${libcron_SOURCE_DIR}/libcron/src/CronSchedule.cpp
+      ${libcron_SOURCE_DIR}/libcron/src/Task.cpp)
+  set_target_properties(cppboostservicelib_libcron_objects PROPERTIES
+      CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+  target_compile_definitions(cppboostservicelib_libcron_objects PRIVATE
+      HAS_UNCAUGHT_EXCEPTIONS)
+  target_include_directories(cppboostservicelib_libcron_objects SYSTEM PRIVATE
+      ${libcron_SOURCE_DIR}/libcron/include
+      ${libcron_date_SOURCE_DIR}/include)
+
+  add_library(cppboostservicelib_cron STATIC
+      src/datasource/cron/libcron.cpp
+      $<TARGET_OBJECTS:cppboostservicelib_libcron_objects>)
+  add_library(servicelib::cron ALIAS cppboostservicelib_cron)
+  set_target_properties(cppboostservicelib_cron PROPERTIES EXPORT_NAME cron)
+  target_compile_features(cppboostservicelib_cron PUBLIC cxx_std_20)
+  target_include_directories(cppboostservicelib_cron SYSTEM PRIVATE
+      ${libcron_SOURCE_DIR}/libcron/include
+      ${libcron_date_SOURCE_DIR}/include)
+  target_link_libraries(cppboostservicelib_cron PUBLIC servicelib::servicelib)
+endif()
+
 if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
   # Transport dependencies stay in a separate component: HTTP-only consumers
   # do not inherit protobuf/gRPC, while gRPC services get the exact headers,
@@ -172,6 +202,13 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
       servicelib::servicelib)
   add_test(NAME cppboostservicelib_schedule_test
       COMMAND cppboostservicelib_schedule_test)
+  if(CPPBOOSTSERVICELIB_ENABLE_CRON)
+    add_executable(cppboostservicelib_cron_test tests/cron_test.cpp)
+    target_link_libraries(cppboostservicelib_cron_test PRIVATE
+        servicelib::cron GTest::gtest_main)
+    add_test(NAME cppboostservicelib_cron_test
+        COMMAND cppboostservicelib_cron_test)
+  endif()
 
   add_executable(cppboostservicelib_asio_runtime_test
       tests/asio_runtime_test.cpp)
@@ -360,6 +397,11 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
 endif()
 
 install(TARGETS cppboostservicelib EXPORT cppboostservicelibTargets)
+if(CPPBOOSTSERVICELIB_ENABLE_CRON)
+  install(TARGETS cppboostservicelib_cron
+      EXPORT cppboostservicelibTargets
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT cppboostservicelibTargets
     FILE cppboostservicelibTargets.cmake
