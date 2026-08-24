@@ -365,7 +365,7 @@ if(CPPBOOSTSERVICELIB_ENABLE_KAFKA)
     set(RDKAFKA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(RDKAFKA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(librdkafka
-        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/confluentinc/librdkafka/archive/refs/tags/${CPPBOOSTSERVICELIB_RDKAFKA_VERSION}.tar.gz"
+        URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/confluentinc/librdkafka/archive/refs/tags/${CPPBOOSTSERVICELIB_LIBRDKAFKA_VERSION}.tar.gz"
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
     FetchContent_MakeAvailable(librdkafka)
     _servicelib_normalize_librdkafka_cmake_config(
