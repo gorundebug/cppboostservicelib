@@ -142,9 +142,10 @@ enum class DataConnectorImplementation {
   kPythonAPScheduler = 20,  // PythonAPScheduler
   kRustCroner = 21,  // RustCroner
   kNodeCroner = 22,  // NodeCroner
-  kTemporalGo = 23,  // TemporalGo
-  kTemporalPython = 24,  // TemporalPython
-  kTemporalTypeScript = 25,  // TemporalTypeScript
+  kCppLibcron = 23,  // CppLibcron
+  kTemporalGo = 24,  // TemporalGo
+  kTemporalPython = 25,  // TemporalPython
+  kTemporalTypeScript = 26,  // TemporalTypeScript
 };
 
 enum class KafkaSecurityProtocol {
