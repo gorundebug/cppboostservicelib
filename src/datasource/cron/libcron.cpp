@@ -339,8 +339,7 @@ void LibcronDataSource::start(Context context) {
 void LibcronDataSource::stop(Context context) {
   if (!impl_->started.exchange(false, std::memory_order_acq_rel)) return;
   if (impl_->timer) {
-    boost::system::error_code ignored;
-    impl_->timer->cancel(ignored);
+    impl_->timer->cancel();
   }
   impl_->scheduler.clear_schedules();
   for (const auto& endpoint : impl_->endpoints) endpoint->impl_->stop(context);
