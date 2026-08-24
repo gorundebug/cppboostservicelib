@@ -22,6 +22,8 @@ set(CPPBOOSTSERVICELIB_GOOGLETEST_REPOSITORY "https://github.com/google/googlete
 set(CPPBOOSTSERVICELIB_GOOGLETEST_VERSION "v1.15.2" CACHE STRING "Pinned googletest revision")
 set(CPPBOOSTSERVICELIB_GRPC_REPOSITORY "https://github.com/grpc/grpc" CACHE STRING "Pinned grpc repository")
 set(CPPBOOSTSERVICELIB_GRPC_VERSION "v1.71.0" CACHE STRING "Pinned grpc revision")
+set(CPPBOOSTSERVICELIB_GRPC_PROTOBUF_REPOSITORY "https://github.com/protocolbuffers/protobuf" CACHE STRING "Pinned grpc-protobuf repository")
+set(CPPBOOSTSERVICELIB_GRPC_PROTOBUF_REVISION "2d4414f384dc499af113b5991ce3eaa9df6dd931" CACHE STRING "Pinned grpc-protobuf revision")
 set(CPPBOOSTSERVICELIB_LIBRDKAFKA_REPOSITORY "https://github.com/confluentinc/librdkafka" CACHE STRING "Pinned librdkafka repository")
 set(CPPBOOSTSERVICELIB_LIBRDKAFKA_VERSION "v2.8.0" CACHE STRING "Pinned librdkafka revision")
 set(CPPBOOSTSERVICELIB_LIBCRON_REPOSITORY "https://github.com/PerMalmberg/libcron" CACHE STRING "Pinned libcron repository")
