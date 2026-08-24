@@ -17,7 +17,33 @@
 #include <servicelib/runtime/payload.hpp>
 #include <servicelib/runtime/schedule.hpp>
 
+namespace servicelib {
+template <typename T, typename R, typename E, typename Context>
+class InputStream;
+}
+
 namespace servicelib::datasource::cron {
+
+namespace detail {
+
+template <typename T, typename InputStreamType>
+class ScheduleCollector final {
+ public:
+  explicit ScheduleCollector(InputStreamType& input) noexcept : input_(input) {}
+
+  void out(MessageContext context, T&& value) {
+    input_.consume(std::move(context), Payload<T>::make(std::move(value)));
+  }
+
+  void out(MessageContext context, const T& value) {
+    input_.consume(std::move(context), Payload<T>::make(value));
+  }
+
+ private:
+  InputStreamType& input_;
+};
+
+}  // namespace detail
 
 // Converts the portable five-field UTC expression to libcron's six-field
 // syntax. libcron remains the parser and occurrence evaluator.
@@ -27,13 +53,18 @@ class Endpoint final {
  public:
   using Output = std::function<void(MessageContext, Payload<ScheduleTrigger>)>;
 
-  template <typename InputStreamType>
+  template <typename T, typename R, typename E, typename StreamContext,
+            typename Function>
   static std::shared_ptr<Endpoint> make(IServiceEnvironment& environment,
-                                        InputStreamType& input) {
+                                        InputStream<T, R, E, StreamContext>& input,
+                                        Function& function) {
+    using InputStreamType = InputStream<T, R, E, StreamContext>;
     return std::shared_ptr<Endpoint>(new Endpoint(
         environment, input.getEndpointId(),
-        [input = &input](MessageContext context, Payload<ScheduleTrigger> value) {
-          input->consume(std::move(context), std::move(value));
+        [input = &input, function = &function](
+            MessageContext context, Payload<ScheduleTrigger> trigger) {
+          detail::ScheduleCollector<T, InputStreamType> out(*input);
+          (*function)(std::move(context), trigger.get(), std::move(out));
         }));
   }
 
