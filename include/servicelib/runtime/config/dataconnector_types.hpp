@@ -92,6 +92,12 @@ struct TemporalDataConnectorConfig {
     std::string address;
     std::string namespaceName;
     std::string identity;
+    std::string apiKey;
+    bool tlsEnabled{};
+    std::string tlsServerName;
+    std::string tlsCaFile;
+    std::string tlsCertFile;
+    std::string tlsKeyFile;
     int maxConcurrentActivities{};
     int maxConcurrentWorkflows{};
     PropertiesMap properties;
@@ -275,11 +281,19 @@ inline TemporalDataConnectorConfig Parse(
   result.address = value["address"].As<std::string>("");
   result.namespaceName = value["namespace"].As<std::string>("");
   result.identity = value["identity"].As<std::string>("");
+  result.apiKey = value["apiKey"].As<std::string>("");
+  result.tlsEnabled = value["tlsEnabled"].As<bool>(false);
+  result.tlsServerName = value["tlsServerName"].As<std::string>("");
+  result.tlsCaFile = value["tlsCaFile"].As<std::string>("");
+  result.tlsCertFile = value["tlsCertFile"].As<std::string>("");
+  result.tlsKeyFile = value["tlsKeyFile"].As<std::string>("");
   result.maxConcurrentActivities = value["maxConcurrentActivities"].As<int>(0);
   result.maxConcurrentWorkflows = value["maxConcurrentWorkflows"].As<int>(0);
   detail::ParseRemainingProperties(
       value,
       {"id", "name", "implementation", "address", "namespace", "identity",
+       "apiKey", "tlsEnabled", "tlsServerName", "tlsCaFile", "tlsCertFile",
+       "tlsKeyFile",
        "maxConcurrentActivities", "maxConcurrentWorkflows"},
       result.properties);
   return result;

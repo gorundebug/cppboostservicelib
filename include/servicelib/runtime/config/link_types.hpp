@@ -51,6 +51,11 @@ struct ParallelCallSemanticsConfig {
 
 struct DurableCallSemanticsConfig {
   int idDataConnector{};
+  std::string taskQueue;
+  int workflowExecutionTimeout{};
+  int activityStartToCloseTimeout{};
+  int activityHeartbeatTimeout{};
+  int maximumAttempts{};
 
   servicelib::api::CallSemantics GetType() const noexcept {
     return servicelib::api::CallSemantics::kDurableCall;
@@ -121,7 +126,8 @@ inline CallSemanticsGroup MakeCallSemanticsGroup(
       result.parallelCall.emplace();
       break;
     case servicelib::api::CallSemantics::kDurableCall:
-      result.durableCall = DurableCallSemanticsConfig{idDataConnector};
+      result.durableCall.emplace();
+      result.durableCall->idDataConnector = idDataConnector;
       break;
     case servicelib::api::CallSemantics::kUndefined:
     case servicelib::api::CallSemantics::kInherited:
@@ -169,7 +175,16 @@ inline ParallelCallSemanticsConfig Parse(
 inline DurableCallSemanticsConfig Parse(
     const YamlValue& value,
     TypeTag<DurableCallSemanticsConfig>) {
-  return DurableCallSemanticsConfig{value["idDataConnector"].As<int>(0)};
+  DurableCallSemanticsConfig result;
+  result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.taskQueue = value["taskQueue"].As<std::string>("");
+  result.workflowExecutionTimeout = value["workflowExecutionTimeout"].As<int>(0);
+  result.activityStartToCloseTimeout =
+      value["activityStartToCloseTimeout"].As<int>(0);
+  result.activityHeartbeatTimeout =
+      value["activityHeartbeatTimeout"].As<int>(0);
+  result.maximumAttempts = value["maximumAttempts"].As<int>(0);
+  return result;
 }
 
 inline CallSemanticsGroup Parse(
