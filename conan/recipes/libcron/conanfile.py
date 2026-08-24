@@ -23,6 +23,11 @@ class LibcronConan(ConanFile):
     def layout(self):
         cmake_layout(self)
 
+    def package_id(self):
+        # libcron is deliberately compiled as C++17 even when its consumer is
+        # C++20; its binary identity must not vary with consumer cppstd.
+        self.info.settings.compiler.rm_safe("cppstd")
+
     def source(self):
         base = (os.getenv("SERVICEGEN_GITHUB_RAW_URL") or "https://github.com").rstrip("/")
         get(
@@ -49,7 +54,10 @@ add_library(libcron STATIC
   libcron/src/CronRandomization.cpp
   libcron/src/CronSchedule.cpp
   libcron/src/Task.cpp)
-target_compile_features(libcron PUBLIC cxx_std_17)
+set_target_properties(libcron PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO)
 target_compile_definitions(libcron PRIVATE HAS_UNCAUGHT_EXCEPTIONS)
 target_include_directories(libcron PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libcron/include>
