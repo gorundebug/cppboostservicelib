@@ -18,6 +18,7 @@ if [[ -n "${SERVICEGEN_DEPENDENCY_PROXY_DIR:-}" ]]; then
   docker_build_args+=(
     --add-host host.docker.internal:host-gateway
     --build-arg "PIP_INDEX_URL=$proxy_base/pypi-proxy/simple"
+    --build-arg "PIP_TRUSTED_HOST=$proxy_host"
     --build-arg "SERVICEGEN_APT_UBUNTU_ARCHIVE_URL=$proxy_base/apt-ubuntu-archive"
     --build-arg "SERVICEGEN_APT_UBUNTU_SECURITY_URL=$proxy_base/apt-ubuntu-security"
     --build-arg "SERVICEGEN_APT_UBUNTU_PORTS_URL=$proxy_base/apt-ubuntu-ports"

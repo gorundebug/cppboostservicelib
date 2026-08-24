@@ -2,6 +2,7 @@ FROM ubuntu:24.04
 
 ARG TARGETARCH
 ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=
 ARG SERVICEGEN_APT_UBUNTU_ARCHIVE_URL=
 ARG SERVICEGEN_APT_UBUNTU_SECURITY_URL=
 ARG SERVICEGEN_APT_UBUNTU_PORTS_URL=
@@ -22,7 +23,8 @@ RUN --mount=type=cache,id=servicegen-apt-lists-${TARGETARCH},target=/var/lib/apt
        libjemalloc-dev librdkafka-dev zlib1g-dev
 
 RUN python3 -m venv /opt/conan \
-    && /opt/conan/bin/pip install --no-cache-dir --index-url "$PIP_INDEX_URL" \
+    && PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
+       /opt/conan/bin/pip install --no-cache-dir --index-url "$PIP_INDEX_URL" \
        conan==2.31.1
 
 ENV PATH=/opt/conan/bin:$PATH
