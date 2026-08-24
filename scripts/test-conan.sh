@@ -24,7 +24,7 @@ docker run --rm \
   -v "$root:/workspace" \
   -w /workspace \
   "$image" \
-  bash -lc '
+  bash -euo pipefail -c '
     export CCACHE_DIR=/ccache
     export CCACHE_BASEDIR=/workspace
     export CCACHE_COMPILERCHECK=content

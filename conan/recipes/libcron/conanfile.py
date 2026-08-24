@@ -24,7 +24,7 @@ class LibcronConan(ConanFile):
         cmake_layout(self)
 
     def source(self):
-        base = os.getenv("SERVICEGEN_GITHUB_RAW_URL", "https://github.com").rstrip("/")
+        base = (os.getenv("SERVICEGEN_GITHUB_RAW_URL") or "https://github.com").rstrip("/")
         get(
             self,
             url=f"{base}/PerMalmberg/libcron/archive/refs/tags/v1.3.3.tar.gz",
