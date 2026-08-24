@@ -72,7 +72,7 @@ class CppBoostServiceLibConan(ConanFile):
         self.requires("yaml-cpp/0.8.0")
 
         if self.options.with_tests:
-            self.requires("gtest/1.15.0")
+            self.requires("gtest/1.15.2")
 
         if self.options.with_grpc or self.options.with_otel:
             self.requires("protobuf/5.29.3", override=True)
@@ -87,6 +87,12 @@ class CppBoostServiceLibConan(ConanFile):
 
         if self.options.with_cron:
             self.requires("libcron/1.3.3")
+
+    def build_requirements(self):
+        if self.options.with_grpc or self.options.with_otel:
+            self.tool_requires("protobuf/5.29.3", override=True)
+        if self.options.with_otel:
+            self.tool_requires("grpc/1.71.0", override=True)
 
     def validate(self):
         if self.settings.get_safe("compiler.cppstd"):
