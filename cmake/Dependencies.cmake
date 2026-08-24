@@ -16,6 +16,31 @@ if(CPPBOOSTSERVICELIB_FETCH_PROGRESS)
   set(FETCHCONTENT_QUIET OFF)
 endif()
 
+# Package targets imported while cppboostservicelib is configured as an
+# add_subdirectory are directory-scoped by default.  Generated API modules are
+# siblings of the framework directory and need the Conan-provided codegen
+# executables as ordinary targets, so promote those exact imports while we are
+# still in the directory that created them.
+function(_servicelib_promote_imported_target target_name)
+  if(NOT TARGET "${target_name}")
+    message(FATAL_ERROR
+        "Required imported dependency target is missing: ${target_name}")
+  endif()
+  get_target_property(_servicelib_aliased_target "${target_name}"
+      ALIASED_TARGET)
+  if(_servicelib_aliased_target)
+    set(_servicelib_imported_target "${_servicelib_aliased_target}")
+  else()
+    set(_servicelib_imported_target "${target_name}")
+  endif()
+  get_target_property(_servicelib_is_imported
+      "${_servicelib_imported_target}" IMPORTED)
+  if(_servicelib_is_imported)
+    set_property(TARGET "${_servicelib_imported_target}"
+        PROPERTY IMPORTED_GLOBAL TRUE)
+  endif()
+endfunction()
+
 if(CPPBOOSTSERVICELIB_ENABLE_CRON AND
    CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
   find_package(libcron CONFIG REQUIRED)
@@ -179,6 +204,10 @@ if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
     find_package(Protobuf CONFIG REQUIRED)
     find_package(gRPC CONFIG REQUIRED)
     find_package(asio-grpc CONFIG REQUIRED)
+    if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
+      _servicelib_promote_imported_target(protobuf::protoc)
+      _servicelib_promote_imported_target(gRPC::grpc_cpp_plugin)
+    endif()
   elseif(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "LOCAL")
     _servicelib_require_local(protobuf "${CPPBOOSTSERVICELIB_PROTOBUF_SOURCE_DIR}")
     _servicelib_require_local(gRPC "${CPPBOOSTSERVICELIB_GRPC_SOURCE_DIR}")
