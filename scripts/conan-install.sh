@@ -31,6 +31,7 @@ options=(
   -o "&:with_tests=${CPPBOOSTSERVICELIB_BUILD_TESTS:-True}"
 )
 
+"$root/scripts/conan-configure-remotes.sh"
 "$root/scripts/conan-export-recipes.sh"
 
 exec conan install "$root" \
