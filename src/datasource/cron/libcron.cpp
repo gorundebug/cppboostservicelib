@@ -174,7 +174,7 @@ struct Endpoint::Impl final {
       ++active;
     }
     try {
-      detail::ParallelExecutorRegistry::Post([this, scheduledAt] {
+      servicelib::detail::ParallelExecutorRegistry::Post([this, scheduledAt] {
         auto context = MessageContext{}.withStreamId(NewStreamId());
         const auto started = metrics.requestStart();
         std::exception_ptr error;
@@ -326,7 +326,7 @@ void LibcronDataSource::start(Context context) {
       }
     }
     impl_->timer = std::make_unique<boost::asio::steady_timer>(
-        detail::ParallelExecutorRegistry::Get());
+        servicelib::detail::ParallelExecutorRegistry::Get());
     impl_->scheduleTick();
   } catch (...) {
     impl_->started.store(false, std::memory_order_release);

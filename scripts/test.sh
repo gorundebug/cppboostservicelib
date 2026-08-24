@@ -42,6 +42,7 @@ docker run --rm \
       -DCMAKE_INSTALL_PREFIX=/workspace/build/docker-install \
       -DCPPBOOSTSERVICELIB_BUILD_TESTS=ON \
       -DCPPBOOSTSERVICELIB_ENABLE_KAFKA=ON \
+      -DCPPBOOSTSERVICELIB_ENABLE_CRON=ON \
     && cmake --build build/docker --parallel \
     && ctest --test-dir build/docker --output-on-failure \
     && cmake --install build/docker \

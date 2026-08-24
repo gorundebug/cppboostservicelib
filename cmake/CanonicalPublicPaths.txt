@@ -10,6 +10,7 @@ datasink/grpc/userver.hpp
 datasink/http/userver.hpp
 datasink/kafka/userver.hpp
 datasink/localsink/custom.hpp
+datasource/cron/libcron.hpp
 datasource/grpc/bidistreaming.hpp
 datasource/grpc/clientstreaming.hpp
 datasource/grpc/common.hpp
@@ -75,6 +76,7 @@ runtime/pool/taskpool.hpp
 runtime/pool/userver_aliases.hpp
 runtime/serde/serde.hpp
 runtime/serde/serdeimpl.hpp
+runtime/schedule.hpp
 runtime/serviceapp.hpp
 runtime/status/status.hpp
 runtime/status/web.generated.hpp
