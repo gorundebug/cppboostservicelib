@@ -118,8 +118,7 @@ inline constexpr std::array kCallSemanticsMap{
     std::pair{"FunctionCall"sv, CallSemantics::kFunctionCall},
     std::pair{"TaskPool"sv, CallSemantics::kTaskPool},
     std::pair{"PriorityTaskPool"sv, CallSemantics::kPriorityTaskPool},
-    std::pair{"ParallelCall"sv, CallSemantics::kParallelCall},
-    std::pair{"DurableCall"sv, CallSemantics::kDurableCall}};
+    std::pair{"ParallelCall"sv, CallSemantics::kParallelCall}};
 
 inline CallSemantics Parse(const config::YamlValue& value,
                          config::TypeTag<CallSemantics>) {

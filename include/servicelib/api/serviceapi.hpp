@@ -76,7 +76,6 @@ enum class CallSemantics {
   kTaskPool = 3,  // TaskPool
   kPriorityTaskPool = 4,  // PriorityTaskPool
   kParallelCall = 5,  // ParallelCall
-  kDurableCall = 6,  // DurableCall
 };
 
 enum class DataConnectorType {

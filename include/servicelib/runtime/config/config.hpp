@@ -234,25 +234,6 @@ class RuntimeConfig {
     }
     for (const auto* link : config_.GetLinks()) {
       link->Validate();
-      if (link->callSemantics && link->callSemantics->durableCall) {
-        const int connectorId =
-            link->callSemantics->durableCall->idDataConnector;
-        const auto connector = dataConnectorsByID_.find(connectorId);
-        if (connector == dataConnectorsByID_.end()) {
-          throw std::runtime_error(
-              "durable link from=" + std::to_string(link->from) + " to=" +
-              std::to_string(link->to) +
-              " references unknown Temporal data connector " +
-              std::to_string(connectorId));
-        }
-        if (connector->second.GetType() !=
-            servicelib::api::DataConnectorType::kTemporal) {
-          throw std::runtime_error(
-              "durable link from=" + std::to_string(link->from) + " to=" +
-              std::to_string(link->to) +
-              " requires a Temporal data connector");
-        }
-      }
       InsertUnique(linksByID_, LinkID{link->from, link->to}, link,
                    "duplicate link from=" + std::to_string(link->from) +
                        " to=" + std::to_string(link->to));

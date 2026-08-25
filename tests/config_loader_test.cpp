@@ -50,7 +50,7 @@ struct TemporalTopologyConfig final : servicelib::config::IConfig {
   std::vector<const servicelib::config::PoolConfig*> GetPools()
       const override { return {}; }
   std::vector<const servicelib::config::LinkConfig*> GetLinks()
-      const override { return {&durableLink}; }
+      const override { return {}; }
   std::vector<const servicelib::config::ModuleConfig*> GetModules()
       const override { return {}; }
   std::vector<const servicelib::config::TypeConfig*> GetTypes()
@@ -60,7 +60,6 @@ struct TemporalTopologyConfig final : servicelib::config::IConfig {
   servicelib::config::TemporalDataConnectorConfig temporalConnector;
   servicelib::config::CronEndpointConfig cronEndpoint;
   servicelib::config::TemporalEndpointConfig temporalEndpoint;
-  servicelib::config::LinkConfig durableLink;
 };
 
 TestConfig MakeConfig(servicelib::config::TypeTag<TestConfig>) {
@@ -183,11 +182,6 @@ temporalEndpoint:
   activityStartToCloseTimeout: 10000
   activityHeartbeatTimeout: 1000
   maximumAttempts: 5
-link:
-  from: 51
-  to: 52
-  callSemantics: DurableCall
-  idDataConnector: 32
 )");
   const servicelib::config::YamlValue topologyValue(topology);
   const auto cronConnector = topologyValue["cronConnector"]
@@ -208,12 +202,6 @@ link:
                                     .As<servicelib::config::TemporalEndpointConfig>();
   assert(temporalEndpoint.taskQueue == "automation");
   assert(temporalEndpoint.maximumAttempts == 5);
-  const auto durableLink =
-      topologyValue["link"].As<servicelib::config::LinkConfig>();
-  assert(durableLink.callSemantics.has_value());
-  assert(durableLink.callSemantics->durableCall.has_value());
-  assert(durableLink.callSemantics->durableCall->idDataConnector == 32);
-
   const servicelib::config::YamlValue nonUtcEndpoint(YAML::Load(R"(
 schedule: "0 * * * *"
 timezone: Europe/Moscow
@@ -244,21 +232,7 @@ timezone: Europe/Moscow
   topologyConfig.temporalEndpoint.id = 42;
   topologyConfig.temporalEndpoint.name = "durable-trigger";
   topologyConfig.temporalEndpoint.idDataConnector = 32;
-  topologyConfig.durableLink.from = 51;
-  topologyConfig.durableLink.to = 52;
-  topologyConfig.durableLink.callSemantics =
-      servicelib::config::MakeCallSemanticsGroup(
-          servicelib::api::CallSemantics::kDurableCall, {}, 0, false, 32);
   (void)servicelib::config::RuntimeConfig{topologyConfig};
-  topologyConfig.durableLink.callSemantics->durableCall->idDataConnector = 31;
-  bool rejectedWrongDurableConnector = false;
-  try {
-    (void)servicelib::config::RuntimeConfig{topologyConfig};
-  } catch (const std::runtime_error&) {
-    rejectedWrongDurableConnector = true;
-  }
-  assert(rejectedWrongDurableConnector);
-  topologyConfig.durableLink.callSemantics->durableCall->idDataConnector = 32;
   topologyConfig.cronEndpoint.idDataConnector = 32;
   bool rejectedWrongEndpointConnector = false;
   try {
