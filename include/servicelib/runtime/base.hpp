@@ -86,7 +86,7 @@ class NotCopyableOrMovable {
 
 class StreamBuilderContext;
 class StreamVerifyContext;
-class TopologyPrinter;
+struct TopologyPrinter;
 
 class StreamBase : public NotCopyableOrMovable {
   template <typename, typename>
