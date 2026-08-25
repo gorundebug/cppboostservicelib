@@ -23,6 +23,7 @@ struct HttpEndpointConfig {
     int id{};
     std::string name;
     int idDataConnector{};
+    bool tracingEnabled{};
     servicelib::api::HTTPMethodType httpMethodType{};
     std::string path;
     std::string functionName;
@@ -44,6 +45,7 @@ struct GrpcEndpointConfig {
     int id{};
     std::string name;
     int idDataConnector{};
+    bool tracingEnabled{};
     servicelib::api::GrpcMethodType grpcMethodType{};
     std::string methodName;
     std::string functionName;
@@ -65,6 +67,7 @@ struct KafkaEndpointConfig {
     int id{};
     std::string name;
     int idDataConnector{};
+    bool tracingEnabled{};
     bool enabled{};
     bool createTopic{};
     std::string topic;
@@ -90,6 +93,7 @@ struct CronEndpointConfig {
     int id{};
     std::string name;
     int idDataConnector{};
+    bool tracingEnabled{};
     bool enabled{};
     std::string schedule;
     std::string timezone{"UTC"};
@@ -114,6 +118,7 @@ struct TemporalEndpointConfig {
     int id{};
     std::string name;
     int idDataConnector{};
+    bool tracingEnabled{};
     bool enabled{};
     std::string taskQueue;
     std::string schedule;
@@ -144,6 +149,7 @@ struct CustomEndpointConfig {
     int id{};
     std::string name;
     int idDataConnector{};
+    bool tracingEnabled{};
     std::string functionName;
     std::string functionPackage;
     bool publicFunction{};
@@ -198,6 +204,10 @@ class EndpointConfigRef {
     return Visit([](const auto& c) { return c.idDataConnector; });
   }
 
+  bool GetTracingEnabled() const {
+    return Visit([](const auto& c) { return c.tracingEnabled; });
+  }
+
   servicelib::api::DataConnectorType GetType() const {
     return Visit([](const auto& c) { return c.GetType(); });
   }
@@ -220,13 +230,14 @@ inline HttpEndpointConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.tracingEnabled = value["tracingEnabled"].As<bool>(false);
   result.httpMethodType = value["httpMethodType"].As<servicelib::api::HTTPMethodType>(
       servicelib::api::HTTPMethodType::kUndefined);
   result.path = value["path"].As<std::string>("");
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "idDataConnector", "httpMethodType", "path", "functionName",
+      {"id", "name", "idDataConnector", "tracingEnabled", "httpMethodType", "path", "functionName",
        "functionPackage", "publicFunction", "functionDescription", "functionInitializerGroup",
        "functionModule"},
       result.properties);
@@ -239,13 +250,14 @@ inline GrpcEndpointConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.tracingEnabled = value["tracingEnabled"].As<bool>(false);
   result.grpcMethodType = value["grpcMethodType"].As<servicelib::api::GrpcMethodType>(
       servicelib::api::GrpcMethodType::kUndefined);
   result.methodName = value["methodName"].As<std::string>("");
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "idDataConnector", "grpcMethodType", "methodName", "functionName",
+      {"id", "name", "idDataConnector", "tracingEnabled", "grpcMethodType", "methodName", "functionName",
        "functionPackage", "publicFunction", "functionDescription", "functionInitializerGroup",
        "functionModule"},
       result.properties);
@@ -258,6 +270,7 @@ inline KafkaEndpointConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.tracingEnabled = value["tracingEnabled"].As<bool>(false);
   result.enabled = value["enabled"].As<bool>(false);
   result.createTopic = value["createTopic"].As<bool>(false);
   result.topic = value["topic"].As<std::string>("");
@@ -267,7 +280,7 @@ inline KafkaEndpointConfig Parse(const YamlValue& value,
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "idDataConnector", "enabled", "createTopic", "topic", "partitions", "consumerGroup",
+      {"id", "name", "idDataConnector", "tracingEnabled", "enabled", "createTopic", "topic", "partitions", "consumerGroup",
        "replicationFactor", "functionName", "functionPackage", "publicFunction",
        "functionDescription", "functionInitializerGroup", "functionModule"},
       result.properties);
@@ -280,10 +293,11 @@ inline CustomEndpointConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.tracingEnabled = value["tracingEnabled"].As<bool>(false);
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "idDataConnector", "functionName", "functionPackage", "publicFunction",
+      {"id", "name", "idDataConnector", "tracingEnabled", "functionName", "functionPackage", "publicFunction",
        "functionDescription", "functionInitializerGroup", "functionModule"},
       result.properties);
   return result;
@@ -295,6 +309,7 @@ inline CronEndpointConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.tracingEnabled = value["tracingEnabled"].As<bool>(false);
   result.enabled = value["enabled"].As<bool>(false);
   result.schedule = value["schedule"].As<std::string>("");
   result.timezone = value["timezone"].As<std::string>("UTC");
@@ -308,7 +323,7 @@ inline CronEndpointConfig Parse(const YamlValue& value,
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "idDataConnector", "enabled", "schedule", "timezone",
+      {"id", "name", "idDataConnector", "tracingEnabled", "enabled", "schedule", "timezone",
        "overlapPolicy", "missedRunPolicy", "functionName", "functionPackage",
        "publicFunction", "functionDescription", "functionInitializerGroup", "functionModule"},
       result.properties);
@@ -322,6 +337,7 @@ inline TemporalEndpointConfig Parse(
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.idDataConnector = value["idDataConnector"].As<int>(0);
+  result.tracingEnabled = value["tracingEnabled"].As<bool>(false);
   result.enabled = value["enabled"].As<bool>(false);
   result.taskQueue = value["taskQueue"].As<std::string>("");
   result.schedule = value["schedule"].As<std::string>("");
@@ -341,7 +357,7 @@ inline TemporalEndpointConfig Parse(
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "idDataConnector", "enabled", "taskQueue", "schedule",
+      {"id", "name", "idDataConnector", "tracingEnabled", "enabled", "taskQueue", "schedule",
        "scheduleId", "timezone", "overlapPolicy", "missedRunPolicy",
        "workflowExecutionTimeout", "activityStartToCloseTimeout",
        "activityHeartbeatTimeout", "maximumAttempts", "functionName",

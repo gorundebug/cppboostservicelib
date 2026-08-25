@@ -376,6 +376,8 @@ class Endpoint final : public IEndpoint {
   }
 
   void process(MessageContext context, Payload<Input> payload) {
+    context = ApplyDataSourceEndpointTracing(
+        std::move(context), environment_, endpointId_);
     std::shared_ptr<tracing::Tracer> tracer;
     if (tracing::SamplingEnabled(context)) {
       if (auto* tracingEngine = environment_.getTracing()) {

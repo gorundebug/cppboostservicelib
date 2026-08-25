@@ -175,7 +175,9 @@ struct Endpoint::Impl final {
     }
     try {
       servicelib::detail::ParallelExecutorRegistry::Post([this, scheduledAt] {
-        auto context = MessageContext{}.withStreamId(NewStreamId());
+        auto context = ApplyDataSourceEndpointTracing(
+            MessageContext{}.withStreamId(NewStreamId()), environment,
+            endpointId);
         const auto started = metrics.requestStart();
         std::exception_ptr error;
         try {

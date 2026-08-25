@@ -186,8 +186,16 @@ class FakeKafkaProducer final
     observed = topic + ":" + key + ":" + value;
     return {partition, 17, {}};
   }
+  servicelib::datasink::kafka::DeliveryResult sendWithHeaders(
+      std::string topic, std::string key, std::string value,
+      std::optional<std::uint32_t> partition,
+      const servicelib::detail::KafkaHeaders& headers) override {
+    observedHeaders = headers;
+    return send(std::move(topic), std::move(key), std::move(value), partition);
+  }
   std::optional<std::uint32_t> actualPartitionCount;
   std::string observed;
+  servicelib::detail::KafkaHeaders observedHeaders;
   int startCount{};
   int stopCount{};
 };
@@ -234,13 +242,42 @@ TEST(KafkaDataSink, SendsThroughAdapterAndCollectsDeliveryResult) {
   servicelib::datasink::kafka::Endpoint<std::string, int, KafkaSinkHandler>
       endpoint{stream, producer, KafkaSinkHandler{6}};
   endpoint.start(servicelib::Context{});
-  endpoint.consume(servicelib::MessageContext{},
+  servicelib::tracing::SpanContext trace{
+      "0123456789abcdef0123456789abcdef", "0123456789abcdef", true,
+      "vendor=value", "tenant=test"};
+  endpoint.consume(servicelib::MessageContext{}
+                       .withStreamId("incoming-stream")
+                       .withSampling(true)
+                       .withTrace(std::move(trace)),
                    servicelib::Payload<std::string>::make("payload"));
   EXPECT_EQ(producer.observed, "events:key:payload");
+  EXPECT_EQ(producer.observedHeaders.at("x-stream-id"), "kafka-sid");
+  EXPECT_EQ(producer.observedHeaders.at("traceparent"),
+            "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01");
+  EXPECT_EQ(producer.observedHeaders.at("tracestate"), "vendor=value");
+  EXPECT_EQ(producer.observedHeaders.at("baggage"), "tenant=test");
+  EXPECT_EQ(producer.observedHeaders.at("x-trace"), "1");
   EXPECT_EQ(result, 17);
   endpoint.stop(servicelib::Context{});
   EXPECT_EQ(producer.startCount, 1);
   EXPECT_EQ(producer.stopCount, 1);
+}
+
+TEST(KafkaContext, RestoresCanonicalPropagationHeaders) {
+  const servicelib::detail::KafkaHeaders headers{
+      {"x-stream-id", "stream-42"},
+      {"traceparent",
+       "00-0123456789abcdef0123456789abcdef-0123456789abcdef-00"},
+      {"tracestate", "vendor=value"},
+      {"baggage", "tenant=test"}};
+  const auto context = servicelib::detail::ContextFromKafkaHeaders(headers);
+  EXPECT_EQ(context.streamId(), "stream-42");
+  EXPECT_FALSE(context.samplingEnabled());
+  ASSERT_TRUE(context.trace().isValid());
+  EXPECT_EQ(context.trace().traceId, "0123456789abcdef0123456789abcdef");
+  EXPECT_EQ(context.trace().spanId, "0123456789abcdef");
+  EXPECT_EQ(context.trace().traceState, "vendor=value");
+  EXPECT_EQ(context.trace().baggage, "tenant=test");
 }
 
 TEST(KafkaDataSink, DisabledEndpointDoesNotStartProducer) {

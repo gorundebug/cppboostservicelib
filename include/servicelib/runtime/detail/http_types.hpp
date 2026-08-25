@@ -71,12 +71,7 @@ inline std::string NewStreamId() {
 
 inline std::optional<tracing::SpanContext> ParseTraceParent(
     std::string_view value) {
-  if (!tracing::SampledTraceParent(value)) return std::nullopt;
-  tracing::SpanContext result;
-  result.traceId = std::string(value.substr(3, 32));
-  result.spanId = std::string(value.substr(36, 16));
-  result.valid = true;
-  return result;
+  return tracing::ParseTraceParent(value);
 }
 
 inline MessageContext ContextFromHeaders(const Headers& headers,
@@ -106,7 +101,9 @@ inline MessageContext ContextFromHeaders(const Headers& headers,
     if (const auto parent = Header(headers, "traceparent")) {
       if (auto trace = ParseTraceParent(*parent)) {
         propagation = std::move(*trace);
-        context = std::move(context).withSampling(true);
+        if (tracing::SampledTraceParent(*parent)) {
+          context = std::move(context).withSampling(true);
+        }
       }
     }
     if (const auto traceState = Header(headers, "tracestate"))

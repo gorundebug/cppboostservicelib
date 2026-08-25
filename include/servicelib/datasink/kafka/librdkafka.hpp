@@ -26,6 +26,7 @@
 #include <servicelib/runtime/telemetry/librdkafka_statistics.hpp>
 #include <servicelib/runtime/datasink.hpp>
 #include <servicelib/runtime/detail/sync.hpp>
+#include <servicelib/runtime/detail/kafka_context.hpp>
 #include <servicelib/runtime/detail/kafka_admin.hpp>
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/environment/tracing/tracing.hpp>
@@ -52,6 +53,11 @@ class ProducerClient {
   virtual DeliveryResult send(std::string topic, std::string key,
                               std::string value,
                               std::optional<std::uint32_t> partition) = 0;
+  virtual DeliveryResult sendWithHeaders(
+      std::string topic, std::string key, std::string value,
+      std::optional<std::uint32_t> partition, const detail::KafkaHeaders&) {
+    return send(std::move(topic), std::move(key), std::move(value), partition);
+  }
 };
 
 class LibrdkafkaProducerClient final : public ProducerClient {
@@ -154,6 +160,14 @@ class LibrdkafkaProducerClient final : public ProducerClient {
 
   DeliveryResult send(std::string topic, std::string key, std::string value,
                       std::optional<std::uint32_t> partition) override {
+    return sendWithHeaders(std::move(topic), std::move(key), std::move(value),
+                           partition, {});
+  }
+
+  DeliveryResult sendWithHeaders(
+      std::string topic, std::string key, std::string value,
+      std::optional<std::uint32_t> partition,
+      const detail::KafkaHeaders& headers) override {
     if (!producer_) {
       return {partition, std::nullopt,
               std::make_exception_ptr(
@@ -170,13 +184,16 @@ class LibrdkafkaProducerClient final : public ProducerClient {
                               ? static_cast<std::int32_t>(*partition)
                               : static_cast<std::int32_t>(
                                     RD_KAFKA_PARTITION_UA);
+    auto kafkaHeaders = MakeHeaders(headers);
     const auto status = rd_kafka_producev(
         producer_.get(), RD_KAFKA_V_TOPIC(topic.c_str()),
         RD_KAFKA_V_PARTITION(selected), RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
         RD_KAFKA_V_KEY(key.data(), key.size()),
         RD_KAFKA_V_VALUE(value.data(), value.size()),
+        RD_KAFKA_V_HEADERS(kafkaHeaders),
         RD_KAFKA_V_OPAQUE(opaquePointer), RD_KAFKA_V_END);
     if (status != RD_KAFKA_RESP_ERR_NO_ERROR) {
+      if (kafkaHeaders) rd_kafka_headers_destroy(kafkaHeaders);
       (void)TakeDeliveryOpaque(opaquePointer);
       return {partition, std::nullopt,
               std::make_exception_ptr(std::runtime_error(
@@ -233,6 +250,22 @@ class LibrdkafkaProducerClient final : public ProducerClient {
       throw std::invalid_argument(std::string{"Kafka config "} + name +
                                   ": " + error);
     }
+  }
+
+  static rd_kafka_headers_t* MakeHeaders(const detail::KafkaHeaders& headers) {
+    if (headers.empty()) return nullptr;
+    auto* result = rd_kafka_headers_new(headers.size());
+    for (const auto& [name, value] : headers) {
+      const auto status = rd_kafka_header_add(
+          result, name.c_str(), static_cast<ssize_t>(name.size()),
+          value.data(), static_cast<ssize_t>(value.size()));
+      if (status != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        rd_kafka_headers_destroy(result);
+        throw std::runtime_error(std::string{"Kafka header: "} +
+                                 rd_kafka_err2str(status));
+      }
+    }
+    return result;
   }
 
   static void DeliveryCallback(rd_kafka_t*, const rd_kafka_message_t* message,
@@ -419,6 +452,8 @@ class Endpoint final {
     const auto startedAt = metrics_.requestStart();
     std::exception_ptr error;
     try {
+      detail::KafkaHeaders headers;
+      detail::InjectKafkaContext(context, headers);
       SinkMessage<R> message{
           topic_, context,
           [this](MessageContext resultContext, R result) {
@@ -427,10 +462,12 @@ class Endpoint final {
           [this, partitionPayload = payload]() {
             return handlerPartition(partitionPayload.get());
           },
-          [this](std::string key, std::string value,
+          [this, headers = std::move(headers)](std::string key,
+                 std::string value,
                  std::optional<std::uint32_t> selected) {
-            return producer_.send(topic_, std::move(key),
-                                  std::move(value), selected);
+            return producer_.sendWithHeaders(topic_, std::move(key),
+                                             std::move(value), selected,
+                                             headers);
           },
           tasks_};
       handler_.consumeMessage(context, streamContext_, begin->state,

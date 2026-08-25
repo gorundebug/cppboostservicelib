@@ -287,6 +287,8 @@ class Endpoint : public IEndpoint {
   }
 
   [[nodiscard]] tracing::ActiveSpan startTrace(MessageContext& context) {
+    context = ApplyDataSourceEndpointTracing(std::move(context), environment_,
+                                             endpointId_);
     if (!tracing::SamplingEnabled(context)) {
       return {};
     }

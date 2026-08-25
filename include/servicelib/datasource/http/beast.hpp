@@ -599,6 +599,8 @@ class BeastEndpoint final : public IBeastEndpoint {
 
   boost::asio::awaitable<servicelib::http::Response> handle(
       servicelib::http::Request request, MessageContext requestContext) override {
+    requestContext = ApplyDataSourceEndpointTracing(
+        std::move(requestContext), environment_, endpointId_);
     servicelib::http::Response httpResponse;
     httpResponse.keepAlive = request.keepAlive;
     auto admission = admit();

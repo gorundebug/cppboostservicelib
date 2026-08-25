@@ -29,6 +29,7 @@
 #include <exception>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -37,6 +38,11 @@
 namespace servicelib::tracing {
 
 enum class StatusCode : uint8_t { kUnset, kOk, kError };
+
+struct SpanContext;
+
+inline std::optional<SpanContext> ParseTraceParent(
+    std::string_view value) noexcept;
 
 // W3C trace-context admission shared by HTTP and gRPC transports. Version 00
 // has a fixed representation; malformed/all-zero identifiers must not enable
@@ -110,6 +116,31 @@ struct SpanContext {
 
   [[nodiscard]] bool isValid() const noexcept { return valid; }
 };
+
+inline std::optional<SpanContext> ParseTraceParent(
+    std::string_view value) noexcept {
+  if (value.size() != 55 || value[2] != '-' || value[35] != '-' ||
+      value[52] != '-') {
+    return std::nullopt;
+  }
+  const auto isHex = [](char ch) noexcept {
+    return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+           (ch >= 'A' && ch <= 'F');
+  };
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    if (i == 2 || i == 35 || i == 52) continue;
+    if (!isHex(value[i])) return std::nullopt;
+  }
+  const auto nonzero = [](std::string_view id) noexcept {
+    return id.find_first_not_of('0') != std::string_view::npos;
+  };
+  if (value.substr(0, 2) == "ff" || !nonzero(value.substr(3, 32)) ||
+      !nonzero(value.substr(36, 16))) {
+    return std::nullopt;
+  }
+  return SpanContext{std::string{value.substr(3, 32)},
+                     std::string{value.substr(36, 16)}, true, {}, {}};
+}
 
 // Go analog: tracing.Span.
 class Span {

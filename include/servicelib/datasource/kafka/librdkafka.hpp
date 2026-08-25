@@ -25,6 +25,7 @@
 #include <servicelib/datasource/localsource/custom.hpp>
 #include <servicelib/runtime/detail/kafka_admin.hpp>
 #include <servicelib/runtime/telemetry/librdkafka_statistics.hpp>
+#include <servicelib/runtime/detail/kafka_context.hpp>
 
 namespace servicelib::datasource::kafka {
 
@@ -33,20 +34,25 @@ class ConsumerMessage final {
   ConsumerMessage(std::string key, std::string value, std::string topic,
                   std::uint32_t partition, std::int64_t offset,
                   std::function<void()> commit = {},
-                  std::function<void(std::string)> markMessage = {})
+                  std::function<void(std::string)> markMessage = {},
+                  detail::KafkaHeaders headers = {})
       : key_(std::move(key)),
         value_(std::move(value)),
         topic_(std::move(topic)),
         partition_(partition),
         offset_(offset),
         commit_(std::move(commit)),
-        markMessage_(std::move(markMessage)) {}
+        markMessage_(std::move(markMessage)),
+        headers_(std::move(headers)) {}
 
   [[nodiscard]] const std::string& key() const noexcept { return key_; }
   [[nodiscard]] const std::string& value() const noexcept { return value_; }
   [[nodiscard]] const std::string& topic() const noexcept { return topic_; }
   [[nodiscard]] std::uint32_t partition() const noexcept { return partition_; }
   [[nodiscard]] std::int64_t offset() const noexcept { return offset_; }
+  [[nodiscard]] const detail::KafkaHeaders& headers() const noexcept {
+    return headers_;
+  }
 
   void commit() const {
     if (commit_) commit_();
@@ -64,6 +70,7 @@ class ConsumerMessage final {
   std::int64_t offset_{};
   std::function<void()> commit_;
   std::function<void(std::string)> markMessage_;
+  detail::KafkaHeaders headers_;
 };
 
 class ConsumerClient {
@@ -110,7 +117,7 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
                           CopyBytes(message->payload, message->len),
                           rd_kafka_topic_name(message->rkt),
                           static_cast<std::uint32_t>(message->partition),
-                          message->offset});
+                          message->offset, CopyHeaders(message.get())});
       }
     } catch (...) {
       rememberError(std::current_exception());
@@ -130,6 +137,7 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
     std::string topic;
     std::uint32_t partition{};
     std::int64_t offset{};
+    detail::KafkaHeaders headers;
   };
 
   struct PartitionLane final {
@@ -288,7 +296,8 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
         },
         [this, topic, partition, offset](std::string) {
           storeOffset(topic, partition, offset);
-        }});
+        },
+        std::move(message.headers)});
   }
 
   void stopLanes() noexcept {
@@ -373,6 +382,35 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
     return {static_cast<const char*>(data), size};
   }
 
+  static detail::KafkaHeaders CopyHeaders(
+      const rd_kafka_message_t* message) {
+    detail::KafkaHeaders result;
+    rd_kafka_headers_t* headers{};
+    if (!message || rd_kafka_message_headers(message, &headers) !=
+                        RD_KAFKA_RESP_ERR_NO_ERROR ||
+        !headers) {
+      return result;
+    }
+    for (std::size_t index = 0;; ++index) {
+      const char* name{};
+      const void* value{};
+      std::size_t size{};
+      if (rd_kafka_header_get_all(headers, index, &name, &value, &size) !=
+          RD_KAFKA_RESP_ERR_NO_ERROR) {
+        break;
+      }
+      if (!name) continue;
+      const std::string_view key{name};
+      if (key != "x-trace" && key != "traceparent" &&
+          key != "tracestate" && key != "baggage" &&
+          key != "x-stream-id") {
+        continue;
+      }
+      result[std::string{key}] = CopyBytes(value, size);
+    }
+    return result;
+  }
+
   static bool IsTransientError(rd_kafka_resp_err_t error) noexcept {
     switch (error) {
       case RD_KAFKA_RESP_ERR__TRANSPORT:
@@ -417,7 +455,9 @@ class ProducerAdapter final
 
   void start(Context, Consumer consumer) override {
     client_.start([consumer = std::move(consumer)](ConsumerMessage message) {
-      consumer(MessageContext{},
+      auto context =
+          servicelib::detail::ContextFromKafkaHeaders(message.headers());
+      consumer(std::move(context),
                Payload<ConsumerMessage>::make(std::move(message)));
     });
   }

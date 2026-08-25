@@ -16,11 +16,24 @@
 #include <utility>
 
 #include <servicelib/runtime/common.hpp>
+#include <servicelib/runtime/config/config.hpp>
 #include <servicelib/runtime/environment/log/log.hpp>
 #include <servicelib/runtime/environment/metrics/metrics.hpp>
+#include <servicelib/runtime/environment/tracing/tracing.hpp>
 #include <servicelib/runtime/payload.hpp>
 
 namespace servicelib {
+
+template <typename TEnvironment>
+[[nodiscard]] MessageContext ApplyDataSourceEndpointTracing(
+    MessageContext context, const TEnvironment& environment, int endpointId) {
+  const auto runtime = environment.getRuntimeConfigSnapshot();
+  const auto endpoint = runtime ? runtime->GetEndpointConfigByID(endpointId)
+                                : std::nullopt;
+  return endpoint && endpoint->GetTracingEnabled()
+             ? tracing::EnableSampling(std::move(context))
+             : std::move(context);
+}
 
 inline constexpr std::size_t kPendingRequestShardCount = 64;
 
