@@ -116,6 +116,16 @@ class CallerBase {
          tracing::Attribute::String("taskpoolname", std::string{poolName})});
   }
 
+  [[nodiscard]] std::shared_ptr<tracing::ActiveSpan> startAsyncCallSpan(
+      MessageContext& context, std::string_view type,
+      std::string_view poolName = {}) const {
+    if (!samplingEnabled(context)) {
+      return {};
+    }
+    return std::make_shared<tracing::ActiveSpan>(
+        startCallSpan(context, type, poolName));
+  }
+
   std::string sourceName_;
   std::string consumerName_;
   std::shared_ptr<tracing::Tracer> tracer_;
@@ -225,10 +235,11 @@ class TaskPoolCaller final : public Caller<T> {
   void consume(MessageContext ctx, Payload<T> payload) override {
     this->recordMessage();
     ctx = std::move(ctx).withoutCompletion();
+    auto activeSpan = this->startAsyncCallSpan(ctx, "taskpool", pool_.getName());
     try {
-      pool_.addTask(ctx, [this, ctx, p = std::move(payload)]() mutable {
-        [[maybe_unused]] auto activeSpan =
-            this->startCallSpan(ctx, "taskpool", pool_.getName());
+      pool_.addTask(ctx, [this, ctx, p = std::move(payload),
+                          activeSpan = std::move(activeSpan)]() mutable {
+        (void)activeSpan;
         consumer_.consume(std::move(ctx), std::move(p));
       });
     } catch (const std::exception& e) {
@@ -272,10 +283,13 @@ class PriorityTaskPoolCaller final : public Caller<T> {
     this->recordMessage();
     ctx = std::move(ctx).withoutCompletion();
     const int prio = ctx.hasPriority() ? ctx.priority() : priority_;
+    auto activeSpan =
+        this->startAsyncCallSpan(ctx, "prioritytaskpool", pool_.getName());
     try {
-      pool_.addTask(ctx, prio, [this, ctx, p = std::move(payload)]() mutable {
-        [[maybe_unused]] auto activeSpan =
-            this->startCallSpan(ctx, "prioritytaskpool", pool_.getName());
+      pool_.addTask(ctx, prio,
+                    [this, ctx, p = std::move(payload),
+                     activeSpan = std::move(activeSpan)]() mutable {
+        (void)activeSpan;
         consumer_.consume(std::move(ctx), std::move(p));
       });
     } catch (const std::exception& e) {
@@ -314,10 +328,11 @@ class ParallelCaller final : public Caller<T> {
   void consume(MessageContext ctx, Payload<T> payload) override {
     this->recordMessage();
     ctx = std::move(ctx).withoutCompletion();
+    auto activeSpan = this->startAsyncCallSpan(ctx, "parallel");
     environment_.parallel(
-        [this, ctx, p = std::move(payload)]() mutable {
-          [[maybe_unused]] auto activeSpan =
-              this->startCallSpan(ctx, "parallel");
+        [this, ctx, p = std::move(payload),
+         activeSpan = std::move(activeSpan)]() mutable {
+          (void)activeSpan;
           consumer_.consume(std::move(ctx), std::move(p));
         });
   }
