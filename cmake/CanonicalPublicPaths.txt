@@ -59,6 +59,7 @@ runtime/context.hpp
 runtime/datasink.hpp
 runtime/datasource.hpp
 runtime/detail/kafka_admin.hpp
+runtime/detail/kafka_context.hpp
 runtime/detail/storage.hpp
 runtime/detail/traits.hpp
 runtime/environment.hpp
