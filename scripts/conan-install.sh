@@ -40,6 +40,9 @@ options=(
 conan_home=$(conan config home)
 install -m 0644 "$root/conan/settings_user.yml" \
   "$conan_home/settings_user.yml"
+mkdir -p "$conan_home/extensions/hooks"
+install -m 0644 "$root/conan/hooks/hook_source_proxy.py" \
+  "$conan_home/extensions/hooks/hook_servicegen_source_proxy.py"
 source_download_cache=${CPPBOOSTSERVICELIB_CONAN_SOURCE_CACHE:-$conan_home/source-download-cache}
 mkdir -p "$source_download_cache"
 source_cache_args=(
