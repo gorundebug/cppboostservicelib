@@ -287,8 +287,7 @@ class Endpoint : public IEndpoint {
   }
 
   [[nodiscard]] tracing::ActiveSpan startTrace(MessageContext& context) {
-    context = ApplyDataSourceEndpointTracing(std::move(context), environment_,
-                                             endpointId_);
+    context = applyEndpointTracing(std::move(context));
     if (!tracing::SamplingEnabled(context)) {
       return {};
     }
@@ -477,6 +476,12 @@ class Endpoint : public IEndpoint {
   DataSourceEndpointMetrics& metrics() noexcept { return metrics_; }
   [[nodiscard]] bool tracingEnabled() const noexcept {
     return environment_.getTracing() != nullptr;
+  }
+
+  [[nodiscard]] MessageContext applyEndpointTracing(
+      MessageContext context) const {
+    return ApplyDataSourceEndpointTracing(std::move(context), environment_,
+                                          endpointId_);
   }
 
  private:
