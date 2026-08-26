@@ -49,8 +49,20 @@ source_cache_args=(
 # Conan keeps remote recipe archives in per-reference download directories.
 # An interrupted download may leave conan_export.tgz behind without a usable
 # recipe and the next install then fails with "file to download already
-# exists". These folders are explicitly non-critical cache state; clean them
-# before resolving while retaining recipes, packages, sources and build data.
+# exists". Unindexed orphan directories are invisible to `conan cache clean`,
+# so remove only incomplete downloads older than one minute first. The age
+# guard avoids touching a concurrent download sharing the same global cache.
+while IFS= read -r orphan_archive; do
+  download_dir=${orphan_archive%/conan_export.tgz}
+  recipe_dir=${download_dir%/d}/e
+  if [[ ! -d "$recipe_dir" ]]; then
+    rm -rf -- "$download_dir"
+  fi
+done < <(find "$conan_home/p" -mindepth 3 -maxdepth 3 -type f \
+  -path '*/d/conan_export.tgz' -mmin +1 -print 2>/dev/null || true)
+
+# Indexed download/temp folders are non-critical cache state. Keep recipes,
+# packages, sources, build data and the explicit source-download cache.
 conan cache clean "*" --download --temp >/dev/null
 
 lockfile=${CPPBOOSTSERVICELIB_CONAN_LOCKFILE:-}
