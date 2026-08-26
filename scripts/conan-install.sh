@@ -46,6 +46,13 @@ source_cache_args=(
   -cc "core.sources:download_cache=$source_download_cache"
 )
 
+# Conan keeps remote recipe archives in per-reference download directories.
+# An interrupted download may leave conan_export.tgz behind without a usable
+# recipe and the next install then fails with "file to download already
+# exists". These folders are explicitly non-critical cache state; clean them
+# before resolving while retaining recipes, packages, sources and build data.
+conan cache clean "*" --download --temp >/dev/null
+
 lockfile=${CPPBOOSTSERVICELIB_CONAN_LOCKFILE:-}
 if [[ -z "$lockfile" ]]; then
   lockfile="$root/conan/locks/$(basename "$profile").lock"
