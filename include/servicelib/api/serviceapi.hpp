@@ -169,6 +169,11 @@ enum class ScheduleMissedRunPolicy {
   kFireOnce = 1,  // FireOnce
 };
 
+enum class TemporalExecutionType {
+  kActivity = 0,  // Activity
+  kWorkflow = 1,  // Workflow
+};
+
 enum class TypeDefinitionFormat {
   kUndefined = 0,  // Undefined
   kNative = 1,  // Native

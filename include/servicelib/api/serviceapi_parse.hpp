@@ -256,6 +256,15 @@ inline ScheduleMissedRunPolicy Parse(const config::YamlValue& value,
   return detail::ParseEnum(value, kScheduleMissedRunPolicyMap);
 }
 
+inline constexpr std::array kTemporalExecutionTypeMap{
+    std::pair{"Activity"sv, TemporalExecutionType::kActivity},
+    std::pair{"Workflow"sv, TemporalExecutionType::kWorkflow}};
+
+inline TemporalExecutionType Parse(const config::YamlValue& value,
+                         config::TypeTag<TemporalExecutionType>) {
+  return detail::ParseEnum(value, kTemporalExecutionTypeMap);
+}
+
 inline constexpr std::array kTypeDefinitionFormatMap{
     std::pair{"Undefined"sv, TypeDefinitionFormat::kUndefined},
     std::pair{"Native"sv, TypeDefinitionFormat::kNative},
