@@ -16,7 +16,8 @@ fi
 if [[ -n "${CPPBOOSTSERVICELIB_TEST_BUILD_VOLUME:-}" ]]; then
   # Do not initialize the nested volume from a host-side build directory.
   # Host CMake caches contain absolute paths that are invalid in the container.
-  set -- "$@" -v "${CPPBOOSTSERVICELIB_TEST_BUILD_VOLUME}:/workspace/build:volume-nocopy"
+  set -- "$@" --mount \
+    "type=volume,source=${CPPBOOSTSERVICELIB_TEST_BUILD_VOLUME},target=/workspace/build,volume-nocopy"
 fi
 
 docker build -f "$ROOT/Dockerfile.cmake" -t cppboostservicelib-build "$ROOT"
