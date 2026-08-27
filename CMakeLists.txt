@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(cppboostservicelib VERSION 0.2.19 LANGUAGES CXX)
+project(cppboostservicelib VERSION 0.2.20 LANGUAGES CXX)
 
 option(SERVICEGEN_USE_CCACHE "Use ccache when it is available" ON)
 if(SERVICEGEN_USE_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
