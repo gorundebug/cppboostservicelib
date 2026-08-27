@@ -149,7 +149,7 @@ class OpenTelemetryCppConan(ConanFile):
 
     def source(self):
         source = dict(self.conan_data["sources"][self.version])
-        base = os.getenv("SERVICEGEN_GITHUB_RAW_URL")
+        base = os.getenv("DEPENDENCY_GITHUB_RAW_URL")
         if base:
             source["url"] = (
                 f"{base.rstrip('/')}/open-telemetry/opentelemetry-cpp/"

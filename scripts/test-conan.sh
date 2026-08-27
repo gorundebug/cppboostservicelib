@@ -8,32 +8,32 @@ build_type=${1:-Debug}
 docker_build_args=()
 docker_run_args=()
 conan_home_mount=cppboostservicelib-conan2:/conan
-if [[ -n "${SERVICEGEN_DEPENDENCY_PROXY_DIR:-}" ]]; then
-  proxy_host=${SERVICEGEN_DEPENDENCY_PROXY_DOCKER_HOST:-host.docker.internal}
-  proxy_port=${SERVICEGEN_NEXUS_PORT:-18081}
+if [[ -n "${DEPENDENCY_PROXY_DIR:-}" ]]; then
+  proxy_host=${DEPENDENCY_PROXY_DOCKER_HOST:-host.docker.internal}
+  proxy_port=${DEPENDENCY_PROXY_PORT:-18081}
   proxy_base="http://${proxy_host}:${proxy_port}/repository"
-  conan_home="$SERVICEGEN_DEPENDENCY_PROXY_DIR/conan2"
+  conan_home="$DEPENDENCY_PROXY_DIR/conan2"
   mkdir -p "$conan_home"
   conan_home_mount="$conan_home:/conan"
   docker_build_args+=(
     --add-host host.docker.internal:host-gateway
     --build-arg "PIP_INDEX_URL=$proxy_base/pypi-proxy/simple"
     --build-arg "PIP_TRUSTED_HOST=$proxy_host"
-    --build-arg "SERVICEGEN_APT_UBUNTU_ARCHIVE_URL=$proxy_base/apt-ubuntu-archive"
-    --build-arg "SERVICEGEN_APT_UBUNTU_SECURITY_URL=$proxy_base/apt-ubuntu-security"
-    --build-arg "SERVICEGEN_APT_UBUNTU_PORTS_URL=$proxy_base/apt-ubuntu-ports"
+    --build-arg "DEPENDENCY_APT_UBUNTU_ARCHIVE_URL=$proxy_base/apt-ubuntu-archive"
+    --build-arg "DEPENDENCY_APT_UBUNTU_SECURITY_URL=$proxy_base/apt-ubuntu-security"
+    --build-arg "DEPENDENCY_APT_UBUNTU_PORTS_URL=$proxy_base/apt-ubuntu-ports"
   )
   docker_run_args+=(
     --add-host host.docker.internal:host-gateway
-    -e "SERVICEGEN_CONAN_REMOTE_URL=$proxy_base/conan-proxy"
-    -e "SERVICEGEN_GITHUB_RAW_URL=$proxy_base/github-raw"
+    -e "DEPENDENCY_CONAN_REMOTE_URL=$proxy_base/conan-proxy"
+    -e "DEPENDENCY_GITHUB_RAW_URL=$proxy_base/github-raw"
   )
 else
   docker_build_args+=(
     --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}"
   )
   docker_run_args+=(
-    -e "SERVICEGEN_GITHUB_RAW_URL=${SERVICEGEN_GITHUB_RAW_URL:-}"
+    -e "DEPENDENCY_GITHUB_RAW_URL=${DEPENDENCY_GITHUB_RAW_URL:-}"
   )
 fi
 

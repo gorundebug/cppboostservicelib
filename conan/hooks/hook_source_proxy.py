@@ -27,10 +27,10 @@ _REPOSITORIES = {
 
 
 def _proxy_root() -> str | None:
-    explicit = os.getenv("SERVICEGEN_CONAN_SOURCE_PROXY_BASE", "").rstrip("/")
+    explicit = os.getenv("DEPENDENCY_CONAN_SOURCE_PROXY_BASE", "").rstrip("/")
     if explicit:
         return explicit
-    conan_remote = os.getenv("SERVICEGEN_CONAN_REMOTE_URL", "").rstrip("/")
+    conan_remote = os.getenv("DEPENDENCY_CONAN_REMOTE_URL", "").rstrip("/")
     if conan_remote.endswith("/conan-proxy"):
         return conan_remote.rsplit("/", 1)[0]
     return None

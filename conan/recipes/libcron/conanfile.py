@@ -28,7 +28,7 @@ class LibcronConan(ConanFile):
         self.info.settings.compiler.rm_safe("cppstd")
 
     def source(self):
-        base = (os.getenv("SERVICEGEN_GITHUB_RAW_URL") or "https://github.com").rstrip("/")
+        base = (os.getenv("DEPENDENCY_GITHUB_RAW_URL") or "https://github.com").rstrip("/")
         sources = self.conan_data["sources"][str(self.version)]
         get(
             self,

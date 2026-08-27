@@ -25,9 +25,9 @@ docker build \
   --add-host "host.docker.internal:host-gateway" \
   --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}" \
   --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-}" \
-  --build-arg "SERVICEGEN_APT_UBUNTU_ARCHIVE_URL=${SERVICEGEN_APT_UBUNTU_ARCHIVE_URL:-}" \
-  --build-arg "SERVICEGEN_APT_UBUNTU_SECURITY_URL=${SERVICEGEN_APT_UBUNTU_SECURITY_URL:-}" \
-  --build-arg "SERVICEGEN_APT_UBUNTU_PORTS_URL=${SERVICEGEN_APT_UBUNTU_PORTS_URL:-}" \
+  --build-arg "DEPENDENCY_APT_UBUNTU_ARCHIVE_URL=${DEPENDENCY_APT_UBUNTU_ARCHIVE_URL:-}" \
+  --build-arg "DEPENDENCY_APT_UBUNTU_SECURITY_URL=${DEPENDENCY_APT_UBUNTU_SECURITY_URL:-}" \
+  --build-arg "DEPENDENCY_APT_UBUNTU_PORTS_URL=${DEPENDENCY_APT_UBUNTU_PORTS_URL:-}" \
   -f "$ROOT/Dockerfile.cmake" -t cppboostservicelib-build "$ROOT"
 docker run --rm \
   --add-host "host.docker.internal:host-gateway" \
@@ -35,8 +35,8 @@ docker run --rm \
   -e CCACHE_BASEDIR=/workspace \
   -e CCACHE_COMPILERCHECK=content \
   -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-20G}" \
-  -e SERVICEGEN_GITHUB_RAW_URL="${SERVICEGEN_GITHUB_RAW_URL:-}" \
-  -e SERVICEGEN_CONAN_REMOTE_URL="${SERVICEGEN_CONAN_REMOTE_URL:-}" \
+  -e DEPENDENCY_GITHUB_RAW_URL="${DEPENDENCY_GITHUB_RAW_URL:-}" \
+  -e DEPENDENCY_CONAN_REMOTE_URL="${DEPENDENCY_CONAN_REMOTE_URL:-}" \
   -v cppboostservicelib-ccache:/ccache \
   "$@" \
   -v "$ROOT:/workspace" -w /workspace \
