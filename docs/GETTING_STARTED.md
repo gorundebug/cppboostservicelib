@@ -86,7 +86,7 @@ docker compose -f docker-compose.cmake.generated.yml run --build --rm \
 
 For a host CMake build, install `ccache`; CMake detects it without additional
 flags. Disable it for a diagnostic build with
-`-DSERVICEGEN_USE_CCACHE=OFF`. `make cpp-clean` removes the generated
+`-DUSE_CCACHE=OFF`. `make cpp-clean` removes the generated
 example's build and compiler-cache volumes; Docker's BuildKit download cache
 is managed separately by the selected Docker builder.
 
