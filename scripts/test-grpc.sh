@@ -12,7 +12,7 @@ docker run --rm \
   -v cppboostservicelib-ccache:/ccache \
   -v "$ROOT:/workspace" -w /workspace \
   cppboostservicelib-build \
-  bash -lc "cmake -S . -B build/grpc-docker -G Ninja \
+  bash -lc "cmake --fresh -S . -B build/grpc-docker -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCPPBOOSTSERVICELIB_DEPENDENCY_MODE=FETCH \
     -DCPPBOOSTSERVICELIB_ENABLE_GRPC=ON \

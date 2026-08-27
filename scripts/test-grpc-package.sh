@@ -12,7 +12,7 @@ docker run --rm \
   -v cppboostservicelib-ccache:/ccache \
   -v "$ROOT:/workspace" -w /workspace \
   cppboostservicelib-build \
-  bash -lc "cmake -S . -B build/grpc-docker -G Ninja \
+  bash -lc "cmake --fresh -S . -B build/grpc-docker -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCPPBOOSTSERVICELIB_DEPENDENCY_MODE=FETCH \
     -DCPPBOOSTSERVICELIB_ENABLE_GRPC=ON \
@@ -20,7 +20,7 @@ docker run --rm \
     && cmake --build build/grpc-docker --parallel \
     && cmake --install build/grpc-docker \
       --prefix /workspace/build/grpc-install \
-    && cmake -S tests/grpc_consumer -B build/grpc-consumer -G Ninja \
+    && cmake --fresh -S tests/grpc_consumer -B build/grpc-consumer -G Ninja \
       -DCMAKE_PREFIX_PATH=/workspace/build/grpc-install \
     && cmake --build build/grpc-consumer --parallel \
     && ./build/grpc-consumer/cppboostservicelib_grpc_consumer"

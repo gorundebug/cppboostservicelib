@@ -50,7 +50,7 @@ docker run --rm \
     if [[ ! -d /servicegen-cpp-source-cache ]]; then
       cache_reset=(-U "FETCHCONTENT_SOURCE_DIR_*" -U OTELCPP_PROTO_PATH)
     fi
-    cmake -S . -B build/docker -G Ninja "${cache_reset[@]}" \
+    cmake --fresh -S . -B build/docker -G Ninja "${cache_reset[@]}" \
       "${source_cache_args[@]}" \
       -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_INSTALL_PREFIX=/workspace/build/docker-install \
@@ -60,7 +60,7 @@ docker run --rm \
     && cmake --build build/docker --parallel \
     && ctest --test-dir build/docker --output-on-failure \
     && cmake --install build/docker \
-    && cmake -S tests/consumer -B build/consumer -G Ninja \
+    && cmake --fresh -S tests/consumer -B build/consumer -G Ninja \
       -DCMAKE_PREFIX_PATH=/workspace/build/docker-install \
     && cmake --build build/consumer --parallel \
     && ./build/consumer/cppboostservicelib_consumer
