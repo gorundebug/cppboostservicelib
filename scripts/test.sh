@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+source "$ROOT/scripts/dependency-proxy-env.sh"
 
 if [[ -n "${CPPBOOSTSERVICELIB_TEST_SOURCE_CACHE_DIR:-}" ]]; then
   if [[ ! -d "${CPPBOOSTSERVICELIB_TEST_SOURCE_CACHE_DIR}" ]]; then
@@ -20,12 +21,22 @@ if [[ -n "${CPPBOOSTSERVICELIB_TEST_BUILD_VOLUME:-}" ]]; then
     "type=volume,source=${CPPBOOSTSERVICELIB_TEST_BUILD_VOLUME},target=/workspace/build,volume-nocopy"
 fi
 
-docker build -f "$ROOT/Dockerfile.cmake" -t cppboostservicelib-build "$ROOT"
+docker build \
+  --add-host "host.docker.internal:host-gateway" \
+  --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}" \
+  --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-}" \
+  --build-arg "SERVICEGEN_APT_UBUNTU_ARCHIVE_URL=${SERVICEGEN_APT_UBUNTU_ARCHIVE_URL:-}" \
+  --build-arg "SERVICEGEN_APT_UBUNTU_SECURITY_URL=${SERVICEGEN_APT_UBUNTU_SECURITY_URL:-}" \
+  --build-arg "SERVICEGEN_APT_UBUNTU_PORTS_URL=${SERVICEGEN_APT_UBUNTU_PORTS_URL:-}" \
+  -f "$ROOT/Dockerfile.cmake" -t cppboostservicelib-build "$ROOT"
 docker run --rm \
+  --add-host "host.docker.internal:host-gateway" \
   -e CCACHE_DIR=/ccache \
   -e CCACHE_BASEDIR=/workspace \
   -e CCACHE_COMPILERCHECK=content \
   -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-20G}" \
+  -e SERVICEGEN_GITHUB_RAW_URL="${SERVICEGEN_GITHUB_RAW_URL:-}" \
+  -e SERVICEGEN_CONAN_REMOTE_URL="${SERVICEGEN_CONAN_REMOTE_URL:-}" \
   -v cppboostservicelib-ccache:/ccache \
   "$@" \
   -v "$ROOT:/workspace" -w /workspace \
