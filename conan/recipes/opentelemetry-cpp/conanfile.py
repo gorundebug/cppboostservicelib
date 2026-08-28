@@ -96,7 +96,7 @@ class OpenTelemetryCppConan(ConanFile):
 
         if self.options.with_otlp_grpc:
             # Version range matches arrow, which uses this as a dependency
-            self.requires("grpc/[>=1.67.1 <2]", transitive_headers=True, transitive_libs=True)
+            self.requires("grpc/[>=1.67.1 <2]@gorundebug/boost", transitive_headers=True, transitive_libs=True)
 
         if self._needs_proto:
             # This will resolve to the pinned version coming from grpc
@@ -137,12 +137,12 @@ class OpenTelemetryCppConan(ConanFile):
     def build_requirements(self):
         if self._needs_proto:
             self.tool_requires(
-                f"opentelemetry-proto/{VERSIONS['opentelemetry-proto']}"
+                f"opentelemetry-proto/{VERSIONS['opentelemetry-proto']}@gorundebug/boost"
             )
             self.tool_requires("protobuf/<host_version>")
 
         if self.options.with_otlp_grpc:
-            self.tool_requires("grpc/<host_version>")
+            self.tool_requires("grpc/<host_version>@gorundebug/boost")
 
         if Version(self.version) >= "1.24.0":
             self.tool_requires("cmake/[>=3.16]")

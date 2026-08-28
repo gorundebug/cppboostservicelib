@@ -163,7 +163,7 @@ class GrpcConan(ConanFile):
         self.tool_requires(f"protobuf/{VERSIONS['protobuf']}")
         if cross_building(self):
             # when cross compiling we need pre compiled grpc plugins for protoc
-            self.tool_requires(f"grpc/{self.version}")
+            self.tool_requires(f"grpc/{self.version}@gorundebug/boost")
 
     def source(self):
         source = dict(self.conan_data["sources"][self.version])

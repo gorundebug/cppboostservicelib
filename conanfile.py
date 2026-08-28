@@ -13,6 +13,7 @@ from dependencies_generated import VERSIONS
 
 
 required_conan_version = ">=2.8.0"
+LOCAL_RECIPE_NAMESPACE = "@gorundebug/boost"
 
 
 class CppBoostServiceLibConan(ConanFile):
@@ -95,27 +96,27 @@ class CppBoostServiceLibConan(ConanFile):
         self.requires(f"yaml-cpp/{VERSIONS['yaml-cpp']}")
 
         if self.options.with_tests:
-            self.requires(f"gtest/{VERSIONS['googletest']}")
+            self.requires(f"gtest/{VERSIONS['googletest']}{LOCAL_RECIPE_NAMESPACE}")
 
         if self.options.with_grpc or self.options.with_otel:
             self.requires(f"protobuf/{VERSIONS['protobuf']}", override=True)
-            self.requires(f"grpc/{VERSIONS['grpc']}", override=True)
+            self.requires(f"grpc/{VERSIONS['grpc']}{LOCAL_RECIPE_NAMESPACE}", override=True)
             self.requires(f"asio-grpc/{VERSIONS['asio-grpc']}")
 
         if self.options.with_kafka:
             self.requires(f"librdkafka/{VERSIONS['librdkafka']}")
 
         if self.options.with_otel:
-            self.requires(f"opentelemetry-cpp/{VERSIONS['opentelemetry-cpp']}")
+            self.requires(f"opentelemetry-cpp/{VERSIONS['opentelemetry-cpp']}{LOCAL_RECIPE_NAMESPACE}")
 
         if self.options.with_cron:
-            self.requires(f"libcron/{VERSIONS['libcron']}")
+            self.requires(f"libcron/{VERSIONS['libcron']}{LOCAL_RECIPE_NAMESPACE}")
 
     def build_requirements(self):
         if self.options.with_grpc or self.options.with_otel:
             self.tool_requires(f"protobuf/{VERSIONS['protobuf']}", override=True)
         if self.options.with_otel:
-            self.tool_requires(f"grpc/{VERSIONS['grpc']}", override=True)
+            self.tool_requires(f"grpc/{VERSIONS['grpc']}{LOCAL_RECIPE_NAMESPACE}", override=True)
 
     def validate(self):
         if self.settings.get_safe("compiler.cppstd"):
