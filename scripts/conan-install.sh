@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+dependency_retry="$root/scripts/retry-dependency-command.sh"
 source "$root/scripts/conan-cache-guard.sh"
 dependency_conan_cache_guard "$0" "$@"
 build_type=${1:-Release}
@@ -51,21 +52,15 @@ source_cache_args=(
   -cc "core.sources:download_cache=$source_download_cache"
 )
 
-# Conan keeps remote recipe and package archives in per-reference download
-# directories. An interrupted download may leave a .tgz behind without usable
-# cache state and the next install then fails with "file to download already
-# exists". Unindexed or revision-stale directories can be invisible to
-# `conan cache clean`, so remove their non-critical archives once they are
-# older than one minute. The age guard avoids touching a concurrent download.
-while IFS= read -r orphan_archive; do
-  download_dir=${orphan_archive%/*}
-  rm -rf -- "$download_dir"
-done < <(find "$conan_home/p" -mindepth 3 -maxdepth 3 -type f \
-  -path '*/d/*.tgz' -mmin +1 -print 2>/dev/null || true)
-
-# Indexed download/temp folders are non-critical cache state. Keep recipes,
-# packages, sources, build data and the explicit source-download cache.
-conan cache clean "*" --download --temp >/dev/null
+publish_built_graph() {
+  local graph_file=$1 built_list
+  [[ "${DEPENDENCY_CONAN_PUBLISH:-0}" == "1" ]] || return 0
+  built_list="${graph_file%.json}.built.json"
+  conan list --graph="$graph_file" --graph-binaries=build \
+    --format=json --out-file="$built_list"
+  "$dependency_retry" conan upload --list="$built_list" \
+    --remote=dependency-cache-write --confirm --check
+}
 
 lockfile=${CPPBOOSTSERVICELIB_CONAN_LOCKFILE:-}
 if [[ -z "$lockfile" ]]; then
@@ -83,7 +78,23 @@ fi
 "$root/scripts/conan-configure-remotes.sh"
 "$root/scripts/conan-export-recipes.sh"
 
-exec conan install "$root" \
+output_folder=
+args=("${@:2}")
+for ((index = 0; index < ${#args[@]}; index++)); do
+  case "${args[$index]}" in
+    --output-folder=*) output_folder=${args[$index]#*=} ;;
+    --output-folder|-of)
+      if (( index + 1 < ${#args[@]} )); then
+        output_folder=${args[$((index + 1))]}
+      fi
+      ;;
+  esac
+done
+output_folder=${output_folder:-$root/build/conan-${build_type,,}}
+mkdir -p "$output_folder"
+graph_file="$output_folder/conan-install.graph.json"
+
+"$dependency_retry" conan install "$root" \
   --profile:host "$profile" \
   --profile:build "$profile" \
   -s:h "build_type=$build_type" \
@@ -92,4 +103,8 @@ exec conan install "$root" \
   "${source_cache_args[@]}" \
   "${lock_args[@]}" \
   "${options[@]}" \
-  "${@:2}"
+  "${@:2}" \
+  --format=json \
+  --out-file="$graph_file"
+
+publish_built_graph "$graph_file"

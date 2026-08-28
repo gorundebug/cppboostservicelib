@@ -10,7 +10,10 @@ if [[ -n "${DEPENDENCY_PROXY_DIR:-}" ]]; then
   export DEPENDENCY_CONAN_HOME="${DEPENDENCY_PROXY_DIR}/conan2"
   export DEPENDENCY_DOCKER_REGISTRY="${dependency_registry_host}:${dependency_registry_port}"
   export DEPENDENCY_GITHUB_RAW_URL="${servicegen_proxy_base}/github-raw"
-  export DEPENDENCY_CONAN_REMOTE_URL="${servicegen_proxy_base}/conan-proxy"
+  export DEPENDENCY_CONAN_REMOTE_URL="${servicegen_proxy_base}/conan-group"
+  export DEPENDENCY_CONAN_UPLOAD_URL="${servicegen_proxy_base}/conan-hosted"
+  export DEPENDENCY_CONAN_PUBLISH=1
+  export DEPENDENCY_CONAN_CREDENTIAL_FILE="${DEPENDENCY_PROXY_DIR%/}/conan.publisher.credential"
   export PIP_INDEX_URL="${servicegen_proxy_base}/pypi-proxy/simple"
   export PIP_TRUSTED_HOST="${servicegen_proxy_docker_host}"
   export DEPENDENCY_APT_UBUNTU_ARCHIVE_URL="${servicegen_proxy_base}/apt-ubuntu-archive"

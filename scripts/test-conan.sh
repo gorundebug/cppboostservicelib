@@ -29,8 +29,12 @@ if [[ -n "${DEPENDENCY_PROXY_DIR:-}" ]]; then
   )
   docker_run_args+=(
     --add-host host.docker.internal:host-gateway
-    -e "DEPENDENCY_CONAN_REMOTE_URL=$proxy_base/conan-proxy"
+    -e "DEPENDENCY_CONAN_REMOTE_URL=$proxy_base/conan-group"
+    -e "DEPENDENCY_CONAN_UPLOAD_URL=$proxy_base/conan-hosted"
+    -e "DEPENDENCY_CONAN_PUBLISH=1"
+    -e "DEPENDENCY_CONAN_CREDENTIAL_FILE=/run/secrets/dependency_conan_credential"
     -e "DEPENDENCY_GITHUB_RAW_URL=$proxy_base/github-raw"
+    -v "${DEPENDENCY_CONAN_CREDENTIAL_FILE}:/run/secrets/dependency_conan_credential:ro"
   )
 else
   docker_build_args+=(
