@@ -2,12 +2,16 @@
 set -euo pipefail
 
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+source "$root/scripts/dependency-proxy-env.sh"
 image=${CPPBOOSTSERVICELIB_CONAN_IMAGE:-cppboostservicelib-conan-build}
 build_type=${1:-Debug}
 
 docker_build_args=()
 docker_run_args=()
 conan_home_mount=cppboostservicelib-conan2:/conan
+docker_build_args+=(
+  --build-arg "DEPENDENCY_DOCKER_REGISTRY=${DEPENDENCY_DOCKER_REGISTRY:-docker.io}"
+)
 if [[ -n "${DEPENDENCY_PROXY_DIR:-}" ]]; then
   proxy_host=${DEPENDENCY_PROXY_DOCKER_HOST:-host.docker.internal}
   proxy_port=${DEPENDENCY_PROXY_PORT:-18081}

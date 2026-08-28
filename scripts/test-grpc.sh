@@ -2,8 +2,10 @@
 set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+source "$ROOT/scripts/dependency-proxy-env.sh"
 
-docker build -f "$ROOT/Dockerfile.cmake" -t cppboostservicelib-build "$ROOT"
+docker build --build-arg "DEPENDENCY_DOCKER_REGISTRY=${DEPENDENCY_DOCKER_REGISTRY:-docker.io}" \
+  -f "$ROOT/Dockerfile.cmake" -t cppboostservicelib-build "$ROOT"
 docker run --rm \
   -e CCACHE_DIR=/ccache \
   -e CCACHE_BASEDIR=/workspace \

@@ -23,6 +23,7 @@ fi
 
 docker build \
   --add-host "host.docker.internal:host-gateway" \
+  --build-arg "DEPENDENCY_DOCKER_REGISTRY=${DEPENDENCY_DOCKER_REGISTRY:-docker.io}" \
   --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}" \
   --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-}" \
   --build-arg "DEPENDENCY_APT_UBUNTU_ARCHIVE_URL=${DEPENDENCY_APT_UBUNTU_ARCHIVE_URL:-}" \
