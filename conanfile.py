@@ -104,7 +104,7 @@ class CppBoostServiceLibConan(ConanFile):
             self.requires(f"asio-grpc/{VERSIONS['asio-grpc']}")
 
         if self.options.with_kafka:
-            self.requires(f"librdkafka/{VERSIONS['librdkafka']}")
+            self.requires(f"librdkafka/{VERSIONS['librdkafka']}@gorundebug/boost")
 
         if self.options.with_otel:
             self.requires(f"opentelemetry-cpp/{VERSIONS['opentelemetry-cpp']}{LOCAL_RECIPE_NAMESPACE}")

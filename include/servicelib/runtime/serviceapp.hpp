@@ -102,6 +102,12 @@ class ServiceLifecycle final {
 
   void stop(Context context,
             log::Logger& logger = log::NoopLogger::instance()) {
+    stopBeforeGraphDrain(context, logger);
+    stopAfterGraphDrain(context, logger);
+  }
+
+  void stopBeforeGraphDrain(
+      Context context, log::Logger& logger = log::NoopLogger::instance()) {
     if (state_ == State::kCreated) {
       state_ = State::kStopped;
       clear();
@@ -119,7 +125,15 @@ class ServiceLifecycle final {
       appendReverse(firstPhase, entries_[index(kind)]);
     }
     stopPhase(context, logger, firstPhase);
+  }
 
+  void stopAfterGraphDrain(
+      Context context, log::Logger& logger = log::NoopLogger::instance()) {
+    if (state_ == State::kStopped) return;
+    if (state_ != State::kStopping) {
+      throw std::logic_error(
+          "service lifecycle graph drain phase has not started");
+    }
     std::vector<Entry*> sinks;
     appendReverse(sinks, entries_[index(ServiceComponentKind::kDataSink)]);
     stopPhase(context, logger, sinks);
@@ -266,10 +280,15 @@ class ServiceLifecycle final {
       // work. A per-component control task preserves canonical parallel stop
       // semantics without occupying a reactor worker or deadlocking the same
       // bounded executor that is being drained.
+      auto stop = entry->stop;
+      auto owner = entry->owner;
       tasks.push_back(std::async(
-          std::launch::async, [entry, context]() mutable -> std::exception_ptr {
+          std::launch::async,
+          [stop = std::move(stop), owner = std::move(owner),
+           context]() mutable -> std::exception_ptr {
+            static_cast<void>(owner);
             try {
-              entry->stop(std::move(context));
+              stop(std::move(context));
               return {};
             } catch (...) {
               return std::current_exception();
@@ -284,6 +303,8 @@ class ServiceLifecycle final {
           ready = false;
         }
       }
+    } else {
+      for (auto& task : tasks) task.wait();
     }
 
     if (!ready) {
@@ -300,12 +321,10 @@ class ServiceLifecycle final {
       }
     }
 
-    // Join every component stop call before releasing ownership. A shutdown
-    // deadline is observable through telemetry, but never permits accepted
-    // asynchronous work to outlive the graph.
-    for (auto& task : tasks) {
-      task.wait();
-    }
+    // Never release component or graph ownership while stop() is still using
+    // it. The deadline is reported above; the process supervisor remains the
+    // hard upper bound if foreign or user code refuses to quiesce.
+    for (auto& task : tasks) task.wait();
 
     for (std::size_t i = 0; i < tasks.size(); ++i) {
       const auto error = tasks[i].get();
@@ -469,9 +488,23 @@ class ServiceApp
         context = context.bounded(
             std::chrono::milliseconds{service->shutdownTimeout});
       }
-      lifecycle_.stop(std::move(context), this->getLogger());
+      lifecycle_.stopBeforeGraphDrain(context, this->getLogger());
     } catch (...) {
       lifecycleError = std::current_exception();
+    }
+    // First drain ordinary graph work while callers and streams are still
+    // alive. Sink completion may itself emit result/error values, so sinks
+    // must quiesce before the execution runtime is released.
+    if (!this->drainExecutionRuntime(context)) {
+      try {
+        this->getLogger().warn("service graph drain timed out");
+      } catch (...) {
+      }
+    }
+    try {
+      lifecycle_.stopAfterGraphDrain(context, this->getLogger());
+    } catch (...) {
+      if (!lifecycleError) lifecycleError = std::current_exception();
     }
     this->stopExecutionRuntime();
     releaseOwnedRuntimeObjects();

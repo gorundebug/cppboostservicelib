@@ -19,8 +19,8 @@ include(cmake/CompilerOptions.cmake)
 option(CPPBOOSTSERVICELIB_BUILD_TESTS "Build framework tests" ON)
 include(cmake/Dependencies.cmake)
 
-find_package(Threads REQUIRED)
-find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED GLOBAL)
+find_package(OpenSSL REQUIRED GLOBAL)
 
 # FetchContent dependency targets expose their headers as ordinary include
 # directories. Keep warnings strict for ServiceLib and its consumers, but do
@@ -110,12 +110,13 @@ if(CPPBOOSTSERVICELIB_ENABLE_CRON)
   add_library(servicelib::cron ALIAS cppboostservicelib_cron)
   set_target_properties(cppboostservicelib_cron PROPERTIES EXPORT_NAME cron)
   target_compile_features(cppboostservicelib_cron PUBLIC cxx_std_20)
-  target_include_directories(cppboostservicelib_cron SYSTEM PRIVATE
-      ${libcron_SOURCE_DIR}/libcron/include
-      ${libcron_date_SOURCE_DIR}/include)
   target_link_libraries(cppboostservicelib_cron PUBLIC servicelib::servicelib)
   if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
     target_link_libraries(cppboostservicelib_cron PRIVATE libcron::libcron)
+  else()
+    target_include_directories(cppboostservicelib_cron SYSTEM PRIVATE
+        ${libcron_SOURCE_DIR}/libcron/include
+        ${libcron_date_SOURCE_DIR}/include)
   endif()
 endif()
 

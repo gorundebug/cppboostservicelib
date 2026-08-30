@@ -1,0 +1,58 @@
+{
+  "archives.boost.io": {
+    "repository": "conan-source-archives-boost",
+    "upstream": "https://archives.boost.io"
+  },
+  "cmake.org": {
+    "repository": "conan-source-cmake",
+    "upstream": "https://cmake.org"
+  },
+  "curl.se": {
+    "repository": "conan-source-curl",
+    "upstream": "https://curl.se"
+  },
+  "dist.schmorp.de": {
+    "repository": "conan-source-schmorp",
+    "upstream": "http://dist.schmorp.de"
+  },
+  "distfiles.ariadne.space": {
+    "repository": "conan-source-ariadne",
+    "upstream": "https://distfiles.ariadne.space"
+  },
+  "ftp.gnu.org": {
+    "repository": "conan-source-gnu-ftp",
+    "upstream": "https://ftp.gnu.org"
+  },
+  "ftpmirror.gnu.org": {
+    "repository": "conan-source-gnu-mirror",
+    "upstream": "https://ftpmirror.gnu.org"
+  },
+  "github.com": {
+    "repository": "github-raw",
+    "upstream": "https://github.com"
+  },
+  "https.git.savannah.gnu.org": {
+    "repository": "conan-source-savannah-git",
+    "upstream": "https://https.git.savannah.gnu.org"
+  },
+  "mirrors.kernel.org": {
+    "repository": "conan-source-kernel",
+    "upstream": "https://mirrors.kernel.org"
+  },
+  "sourceforge.net": {
+    "repository": "conan-source-sourceforge",
+    "upstream": "https://sourceforge.net"
+  },
+  "sourceware.org": {
+    "repository": "conan-source-sourceware",
+    "upstream": "https://sourceware.org"
+  },
+  "www.mirrorservice.org": {
+    "repository": "conan-source-mirrorservice",
+    "upstream": "https://www.mirrorservice.org"
+  },
+  "zlib.net": {
+    "repository": "conan-source-zlib",
+    "upstream": "https://zlib.net"
+  }
+}

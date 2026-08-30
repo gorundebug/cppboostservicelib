@@ -11,8 +11,7 @@ dependency_conan_cache_guard() {
     return
   fi
 
-  local conan_home
-  conan_home=$(conan config home)
+  local conan_home=${CONAN_HOME:-${HOME:?HOME is required}/.conan2}
   mkdir -p "$conan_home"
   if ! command -v flock >/dev/null 2>&1; then
     echo "flock is required to use the shared Conan cache safely" >&2

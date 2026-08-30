@@ -152,7 +152,6 @@ class GrpcRuntime final {
     while (state == State::kCreated || state == State::kRunning) {
       if (state_.compare_exchange_weak(state, State::kStopping)) {
         ioWork_.reset();
-        grpcWork_.reset();
         if (metricsTimer_) {
           try {
             metricsTimer_->cancel();
@@ -166,7 +165,12 @@ class GrpcRuntime final {
             signalSet_->cancel(ignored);
           }
         }
-        grpcContext_->stop();
+        // run_completion_queue observes state_ as its stop predicate. Do not
+        // stop GrpcContext while its worker thread contexts are unwinding:
+        // asio-grpc may wake the shared grpc::Alarm from every worker exit,
+        // which races with a concurrent GrpcContext::stop(). The workers poll
+        // with a bounded latency, so joining them first is both prompt and the
+        // native asio-grpc shutdown order.
         ioContext_.stop();
         return;
       }
@@ -181,6 +185,9 @@ class GrpcRuntime final {
     for (auto& worker : workers_)
       if (worker.joinable()) worker.join();
     workers_.clear();
+    // With every GrpcContext worker gone, releasing the final work guard may
+    // stop and wake the completion queue without a competing Alarm::Set.
+    grpcWork_.reset();
     if (state_.load() == State::kStopping) state_.store(State::kStopped);
     if (blockingPool_) {
       blockingPool_->stop();

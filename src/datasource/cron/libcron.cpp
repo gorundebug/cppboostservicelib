@@ -111,10 +111,13 @@ std::string ToLibcronExpression(const std::string& expression) {
 
 struct Endpoint::Impl final {
   Impl(IServiceEnvironment& environmentValue, int endpointIdValue,
+       bool hasResultValue, std::shared_ptr<detail::ResultWaiter> waiterValue,
        Output outputValue)
       : environment(environmentValue),
         endpointId(endpointIdValue),
         endpointName(EndpointConfig(environment, endpointId).name),
+        hasResult(hasResultValue),
+        waiter(std::move(waiterValue)),
         output(std::move(outputValue)),
         metrics(environment.getMetrics(), environment.getLogger(),
                 ConnectorConfig(environment,
@@ -175,11 +178,23 @@ struct Endpoint::Impl final {
     }
     try {
       servicelib::detail::ParallelExecutorRegistry::Post([this, scheduledAt] {
+        struct ActiveGuard final {
+          Impl& impl;
+          ~ActiveGuard() {
+            {
+              std::lock_guard lock(impl.mutex);
+              --impl.active;
+            }
+            impl.drained.notify_all();
+          }
+        } activeGuard{*this};
         auto context = ApplyDataSourceEndpointTracing(
             MessageContext{}.withStreamId(NewStreamId()), environment,
             endpointId);
+        const std::string streamId{context.streamId()};
         const auto started = metrics.requestStart();
         std::exception_ptr error;
+        if (hasResult) metrics.pendingAdd(streamId);
         try {
           output(std::move(context), Payload<ScheduleTrigger>::make(
               MakeScheduleTrigger(endpointId, endpointName, scheduledAt,
@@ -187,12 +202,8 @@ struct Endpoint::Impl final {
         } catch (...) {
           error = std::current_exception();
         }
+        if (hasResult) metrics.pendingRemove(streamId);
         metrics.requestEnd(started, error);
-        {
-          std::lock_guard lock(mutex);
-          --active;
-        }
-        drained.notify_all();
       });
     } catch (...) {
       {
@@ -218,6 +229,8 @@ struct Endpoint::Impl final {
   IServiceEnvironment& environment;
   int endpointId;
   std::string endpointName;
+  bool hasResult;
+  std::shared_ptr<detail::ResultWaiter> waiter;
   Output output;
   DataSourceEndpointMetrics metrics;
   api::ScheduleOverlapPolicy overlapPolicy{api::ScheduleOverlapPolicy::kSkip};
@@ -232,13 +245,31 @@ struct Endpoint::Impl final {
 };
 
 Endpoint::Endpoint(IServiceEnvironment& environment, int endpointId,
-                   Output output)
-    : impl_(std::make_unique<Impl>(environment, endpointId,
-                                  std::move(output))) {}
+                   bool hasResult,
+                   std::shared_ptr<detail::ResultWaiter> waiter, Output output)
+    : impl_(std::make_unique<Impl>(environment, endpointId, hasResult,
+                                  std::move(waiter), std::move(output))) {}
 
 Endpoint::~Endpoint() = default;
 int Endpoint::id() const noexcept { return impl_->endpointId; }
 const std::string& Endpoint::name() const noexcept { return impl_->endpointName; }
+
+void Endpoint::completeResult(std::string_view streamId) noexcept {
+  if (streamId.empty()) {
+    impl_->metrics.missingStreamId();
+    return;
+  }
+  switch (impl_->waiter->complete(streamId)) {
+    case detail::ResultWaiter::Completion::kCompleted:
+      return;
+    case detail::ResultWaiter::Completion::kMissing:
+      impl_->metrics.lateResult(streamId);
+      return;
+    case detail::ResultWaiter::Completion::kDuplicate:
+      impl_->metrics.duplicateMessageId(streamId, streamId);
+      return;
+  }
+}
 
 struct LibcronDataSource::Impl final {
   Impl(IServiceEnvironment& environmentValue, int connectorIdValue)

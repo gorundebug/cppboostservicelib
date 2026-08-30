@@ -10,6 +10,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+
 #include <servicelib/datasource/cron/libcron.hpp>
 
 TEST(CronDataSource, AdaptsPortableExpressionsToLibcron) {
@@ -25,4 +28,21 @@ TEST(CronDataSource, RejectsNonPortableExpressions) {
   EXPECT_THROW(ToLibcronExpression("0 0 1 * MON"), std::invalid_argument);
   EXPECT_THROW(ToLibcronExpression("0 0 * *"), std::invalid_argument);
   EXPECT_THROW(ToLibcronExpression("0 0 0 * * ?"), std::invalid_argument);
+}
+
+TEST(CronDataSource, WaitsForCorrelatedPipelineResult) {
+  servicelib::datasource::cron::detail::ResultWaiter waiter;
+  auto pending = waiter.begin("request-1");
+  std::atomic<bool> completed{false};
+  std::thread waiting([&] {
+    waiter.wait("request-1", pending);
+    completed.store(true, std::memory_order_release);
+  });
+  std::this_thread::yield();
+  EXPECT_FALSE(completed.load(std::memory_order_acquire));
+  EXPECT_EQ(waiter.complete("request-1"),
+            servicelib::datasource::cron::detail::ResultWaiter::Completion::
+                kCompleted);
+  waiting.join();
+  EXPECT_TRUE(completed.load(std::memory_order_acquire));
 }

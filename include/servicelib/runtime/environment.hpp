@@ -252,18 +252,38 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
     }
   }
 
-  void stopExecutionRuntime() noexcept {
-    if (!activeRuntime_) return;
-    auto* runtime = activeRuntime_;
-    activeRuntime_ = nullptr;
+  bool drainExecutionRuntime(Context context = {}) noexcept {
+    if (!activeRuntime_) return true;
+    bool drained = true;
     {
       std::unique_lock lock(parallelMutex_);
-      // Sources and managed pools have already stopped. While active work is
-      // draining it may schedule nested ParallelCall operations; once the
-      // count reaches zero no producer remains, so admission closes atomically.
-      parallelDrained_.wait(lock, [this] { return parallelActive_ == 0; });
+      // Keep admission open while already accepted work drains: an active
+      // operation may legitimately schedule a nested ParallelCall.
+      if (context.deadline()) {
+        drained = parallelDrained_.wait_until(
+            lock, *context.deadline(), [this] { return parallelActive_ == 0; });
+      } else {
+        parallelDrained_.wait(lock, [this] { return parallelActive_ == 0; });
+      }
+    }
+    return drained;
+  }
+
+  void stopExecutionRuntime() noexcept {
+    if (!activeRuntime_) return;
+    // Ownership cannot be released while an accepted graph operation is
+    // still running. The bounded drain performed by ServiceApp reports a
+    // shutdown timeout; this final safety join prevents use-after-free.
+    static_cast<void>(drainExecutionRuntime());
+    auto* runtime = activeRuntime_;
+    {
+      std::lock_guard lock(parallelMutex_);
+      // Sources, managed pools and sinks have stopped, and all work they
+      // accepted has drained. No producer remains, so admission can now close
+      // atomically before streams and callers are released.
       parallelAccepting_ = false;
     }
+    activeRuntime_ = nullptr;
     runtime->runtimeRelease();
   }
 

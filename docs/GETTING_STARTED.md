@@ -140,9 +140,9 @@ docker compose build inventoryservice orderservice
 
 # Build and execute the sanitizer integration targets.
 docker build --target asan-test \
-  -t cppboostnativeexample-asan-test:latest .
+  -t cppboostnativeexample-asan-test:local .
 docker build --target tsan-test \
-  -t cppboostnativeexample-tsan-test:latest .
+  -t cppboostnativeexample-tsan-test:local .
 
 # Start both services for manual requests.
 docker compose up --build

@@ -9,6 +9,7 @@ version() {
 }
 
 conan export "$root/conan/recipes/libcron" --version "$(version libcron)" --user gorundebug --channel boost
+conan export "$root/conan/recipes/librdkafka" --version "$(version librdkafka)" --user gorundebug --channel boost
 conan export "$root/conan/recipes/gtest" --version "$(version googletest)" --user gorundebug --channel boost
 conan export "$root/conan/recipes/grpc" --version "$(version grpc)" --user gorundebug --channel boost
 conan export "$root/conan/recipes/opentelemetry-proto" --version "$(version opentelemetry-proto)" --user gorundebug --channel boost

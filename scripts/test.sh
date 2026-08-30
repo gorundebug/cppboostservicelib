@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 source "$ROOT/scripts/dependency-proxy-env.sh"
+"$ROOT/scripts/test-conan-install-contract.sh"
 
 if [[ -n "${CPPBOOSTSERVICELIB_TEST_SOURCE_CACHE_DIR:-}" ]]; then
   if [[ ! -d "${CPPBOOSTSERVICELIB_TEST_SOURCE_CACHE_DIR}" ]]; then

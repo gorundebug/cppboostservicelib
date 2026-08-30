@@ -214,7 +214,11 @@ void startsAndStopsInServiceOrder() {
   lifecycle.add(servicelib::ServiceComponentKind::kDataSource,
                 std::make_shared<Component>("source", &events));
   lifecycle.start({});
-  lifecycle.stop({});
+  lifecycle.stopBeforeGraphDrain({});
+  const auto beforeGraphDrain = events.snapshot();
+  assert(std::find(beforeGraphDrain.begin(), beforeGraphDrain.end(),
+                   "sink:stop") == beforeGraphDrain.end());
+  lifecycle.stopAfterGraphDrain({});
   const auto recorded = events.snapshot();
   assert(recorded.size() == 6);
   assert((std::vector(recorded.begin(), recorded.begin() + 3) ==
@@ -268,7 +272,7 @@ void stopFailureDoesNotSkipResources() {
   assert(logger.records.front().error == "stop failed");
 }
 
-void deadlineDiagnosesButJoinsResource() {
+void deadlineDiagnosesButDoesNotReleaseLiveResource() {
   EventLog events;
   RecordingLogger logger;
   std::atomic<bool> stopped{false};
@@ -278,8 +282,11 @@ void deadlineDiagnosesButJoinsResource() {
                     "slow", &events, false, false,
                     std::chrono::milliseconds{30}, &stopped));
   lifecycle.start({});
+  const auto started = std::chrono::steady_clock::now();
   lifecycle.stop(servicelib::Context{}.bounded(std::chrono::milliseconds{1}),
                  logger);
+  assert(std::chrono::steady_clock::now() - started >=
+         std::chrono::milliseconds{20});
   assert(stopped.load());
   assert(logger.records.size() == 1);
   assert(logger.records.front().message ==
@@ -363,7 +370,7 @@ int main() {
   startsAndStopsInServiceOrder();
   rollsBackStartedComponents();
   stopFailureDoesNotSkipResources();
-  deadlineDiagnosesButJoinsResource();
+  deadlineDiagnosesButDoesNotReleaseLiveResource();
   connectorTimeoutMatchesTelemetry();
   preparesConfiguredPoolsBeforeGraphConstruction();
   exposesCanonicalServiceInfoMetric();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +46,7 @@ class ProducerClient {
  public:
   virtual ~ProducerClient() = default;
   virtual void start(const config::KafkaDataConnectorConfig&) {}
+  virtual void requestStop() noexcept {}
   virtual void stop() noexcept {}
   [[nodiscard]] virtual std::optional<std::uint32_t> partitionCount(
       const std::string&) const {
@@ -76,6 +78,7 @@ class LibrdkafkaProducerClient final : public ProducerClient {
                    ? std::chrono::milliseconds{
                          static_cast<std::int64_t>(config.dialTimeout)}
                    : std::chrono::seconds{30};
+    stopping_.store(false, std::memory_order_release);
     auto* kafkaConfig = rd_kafka_conf_new();
     try {
       SetConfig(kafkaConfig, "bootstrap.servers", config.brokers);
@@ -102,12 +105,18 @@ class LibrdkafkaProducerClient final : public ProducerClient {
       }
       kafkaConfig = nullptr;
     } catch (...) {
+      stopping_.store(true, std::memory_order_release);
       if (kafkaConfig) rd_kafka_conf_destroy(kafkaConfig);
       throw;
     }
   }
 
+  void requestStop() noexcept override {
+    stopping_.store(true, std::memory_order_release);
+  }
+
   void stop() noexcept override {
+    requestStop();
     if (producer_) {
       rd_kafka_flush(producer_.get(), static_cast<int>(timeout_.count()));
       // rd_kafka_destroy may discard messages that are still queued after a
@@ -206,6 +215,11 @@ class LibrdkafkaProducerClient final : public ProducerClient {
         std::lock_guard lock(waiter->mutex);
         if (waiter->result) return std::move(*waiter->result);
       }
+      if (stopping_.load(std::memory_order_acquire)) {
+        return {partition, std::nullopt,
+                std::make_exception_ptr(std::runtime_error(
+                    "Kafka delivery cancelled during shutdown"))};
+      }
       if (std::chrono::steady_clock::now() >= deadline) {
         return {partition, std::nullopt,
                 std::make_exception_ptr(
@@ -291,6 +305,7 @@ class LibrdkafkaProducerClient final : public ProducerClient {
 
   telemetry::LibrdkafkaStatistics statistics_;
   std::chrono::milliseconds timeout_{std::chrono::seconds{30}};
+  std::atomic<bool> stopping_{true};
   std::unique_ptr<rd_kafka_t, KafkaDeleter> producer_;
   std::mutex deliveryOpaquesMutex_;
   std::unordered_map<DeliveryOpaque*, std::unique_ptr<DeliveryOpaque>>
@@ -421,6 +436,7 @@ class Endpoint final {
   }
   void stop(Context) {
     enabled_.store(false, std::memory_order_release);
+    producer_.requestStop();
     tasks_.CancelAndWait();
     if (producerStarted_) {
       producer_.stop();

@@ -3,27 +3,22 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from conan.errors import ConanException
 
 
-_REPOSITORIES = {
-    "archives.boost.io": "conan-source-archives-boost",
-    "cmake.org": "conan-source-cmake",
-    "curl.se": "conan-source-curl",
-    "dist.schmorp.de": "conan-source-schmorp",
-    "distfiles.ariadne.space": "conan-source-ariadne",
-    "ftp.gnu.org": "conan-source-gnu-ftp",
-    "ftpmirror.gnu.org": "conan-source-gnu-mirror",
-    "github.com": "github-raw",
-    "https.git.savannah.gnu.org": "conan-source-savannah-git",
-    "mirrors.kernel.org": "conan-source-kernel",
-    "sourceforge.net": "conan-source-sourceforge",
-    "sourceware.org": "conan-source-sourceware",
-    "www.mirrorservice.org": "conan-source-mirrorservice",
-    "zlib.net": "conan-source-zlib",
-}
+def _repositories() -> dict[str, str]:
+    catalog_path = Path(__file__).with_name("source-proxies.generated.json")
+    try:
+        catalog = json.loads(catalog_path.read_text())
+    except (OSError, ValueError) as error:
+        raise ConanException(
+            f"Conan source proxy catalog is unavailable: {catalog_path}: {error}"
+        ) from error
+    return {host: proxy["repository"] for host, proxy in catalog.items()}
 
 
 def _proxy_root() -> str | None:
@@ -49,7 +44,7 @@ def _rewrite(value, proxy_root: str, conanfile):
         return value
 
     parsed = urlsplit(value)
-    repository = _REPOSITORIES.get(parsed.hostname or "")
+    repository = _repositories().get(parsed.hostname or "")
     if repository is None:
         raise ConanException(
             "Conan source host is not configured in the ServiceGen dependency "

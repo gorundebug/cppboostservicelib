@@ -16,34 +16,9 @@ if(CPPBOOSTSERVICELIB_FETCH_PROGRESS)
   set(FETCHCONTENT_QUIET OFF)
 endif()
 
-# Package targets imported while cppboostservicelib is configured as an
-# add_subdirectory are directory-scoped by default.  Generated API modules are
-# siblings of the framework directory and need the Conan-provided codegen
-# executables as ordinary targets, so promote those exact imports while we are
-# still in the directory that created them.
-function(_servicelib_promote_imported_target target_name)
-  if(NOT TARGET "${target_name}")
-    message(FATAL_ERROR
-        "Required imported dependency target is missing: ${target_name}")
-  endif()
-  get_target_property(_servicelib_aliased_target "${target_name}"
-      ALIASED_TARGET)
-  if(_servicelib_aliased_target)
-    set(_servicelib_imported_target "${_servicelib_aliased_target}")
-  else()
-    set(_servicelib_imported_target "${target_name}")
-  endif()
-  get_target_property(_servicelib_is_imported
-      "${_servicelib_imported_target}" IMPORTED)
-  if(_servicelib_is_imported)
-    set_property(TARGET "${_servicelib_imported_target}"
-        PROPERTY IMPORTED_GLOBAL TRUE)
-  endif()
-endfunction()
-
 if(CPPBOOSTSERVICELIB_ENABLE_CRON AND
    CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
-  find_package(libcron CONFIG REQUIRED)
+  find_package(libcron CONFIG REQUIRED GLOBAL)
 elseif(CPPBOOSTSERVICELIB_ENABLE_CRON)
   FetchContent_Declare(libcron
       URL "${CPPBOOSTSERVICELIB_GITHUB_ARCHIVE_BASE}/PerMalmberg/libcron/archive/refs/tags/${CPPBOOSTSERVICELIB_LIBCRON_VERSION}.tar.gz"
@@ -133,26 +108,14 @@ function(_servicelib_normalize_librdkafka_cmake_config config_path)
                    config_contents "${config_contents}")
   endif()
 
-  # librdkafka's own `dev-conf.sh tsan` disables glibc C11 threads because
-  # they crash under ThreadSanitizer. Its CMake build probes and enables them
-  # unconditionally, so mirror the upstream-supported TSan setup. The
-  # tinycthread source is already part of the rdkafka target and uses pthreads
-  # when WITH_C11THREADS is zero.
-  if(CPPBOOSTSERVICELIB_TSAN)
-    string(REPLACE "#define WITH_C11THREADS 1"
-                   "#define WITH_C11THREADS 0"
-                   config_contents "${config_contents}")
-    string(REPLACE " C11THREADS" "" config_contents "${config_contents}")
-  endif()
-
   if(NOT config_contents STREQUAL original_config_contents)
     file(WRITE "${config_path}" "${config_contents}")
   endif()
 endfunction()
 
 if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
-  find_package(Boost 1.75 REQUIRED COMPONENTS json)
-  find_package(yaml-cpp 0.7 REQUIRED)
+  find_package(Boost 1.75 REQUIRED COMPONENTS json GLOBAL)
+  find_package(yaml-cpp 0.7 REQUIRED GLOBAL)
 elseif(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "LOCAL")
   _servicelib_require_local(Boost "${CPPBOOSTSERVICELIB_BOOST_SOURCE_DIR}")
   _servicelib_require_local(yaml-cpp "${CPPBOOSTSERVICELIB_YAML_CPP_SOURCE_DIR}")
@@ -185,7 +148,7 @@ else()
 endif()
 
 if(CPPBOOSTSERVICELIB_BUILD_TESTS)
-  find_package(GTest QUIET)
+  find_package(GTest QUIET GLOBAL)
   if(NOT TARGET GTest::gtest_main)
     if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
       message(FATAL_ERROR
@@ -201,13 +164,9 @@ endif()
 
 if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
   if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
-    find_package(Protobuf CONFIG REQUIRED)
-    find_package(gRPC CONFIG REQUIRED)
-    find_package(asio-grpc CONFIG REQUIRED)
-    if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
-      _servicelib_promote_imported_target(protobuf::protoc)
-      _servicelib_promote_imported_target(gRPC::grpc_cpp_plugin)
-    endif()
+    find_package(Protobuf CONFIG REQUIRED GLOBAL)
+    find_package(gRPC CONFIG REQUIRED GLOBAL)
+    find_package(asio-grpc CONFIG REQUIRED GLOBAL)
   elseif(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "LOCAL")
     _servicelib_require_local(protobuf "${CPPBOOSTSERVICELIB_PROTOBUF_SOURCE_DIR}")
     _servicelib_require_local(gRPC "${CPPBOOSTSERVICELIB_GRPC_SOURCE_DIR}")
@@ -249,8 +208,8 @@ if(CPPBOOSTSERVICELIB_ENABLE_GRPC)
     # system packages avoids cloning and compiling BoringSSL on every clean
     # consumer build while retaining gRPC's pinned revisions for ABI-coupled
     # dependencies.
-    find_package(OpenSSL REQUIRED)
-    find_package(ZLIB REQUIRED)
+    find_package(OpenSSL REQUIRED GLOBAL)
+    find_package(ZLIB REQUIRED GLOBAL)
     set(gRPC_SSL_PROVIDER package CACHE STRING "" FORCE)
     set(gRPC_ZLIB_PROVIDER package CACHE STRING "" FORCE)
     FetchContent_Declare(grpc
@@ -343,7 +302,7 @@ endif()
 
 if(CPPBOOSTSERVICELIB_ENABLE_KAFKA)
   if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
-    find_package(RdKafka CONFIG QUIET)
+    find_package(RdKafka CONFIG QUIET GLOBAL)
     if(NOT TARGET RdKafka::rdkafka)
       find_path(CPPBOOSTSERVICELIB_RDKAFKA_INCLUDE_DIR
           NAMES librdkafka/rdkafka.h rdkafka.h REQUIRED)
@@ -387,7 +346,7 @@ if(CPPBOOSTSERVICELIB_ENABLE_OTEL)
         "CPPBOOSTSERVICELIB_ENABLE_OTEL requires CPPBOOSTSERVICELIB_ENABLE_GRPC for the OTLP gRPC exporter")
   endif()
   if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
-    find_package(opentelemetry-cpp CONFIG REQUIRED)
+    find_package(opentelemetry-cpp CONFIG REQUIRED GLOBAL)
   elseif(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "LOCAL")
     set(_servicelib_saved_find_package_prefer_config
         "${CMAKE_FIND_PACKAGE_PREFER_CONFIG}")

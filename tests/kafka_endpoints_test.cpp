@@ -445,6 +445,47 @@ TEST(KafkaDataSink, MarshalsAsyncDeliveryThroughAsioExecutor) {
   EXPECT_TRUE(callbackOnAsio.load(std::memory_order_acquire));
 }
 
+class StopAwareKafkaProducer final
+    : public servicelib::datasink::kafka::ProducerClient {
+ public:
+  void start(const servicelib::config::KafkaDataConnectorConfig&) override {}
+
+  void requestStop() noexcept override { stopRequested.Send(); }
+
+  servicelib::datasink::kafka::DeliveryResult send(
+      std::string, std::string, std::string,
+      std::optional<std::uint32_t> partition) override {
+    sendEntered.Send();
+    if (!stopRequested.WaitForEvent()) {
+      return {partition, std::nullopt,
+              std::make_exception_ptr(
+                  std::runtime_error("requestStop was not called"))};
+    }
+    return {partition, 17, {}};
+  }
+
+  test_async::Event sendEntered;
+  test_async::Event stopRequested;
+};
+
+TEST(KafkaDataSink, RequestsProducerStopBeforeJoiningDeliveryTasks) {
+  test_async::AsioRuntime runtime;
+  TestEnvironment environment;
+  StopAwareKafkaProducer producer;
+  std::atomic<bool> callbackOnAsio{false};
+  TestSinkEndpointStream<std::string, int> stream{environment, 3};
+  servicelib::datasink::kafka::Endpoint<std::string, int,
+                                        AsyncKafkaSinkHandler>
+      endpoint{stream, producer,
+               AsyncKafkaSinkHandler{std::this_thread::get_id(),
+                                     &callbackOnAsio}};
+  endpoint.start(servicelib::Context{});
+  endpoint.consume(servicelib::MessageContext{},
+                   servicelib::Payload<std::string>::make("payload"));
+  ASSERT_TRUE(producer.sendEntered.WaitForEvent());
+  endpoint.stop(servicelib::Context{});
+}
+
 class FailingKafkaProducer final
     : public servicelib::datasink::kafka::ProducerClient {
  public:

@@ -39,10 +39,15 @@ endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
   target_compile_options(cppboostservicelib_build_options INTERFACE
       -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
+  if(CPPBOOSTSERVICELIB_ASAN OR CPPBOOSTSERVICELIB_UBSAN OR
+     CPPBOOSTSERVICELIB_TSAN)
+    # Sanitizer builds retain optimized Release code while keeping symbolic
+    # stacks and frame pointers for actionable reports.
+    add_compile_options(-g -fno-omit-frame-pointer)
+  endif()
   if(CPPBOOSTSERVICELIB_ASAN)
-    # Conan profiles instrument transport dependencies with the same sanitizer
-    # and include compiler.sanitizer in their package IDs. These directory and
-    # interface flags instrument ServiceLib and its generated consumers.
+    # Conan supplies matching sanitizer flags to the complete static
+    # dependency graph; these options instrument this project and consumers.
     add_compile_options(
         $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=address>
         $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
@@ -56,17 +61,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         -fsanitize=address)
   endif()
   if(CPPBOOSTSERVICELIB_UBSAN)
-    # gRPC's vendored Abseil does not compile under whole-tree UBSan with the
-    # supported GCC toolchain. Keep undefined-behavior instrumentation on the
-    # ServiceLib consumers while ASan covers the cross-library coroutine frame.
+    # The generated ASan profile also supplies UBSan to the complete static
+    # dependency graph through Conan.
     target_compile_options(cppboostservicelib_build_options INTERFACE
         -fsanitize=undefined -fno-omit-frame-pointer)
     target_link_options(cppboostservicelib_build_options INTERFACE
         -fsanitize=undefined)
   endif()
   if(CPPBOOSTSERVICELIB_TSAN)
-    # Conan profiles apply the same flags to transport dependencies. Static,
-    # non-instrumented gRPC/Abseil code would hide synchronization from TSan.
+    # Conan supplies matching TSan flags to the complete static dependency
+    # graph; these options instrument this project and consumers.
     add_compile_options(
         $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=thread>
         $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
