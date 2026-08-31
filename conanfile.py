@@ -163,6 +163,8 @@ class CppBoostServiceLibConan(ConanFile):
         cmake.install()
 
     def package_info(self):
-        self.cpp_info.set_property("cmake_file_name", "cppboostservicelib")
-        self.cpp_info.set_property("cmake_target_name", "servicelib::servicelib")
-        self.cpp_info.builddirs = ["lib/cmake/cppboostservicelib"]
+        # The package installs its own CMake config with the complete optional
+        # target surface (cron, gRPC, Kafka and OTEL).  Do not let CMakeDeps
+        # shadow it with a synthetic config containing only the root target.
+        self.cpp_info.set_property("cmake_find_mode", "none")
+        self.cpp_info.builddirs.append("lib/cmake/cppboostservicelib")

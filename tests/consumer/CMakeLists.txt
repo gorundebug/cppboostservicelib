@@ -6,4 +6,4 @@ find_package(cppboostservicelib REQUIRED)
 
 add_executable(cppboostservicelib_consumer main.cpp)
 target_link_libraries(cppboostservicelib_consumer PRIVATE
-    servicelib::servicelib)
+    servicelib::servicelib servicelib::cron)

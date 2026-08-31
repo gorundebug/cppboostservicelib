@@ -84,7 +84,9 @@ target_link_libraries(cppboostservicelib INTERFACE
     OpenSSL::Crypto)
 
 if(CPPBOOSTSERVICELIB_ENABLE_CRON)
+  set(CPPBOOSTSERVICELIB_CRON_REQUIRES_LIBCRON OFF)
   if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE STREQUAL "CONAN")
+    set(CPPBOOSTSERVICELIB_CRON_REQUIRES_LIBCRON ON)
     add_library(cppboostservicelib_cron STATIC
         src/datasource/cron/libcron.cpp)
   else()

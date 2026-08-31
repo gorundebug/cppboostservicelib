@@ -4,6 +4,12 @@ set -euo pipefail
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 script="$root/scripts/conan-install.sh"
 source_proxy_catalog="$root/conan/hooks/source-proxies.generated.json"
+recipe="$root/conanfile.py"
+
+grep -Fq 'self.cpp_info.set_property("cmake_find_mode", "none")' "$recipe" || {
+  echo "the Conan package must expose its installed multi-target CMake config" >&2
+  exit 1
+}
 
 install_count=$(grep -Ec '^[[:space:]]*conan install ' "$script")
 if [[ "$install_count" != "1" ]]; then

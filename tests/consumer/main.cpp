@@ -2,6 +2,7 @@
 #include <servicelib/runtime/context.hpp>
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/transformation/streams.hpp>
+#include <servicelib/datasource/cron/libcron.hpp>
 
 #include <concepts>
 
@@ -13,7 +14,10 @@ int main() {
   service.id = 1;
   service.name = "installed-consumer";
   const auto context = servicelib::MessageContext{}.withPriority(7);
-  return service.id == 1 && context.hasPriority() && context.priority() == 7
+  const auto schedule =
+      servicelib::datasource::cron::ToLibcronExpression("*/5 * * * *");
+  return service.id == 1 && context.hasPriority() && context.priority() == 7 &&
+                 schedule == "0 */5 * * * ?"
              ? 0
              : 1;
 }
