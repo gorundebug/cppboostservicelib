@@ -34,6 +34,9 @@ struct TopologyEdge {
 };
 
 struct TopologyPrinter {
+  virtual void printNode(const TopologyNode& node) {
+    static_cast<void>(node);
+  }
   virtual void printLink(const TopologyNode& from, const TopologyNode& to) = 0;
 
   template <typename T>
@@ -73,6 +76,8 @@ struct StatusTopologyPrinter final : TopologyPrinter {
   std::vector<TopologyNode> nodes;
   std::vector<TopologyEdge> edges;
 
+  void printNode(const TopologyNode& node) override { AddNode(node); }
+
   void printLink(const TopologyNode& from, const TopologyNode& to) override {
     AddNode(from);
     AddNode(to);
@@ -107,17 +112,17 @@ struct VisTopologyPrinter : public TopologyPrinter {
   std::stringstream edges;
   std::unordered_set<size_t> added;
 
+  void printNode(const TopologyNode& node) override {
+    if (added.find(node.id) == added.end()) {
+      nodes << "{ id: " << node.id << ", label: \"" << node.name << "\" },"
+            << std::endl;
+      added.emplace(node.id);
+    }
+  }
+
   void printLink(const TopologyNode& from, const TopologyNode& to) override {
-    if (added.find(from.id) == added.end()) {
-      nodes << "{ id: " << from.id << ", label: \"" << from.name << "\" },"
-            << std::endl;
-      added.emplace(from.id);
-    }
-    if (added.find(to.id) == added.end()) {
-      nodes << "{ id: " << to.id << ", label: \"" << to.name << "\" },"
-            << std::endl;
-      added.emplace(to.id);
-    }
+    printNode(from);
+    printNode(to);
     edges << "{ from: " << from.id << ", to: " << to.id << ", arrows:'to' },"
           << std::endl;
   }

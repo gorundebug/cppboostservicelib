@@ -60,7 +60,7 @@ class InputStream final : public Stream<T, StreamConsumer<T>, Context> {
     void printTopology(TopologyPrinter& printer,
                        std::unordered_set<size_t>& visited) const override {
       if (visited.emplace(getId()).second) {
-        static_cast<void>(printer.makeNode(*this));
+        printer.printNode(printer.makeNode(*this));
       }
     }
 

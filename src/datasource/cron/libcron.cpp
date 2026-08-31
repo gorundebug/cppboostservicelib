@@ -124,7 +124,7 @@ struct Endpoint::Impl final {
                                 EndpointConfig(environment, endpointId)
                                     .idDataConnector)
                     .name,
-                endpointName, "cron") {}
+                endpointName) {}
 
   std::optional<std::string> configure() {
     const auto cfg = EndpointConfig(environment, endpointId);

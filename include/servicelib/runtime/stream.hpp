@@ -232,6 +232,8 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
       if (hasConsumer()) {
         tp.printLink(tp.makeNode(*this), tp.makeNode(*consumer_));
         consumer_->printTopology(tp, visited);
+      } else {
+        tp.printNode(tp.makeNode(*this));
       }
     }
   }

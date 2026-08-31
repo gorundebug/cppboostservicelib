@@ -104,7 +104,7 @@ class Sink final : public StreamConsumer<_Tp>,
   void printTopology(TopologyPrinter& tp,
                      std::unordered_set<size_t>& visited) const override {
     if (visited.emplace(getId()).second) {
-      static_cast<void>(tp.makeNode(*this));
+      tp.printNode(tp.makeNode(*this));
       if (errorStream_.getErrorConsumer()) {
         tp.printLink(tp.makeNode(*this), tp.makeNode(errorStream_));
         errorStream_.printErrorTopology(tp, visited);
