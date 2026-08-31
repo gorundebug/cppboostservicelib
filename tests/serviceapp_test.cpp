@@ -222,8 +222,8 @@ void startsAndStopsInServiceOrder() {
   const auto recorded = events.snapshot();
   assert(recorded.size() == 6);
   assert((std::vector(recorded.begin(), recorded.begin() + 3) ==
-          std::vector<std::string>{"source:start", "sink:start",
-                                   "delay:start"}));
+          std::vector<std::string>{"delay:start", "sink:start",
+                                   "source:start"}));
   assert(recorded.back() == "sink:stop");
   assert(std::find(recorded.begin() + 3, recorded.end(), "source:stop") !=
          recorded.end());
@@ -235,9 +235,9 @@ void rollsBackStartedComponents() {
   EventLog events;
   servicelib::ServiceLifecycle lifecycle;
   lifecycle.add(servicelib::ServiceComponentKind::kDataSource,
-                std::make_shared<Component>("source", &events));
+                std::make_shared<Component>("source", &events, true));
   lifecycle.add(servicelib::ServiceComponentKind::kDataSink,
-                std::make_shared<Component>("sink", &events, true));
+                std::make_shared<Component>("sink", &events));
   bool failed = false;
   try {
     lifecycle.start({});
@@ -246,8 +246,8 @@ void rollsBackStartedComponents() {
   }
   assert(failed);
   assert((events.snapshot() ==
-          std::vector<std::string>{"source:start", "sink:start",
-                                   "source:stop"}));
+          std::vector<std::string>{"sink:start", "source:start",
+                                   "sink:stop"}));
 }
 
 void stopFailureDoesNotSkipResources() {

@@ -357,13 +357,13 @@ class ServiceLifecycle final {
   }
 
   inline static constexpr std::array kStartOrder{
-      ServiceComponentKind::kDataSource,
-      ServiceComponentKind::kDataSink,
       ServiceComponentKind::kStorage,
       ServiceComponentKind::kDelayPool,
       ServiceComponentKind::kTaskPool,
       ServiceComponentKind::kPriorityTaskPool,
-      ServiceComponentKind::kComponent};
+      ServiceComponentKind::kComponent,
+      ServiceComponentKind::kDataSink,
+      ServiceComponentKind::kDataSource};
 
   // Stop admission first. Sinks stop last so already accepted source work can
   // still flush results, matching Go ServiceApp's two-phase shutdown.
