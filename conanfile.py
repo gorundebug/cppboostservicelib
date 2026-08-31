@@ -39,7 +39,7 @@ class CppBoostServiceLibConan(ConanFile):
         "with_grpc": False,
         "with_kafka": False,
         "with_otel": False,
-        "with_cron": False,
+        "with_cron": True,
         "with_tests": False,
     }
     exports_sources = (

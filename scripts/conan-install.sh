@@ -45,11 +45,15 @@ options=(
   -o "&:with_grpc=${CPPBOOSTSERVICELIB_ENABLE_GRPC:-True}"
   -o "&:with_kafka=${CPPBOOSTSERVICELIB_ENABLE_KAFKA:-True}"
   -o "&:with_otel=${CPPBOOSTSERVICELIB_ENABLE_OTEL:-False}"
-  -o "&:with_cron=${CPPBOOSTSERVICELIB_ENABLE_CRON:-True}"
   -o "&:with_tests=${CPPBOOSTSERVICELIB_BUILD_TESTS:-True}"
   -o:h "openssl/*:no_engine=False"
   -o:b "openssl/*:no_engine=False"
 )
+if [[ -n "${CPPBOOSTSERVICELIB_ENABLE_CRON:-}" ]]; then
+  options+=(
+    -o "&:with_cron=${CPPBOOSTSERVICELIB_ENABLE_CRON}"
+  )
+fi
 
 # Conan's compiler.sanitizer setting is part of the standard package identity.
 # Generated sanitizer builds set it for the complete host graph, so ordinary,

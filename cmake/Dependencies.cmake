@@ -9,7 +9,7 @@ set_property(CACHE CPPBOOSTSERVICELIB_DEPENDENCY_MODE PROPERTY STRINGS
 option(CPPBOOSTSERVICELIB_ENABLE_GRPC "Build asio-grpc transport" OFF)
 option(CPPBOOSTSERVICELIB_ENABLE_KAFKA "Build librdkafka transport" OFF)
 option(CPPBOOSTSERVICELIB_ENABLE_OTEL "Build OpenTelemetry exporters" OFF)
-option(CPPBOOSTSERVICELIB_ENABLE_CRON "Build the libcron data source" OFF)
+option(CPPBOOSTSERVICELIB_ENABLE_CRON "Build the libcron data source" ON)
 option(CPPBOOSTSERVICELIB_FETCH_PROGRESS
        "Show FetchContent download and Git clone progress" ON)
 if(CPPBOOSTSERVICELIB_FETCH_PROGRESS)

@@ -20,7 +20,6 @@ options=(
   -o "&:with_grpc=True"
   -o "&:with_kafka=True"
   -o "&:with_otel=True"
-  -o "&:with_cron=True"
   -o "&:with_tests=True"
   -o:h "openssl/*:no_engine=False"
   -o:b "openssl/*:no_engine=False"
