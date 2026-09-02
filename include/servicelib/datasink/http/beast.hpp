@@ -92,6 +92,8 @@ class BeastClient final : public Client {
     if (!client_) throw std::invalid_argument("HTTP client is null");
   }
 
+  void Stop() noexcept { client_->Stop(); }
+
   boost::asio::awaitable<Response> perform(
       Request request, MessageContext context) override {
     auto target = parseUrl(request.url);
