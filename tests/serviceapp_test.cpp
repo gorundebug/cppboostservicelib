@@ -229,6 +229,8 @@ void startsAndStopsInServiceOrder() {
          recorded.end());
   assert(std::find(recorded.begin() + 3, recorded.end(), "delay:stop") !=
          recorded.end());
+  assert(std::find(recorded.begin() + 3, recorded.end(), "source:stop") <
+         std::find(recorded.begin() + 3, recorded.end(), "delay:stop"));
 }
 
 void rollsBackStartedComponents() {
@@ -364,6 +366,40 @@ void runtimeConfigSnapshotOwnsConcreteConfigAcrossReload() {
   servicelib::config::RuntimeConfigRegistry::Publish({});
 }
 
+void stopWaitsForAcceptedInputInvocation() {
+  PriorityPoolConfig config;
+  servicelib::config::RuntimeConfigRegistry::Publish(
+      std::make_shared<const servicelib::config::RuntimeConfig>(config));
+  {
+    Service service;
+    service.start();
+    auto invocation = std::make_unique<
+        decltype(service.beginInputInvocation())>(
+        service.beginInputInvocation());
+    std::atomic<bool> stopReturned{false};
+    std::thread stopThread([&] {
+      service.stop();
+      stopReturned.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    assert(!stopReturned.load(std::memory_order_acquire));
+    invocation.reset();
+    stopThread.join();
+    assert(stopReturned.load(std::memory_order_acquire));
+#ifdef NDEBUG
+    bool rejected = false;
+    try {
+      static_cast<void>(service.beginInputInvocation());
+    } catch (const servicelib::StreamException&) {
+      rejected = true;
+    }
+    assert(rejected);
+#endif
+  }
+  servicelib::config::RuntimeConfigRegistry::Publish({});
+}
+
 }  // namespace
 
 int main() {
@@ -375,4 +411,5 @@ int main() {
   preparesConfiguredPoolsBeforeGraphConstruction();
   exposesCanonicalServiceInfoMetric();
   runtimeConfigSnapshotOwnsConcreteConfigAcrossReload();
+  stopWaitsForAcceptedInputInvocation();
 }

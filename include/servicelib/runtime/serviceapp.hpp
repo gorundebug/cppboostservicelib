@@ -119,12 +119,29 @@ class ServiceLifecycle final {
     }
 
     state_ = State::kStopping;
-    std::vector<Entry*> firstPhase;
-    for (const auto kind : kStopOrder) {
-      if (kind == ServiceComponentKind::kDataSink) continue;
-      appendReverse(firstPhase, entries_[index(kind)]);
-    }
-    stopPhase(context, logger, firstPhase);
+    // Close and drain every root producer before touching the graph
+    // executors. A source that was accepted before shutdown may still enqueue
+    // work into a task pool while its stop() is draining.
+    std::vector<Entry*> admission;
+    appendReverse(admission,
+                  entries_[index(ServiceComponentKind::kDataSource)]);
+    appendReverse(admission,
+                  entries_[index(ServiceComponentKind::kComponent)]);
+    stopPhase(context, logger, admission);
+
+    // Pools and timers are graph-work producers. Drain them completely before
+    // StreamExecutionEnvironment checks the input/parallel counters; otherwise
+    // a pool task may create a ParallelCall after the counter was observed at
+    // zero.
+    std::vector<Entry*> executors;
+    appendReverse(executors,
+                  entries_[index(ServiceComponentKind::kPriorityTaskPool)]);
+    appendReverse(executors,
+                  entries_[index(ServiceComponentKind::kTaskPool)]);
+    appendReverse(executors,
+                  entries_[index(ServiceComponentKind::kDelayPool)]);
+    appendReverse(executors, entries_[index(ServiceComponentKind::kStorage)]);
+    stopPhase(context, logger, executors);
   }
 
   void stopAfterGraphDrain(
