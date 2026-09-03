@@ -156,8 +156,6 @@ temporalConnector:
   address: temporal:7233
   namespace: servicegen
   identity: automation-service
-  maxConcurrentActivities: 12
-  maxConcurrentWorkflows: 7
   workerStopTimeout: 5000
 cronEndpoint:
   id: 41
@@ -183,6 +181,7 @@ temporalEndpoint:
   activityStartToCloseTimeout: 10000
   activityHeartbeatTimeout: 1000
   maximumAttempts: 5
+  maxConcurrentActivities: 12
 )");
   const servicelib::config::YamlValue topologyValue(topology);
   const auto cronConnector = topologyValue["cronConnector"]
@@ -192,7 +191,6 @@ temporalEndpoint:
   const auto temporalConnector = topologyValue["temporalConnector"]
                                      .As<servicelib::config::TemporalDataConnectorConfig>();
   assert(temporalConnector.namespaceName == "servicegen");
-  assert(temporalConnector.maxConcurrentActivities == 12);
   assert(temporalConnector.workerStopTimeout == 5000);
   const auto cronEndpoint = topologyValue["cronEndpoint"]
                                 .As<servicelib::config::CronEndpointConfig>();
@@ -204,6 +202,7 @@ temporalEndpoint:
                                     .As<servicelib::config::TemporalEndpointConfig>();
   assert(temporalEndpoint.taskQueue == "automation");
   assert(temporalEndpoint.maximumAttempts == 5);
+  assert(temporalEndpoint.maxConcurrentActivities == 12);
   const servicelib::config::YamlValue nonUtcEndpoint(YAML::Load(R"(
 schedule: "0 * * * *"
 timezone: Europe/Moscow
