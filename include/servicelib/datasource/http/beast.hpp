@@ -982,9 +982,11 @@ class BeastDataSource final {
  public:
   template <typename Input>
   [[nodiscard]] static std::shared_ptr<BeastDataSource> make(
-      IServiceEnvironment& environment, const Input& input) {
+      IServiceEnvironment& environment, const Input& input,
+      std::unique_ptr<servicelib::http::Server> server = {}) {
     return std::shared_ptr<BeastDataSource>(new BeastDataSource(
-        environment, connectorIdForEndpoint(environment, input.getEndpointId())));
+        environment, connectorIdForEndpoint(environment, input.getEndpointId()),
+        std::move(server)));
   }
   [[nodiscard]] int id() const noexcept { return connectorId_; }
   [[nodiscard]] config::HttpDataConnectorConfig config() const {
@@ -1034,7 +1036,9 @@ class BeastDataSource final {
         endpoint->start(context);
         started.push_back(endpoint.get());
       }
+      if (server_) server_->Start();
     } catch (...) {
+      if (server_) server_->Stop();
       for (auto it = started.rbegin(); it != started.rend(); ++it) {
         (*it)->stop(context);
       }
@@ -1042,12 +1046,16 @@ class BeastDataSource final {
     }
   }
   void stop(Context context) {
+    if (server_) server_->Stop();
     for (const auto& [_, endpoint] : endpoints_) endpoint->stop(context);
   }
 
  private:
-  BeastDataSource(IServiceEnvironment& environment, int connectorId)
-      : environment_(environment), connectorId_(connectorId) {
+  BeastDataSource(IServiceEnvironment& environment, int connectorId,
+                  std::unique_ptr<servicelib::http::Server> server)
+      : environment_(environment),
+        connectorId_(connectorId),
+        server_(std::move(server)) {
     static_cast<void>(config());
   }
 
@@ -1064,6 +1072,7 @@ class BeastDataSource final {
 
   IServiceEnvironment& environment_;
   int connectorId_;
+  std::unique_ptr<servicelib::http::Server> server_;
   std::unordered_map<int, std::shared_ptr<IBeastEndpoint>> endpoints_;
 };
 

@@ -207,6 +207,14 @@ struct RecordingLogger final : servicelib::log::Logger {
 void startsAndStopsInServiceOrder() {
   EventLog events;
   servicelib::ServiceLifecycle lifecycle;
+  lifecycle.add(servicelib::ServiceComponentKind::kStorage,
+                std::make_shared<Component>("storage", &events));
+  lifecycle.add(servicelib::ServiceComponentKind::kTaskPool,
+                std::make_shared<Component>("task", &events));
+  lifecycle.add(servicelib::ServiceComponentKind::kPriorityTaskPool,
+                std::make_shared<Component>("priority", &events));
+  lifecycle.add(servicelib::ServiceComponentKind::kComponent,
+                std::make_shared<Component>("component", &events));
   lifecycle.add(servicelib::ServiceComponentKind::kDataSink,
                 std::make_shared<Component>("sink", &events));
   lifecycle.add(servicelib::ServiceComponentKind::kDelayPool,
@@ -220,17 +228,19 @@ void startsAndStopsInServiceOrder() {
                    "sink:stop") == beforeGraphDrain.end());
   lifecycle.stopAfterGraphDrain({});
   const auto recorded = events.snapshot();
-  assert(recorded.size() == 6);
-  assert((std::vector(recorded.begin(), recorded.begin() + 3) ==
-          std::vector<std::string>{"delay:start", "sink:start",
+  assert(recorded.size() == 14);
+  assert((std::vector(recorded.begin(), recorded.begin() + 7) ==
+          std::vector<std::string>{"storage:start", "delay:start",
+                                   "task:start", "priority:start",
+                                   "component:start", "sink:start",
                                    "source:start"}));
   assert(recorded.back() == "sink:stop");
-  assert(std::find(recorded.begin() + 3, recorded.end(), "source:stop") !=
+  assert(std::find(recorded.begin() + 7, recorded.end(), "source:stop") !=
          recorded.end());
-  assert(std::find(recorded.begin() + 3, recorded.end(), "delay:stop") !=
+  assert(std::find(recorded.begin() + 7, recorded.end(), "delay:stop") !=
          recorded.end());
-  assert(std::find(recorded.begin() + 3, recorded.end(), "source:stop") <
-         std::find(recorded.begin() + 3, recorded.end(), "delay:stop"));
+  assert(std::find(recorded.begin() + 7, recorded.end(), "source:stop") <
+         std::find(recorded.begin() + 7, recorded.end(), "delay:stop"));
 }
 
 void rollsBackStartedComponents() {
