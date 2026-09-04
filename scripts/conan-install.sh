@@ -21,9 +21,13 @@ network_retry_args=(
   # list. Retrying at both layers multiplies waits and prevents timely fallback
   # to the next recipe URL.
   -cc "core.net.http:max_retries=0"
-  -c:h "tools.files.download:retry=${DEPENDENCY_COMMAND_RETRY_ATTEMPTS:-10}"
+  # A recipe may provide an ordered URL list. Try each URL once so a broken
+  # mirror cannot consume the retry budget before Conan reaches the next one.
+  # The generated build boundary retries the complete dependency operation
+  # after every URL has failed.
+  -c:h "tools.files.download:retry=0"
   -c:h "tools.files.download:retry_wait=${DEPENDENCY_COMMAND_RETRY_DELAY_SECONDS:-5}"
-  -c:b "tools.files.download:retry=${DEPENDENCY_COMMAND_RETRY_ATTEMPTS:-10}"
+  -c:b "tools.files.download:retry=0"
   -c:b "tools.files.download:retry_wait=${DEPENDENCY_COMMAND_RETRY_DELAY_SECONDS:-5}"
 )
 

@@ -24,10 +24,10 @@ grep -Fq -- 'core.download:retry=' "$script" || {
   echo "Conan package downloads must use native network retries" >&2
   exit 1
 }
-grep -Fq -- 'tools.files.download:retry=' "$script" || {
-  echo "Conan recipe source downloads must use native network retries" >&2
+if [[ $(grep -Fc -- 'tools.files.download:retry=0' "$script") != "2" ]]; then
+  echo "each Conan recipe source URL must be attempted once before mirror fallback" >&2
   exit 1
-}
+fi
 grep -Fq -- 'core.net.http:max_retries=0' "$script" || {
   echo "low-level HTTP retries must stay disabled so recipe mirrors are tried promptly" >&2
   exit 1
