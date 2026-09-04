@@ -28,6 +28,10 @@ grep -Fq -- 'tools.files.download:retry=' "$script" || {
   echo "Conan recipe source downloads must use native network retries" >&2
   exit 1
 }
+grep -Fq -- 'core.net.http:max_retries=0' "$script" || {
+  echo "low-level HTTP retries must stay disabled so recipe mirrors are tried promptly" >&2
+  exit 1
+}
 grep -Fq -- '-o:h "openssl/*:no_engine=False"' "$script" || {
   echo "all C++ variants must share the OpenSSL ENGINE compatibility setting in the host graph" >&2
   exit 1
