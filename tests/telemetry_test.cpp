@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -10,6 +11,7 @@
 #include <servicelib/runtime/caller.hpp>
 #include <servicelib/runtime/datasink.hpp>
 #include <servicelib/runtime/datasource.hpp>
+#include <servicelib/runtime/environment_variable.hpp>
 #include <servicelib/runtime/testlog/testlog.hpp>
 #include <servicelib/runtime/testmetrics/testmetrics.hpp>
 #include <servicelib/runtime/testtracing/testtracing.hpp>
@@ -36,6 +38,20 @@ class TestCallerBase final : public servicelib::CallerBase {
 };
 
 }  // namespace
+
+TEST(TestTelemetry, EnvironmentFlagsUseStrictBooleanValues) {
+  constexpr auto kName = "SERVICELIB_TEST_BOOLEAN_FLAG";
+  for (const char* value : {"1", "true", "TRUE", " yes ", "On"}) {
+    ASSERT_EQ(setenv(kName, value, 1), 0);
+    EXPECT_TRUE(servicelib::EnvironmentFlagEnabled(kName));
+  }
+  for (const char* value : {"", "0", "false", "no", "off", "anything"}) {
+    ASSERT_EQ(setenv(kName, value, 1), 0);
+    EXPECT_FALSE(servicelib::EnvironmentFlagEnabled(kName));
+  }
+  ASSERT_EQ(unsetenv(kName), 0);
+  EXPECT_FALSE(servicelib::EnvironmentFlagEnabled(kName));
+}
 
 TEST(TestTelemetry, MetricsRecordAllInstrumentKindsAndReset) {
   servicelib::testmetrics::TestMetrics metrics;
