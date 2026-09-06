@@ -275,10 +275,8 @@ class MultiJoinImpl final : public MultiJoin<_TTp, _JTp, _JoinStrategy, _CCp>,
           auto typed = makeTypedValues(
               values, std::make_index_sequence<std::tuple_size_v<_TTp>>{});
           auto mutableKey = key;
-          bool emitted = false;
-          f_(context, *this, mutableKey, typed,
-             Collector<_JTp, MultiJoinImpl>(*this, &emitted));
-          return emitted;
+          return f_(context, *this, mutableKey, typed,
+                    Collector<_JTp, MultiJoinImpl>(*this));
         });
   }
 

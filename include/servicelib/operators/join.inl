@@ -332,10 +332,8 @@ class JoinImpl final : public Join<_TTp, _JTp, _JoinType, _JoinStrategy, _CCp>,
             }
           }
           auto mutableKey = key;
-          bool emitted = false;
-          f_(context, *this, mutableKey, typed,
-             Collector<_JTp, JoinImpl>(*this, &emitted));
-          return emitted;
+          return f_(context, *this, mutableKey, typed,
+                    Collector<_JTp, JoinImpl>(*this));
         });
   }
 

@@ -108,7 +108,25 @@ class CaseBase : protected T, public StreamConsumer<_Tp>, public StreamBase {
              std::tuple_size_v<T>>
       branchDispatchers_{};
 
-  explicit CaseBase(const T& t) : T(t) {}
+  explicit CaseBase(const T& t) : T(t) {
+    // Go CaseStream dispatches directly into the selected WhenStream.  The
+    // WhenStream then uses its own prepared Caller for the When -> consumer
+    // edge.  Keep the same boundary here: Case -> When is routing, not a
+    // separately metered/call-semantics edge.
+    std::apply(
+        [this, index = std::size_t{0}](auto&... consumer) mutable {
+          (([&] {
+             auto* branch = std::addressof(consumer);
+             branchDispatchers_[index++] =
+                 [branch](MessageContext context, Payload<_Tp> payload) {
+                   branch->dispatchPrepared(std::move(context),
+                                            std::move(payload));
+                 };
+           }()),
+           ...);
+        },
+        static_cast<T&>(*this));
+  }
   ~CaseBase() override = default;
 
   void verifyTopology(StreamVerifyContext& ctx) const override {
@@ -186,20 +204,6 @@ class CaseBase : protected T, public StreamConsumer<_Tp>, public StreamBase {
       os << "auto &stream" << id << "r = *stream" << id << "c;" << std::endl;
       os << "stream" << id << "r.setId(" << id << ");" << std::endl;
     }
-    std::apply(
-        [this, index = std::size_t{0}](auto&... consumer) mutable {
-          (([&] {
-             auto* caller = _Context::getExecutionEnvironment()
-                                .template prepareCaller<_Tp>(
-                                    *this, consumer, consumer.getName());
-             branchDispatchers_[index++] =
-                 [caller](MessageContext context, Payload<_Tp> payload) {
-                   caller->consume(std::move(context), std::move(payload));
-                 };
-           }()),
-           ...);
-        },
-        static_cast<T&>(*this));
     return next_id;
   }
 

@@ -89,19 +89,14 @@ class Collector final : public NotCopyableOrMovable {
   friend class Stream;
 
   C& _collector;
-  bool* emitted_{};
-
  protected:
-  explicit Collector(C& collector, bool* emitted = nullptr)
-      : _collector(collector), emitted_(emitted) {}
+  explicit Collector(C& collector) : _collector(collector) {}
 
  public:
   void out(MessageContext ctx, T&& v) {
-    if (emitted_) *emitted_ = true;
     _collector.produce(ctx, std::forward<T>(v));
   }
   void out(MessageContext ctx, const T& v) {
-    if (emitted_) *emitted_ = true;
     _collector.produce(ctx, v);
   }
 };

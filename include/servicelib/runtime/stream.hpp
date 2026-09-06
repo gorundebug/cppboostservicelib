@@ -400,7 +400,7 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
                                     T>::value_type>,
                                 std::vector<_Vp>>&,
                       Collector<_Type, void>&&>,
-                  void>,
+                  bool>,
           Join<KeyValueType<_Kp, _Vp>, _Type, _JoinType, _JoinStrategy>&> {
     using TJoinImpl = JoinImpl<KeyValueType<_Kp, _Vp>, _Type, _JoinFunction,
                                _JoinType, _JoinStrategy>;
@@ -432,7 +432,7 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
                                      T>::value_type>,
                                  std::vector<ValueType>...>&,
                       Collector<_Type, void>&&>,
-                  void>,
+                  bool>,
               std::conjunction<detail::can_join<
                   KeyValueType<typename detail::key_value_args<T>::key_type,
                                ValueType>,

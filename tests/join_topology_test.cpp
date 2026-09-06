@@ -39,13 +39,14 @@ servicelib::config::SinkStreamConfig sinkConfig(int id, std::string name) {
 }
 
 struct JoinValues final {
-  void operator()(
+  bool operator()(
       servicelib::MessageContext context, servicelib::StreamBase&, int& key,
       std::pair<std::vector<std::string>, std::vector<int>>& values,
       auto&& output) const {
-    if (values.first.empty() || values.second.empty()) return;
+    if (values.first.empty() || values.second.empty()) return false;
     output.out(context, std::to_string(key) + ":" + values.first.front() +
                             ":" + std::to_string(values.second.front()));
+    return true;
   }
 };
 
@@ -58,30 +59,32 @@ struct RecordValue final {
 };
 
 struct MultiJoinValues final {
-  void operator()(
+  bool operator()(
       servicelib::MessageContext context, servicelib::StreamBase&, int& key,
       std::tuple<std::vector<std::string>, std::vector<int>,
                  std::vector<double>>& values,
       auto&& output) const {
     if (std::get<0>(values).empty() || std::get<1>(values).empty() ||
         std::get<2>(values).empty()) {
-      return;
+      return false;
     }
     output.out(context,
                std::to_string(key) + ":" + std::get<0>(values).front() +
                    ":" + std::to_string(std::get<1>(values).front()) + ":" +
                    std::to_string(std::get<2>(values).front()));
+    return true;
   }
 };
 
 struct JoinAvailability final {
-  void operator()(
+  bool operator()(
       servicelib::MessageContext context, servicelib::StreamBase&, int& key,
       std::pair<std::vector<std::string>, std::vector<int>>& values,
       auto&& output) const {
     output.out(context, std::to_string(key) + ":L" +
                             std::to_string(values.first.size()) + ":R" +
                             std::to_string(values.second.size()));
+    return true;
   }
 };
 
