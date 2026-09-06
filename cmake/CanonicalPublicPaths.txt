@@ -63,6 +63,7 @@ runtime/detail/kafka_context.hpp
 runtime/detail/storage.hpp
 runtime/detail/traits.hpp
 runtime/environment.hpp
+runtime/environment_variable.hpp
 runtime/environment/environment.hpp
 runtime/environment/log/log.hpp
 runtime/environment/metrics/metrics.hpp
