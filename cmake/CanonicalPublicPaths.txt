@@ -11,6 +11,7 @@ datasink/http/userver.hpp
 datasink/kafka/userver.hpp
 datasink/localsink/custom.hpp
 datasource/cron/libcron.hpp
+datasource/detail/result_context.hpp
 datasource/grpc/bidistreaming.hpp
 datasource/grpc/clientstreaming.hpp
 datasource/grpc/common.hpp
@@ -18,6 +19,7 @@ datasource/grpc/nostreaming.hpp
 datasource/grpc/serverstreaming.hpp
 datasource/grpc/userver.hpp
 datasource/http/userver.hpp
+datasource/kafka/detail/endpoint.hpp
 datasource/kafka/userver.hpp
 datasource/localsource/custom.hpp
 operators/case.inl

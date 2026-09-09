@@ -29,6 +29,7 @@ list(APPEND _omitted_userver_boundaries
     runtime/telemetry/userver/userver.hpp)
 
 set(_boost_boundary_replacements
+    datasink/grpc/streaming_lifecycle.hpp
     datasink/grpc/asio.hpp
     datasink/http/beast.hpp
     datasink/http/client.hpp
@@ -56,6 +57,7 @@ set(_boost_boundary_replacements
     runtime/endpoint.hpp
     runtime/environment/log/json_logger.hpp
     runtime/environment/metrics/prometheus.hpp
+    runtime/pool/queuedpool.hpp
     runtime/telemetry/opentelemetry/log.hpp
     runtime/telemetry/opentelemetry/opentelemetry.hpp
     runtime/telemetry/opentelemetry/tracing.hpp
