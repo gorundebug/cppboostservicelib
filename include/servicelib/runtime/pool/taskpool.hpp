@@ -5,6 +5,7 @@ class TaskPoolImpl final : public ITaskPool {
  public:
   TaskPoolImpl(std::string name, IServiceEnvironment& env)
       : pool_(std::move(name), env) {}
+  ~TaskPoolImpl() override {}
   const std::string& getName() const noexcept override {
     return pool_.getName();
   }

@@ -5,6 +5,7 @@ class PriorityTaskPoolImpl final : public IPriorityTaskPool {
  public:
   PriorityTaskPoolImpl(std::string name, IServiceEnvironment& env)
       : pool_(std::move(name), env) {}
+  ~PriorityTaskPoolImpl() override {}
   const std::string& getName() const noexcept override {
     return pool_.getName();
   }
