@@ -384,6 +384,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         session->rpc->cancel();
       }
     }
+    static_cast<void>(active);
   }
 
   void finishAsync(const std::shared_ptr<Session>& session, std::exception_ptr error) {
