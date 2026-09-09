@@ -7,15 +7,16 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <future>
+#include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <utility>
@@ -29,18 +30,22 @@ namespace servicelib::pool {
 
 class DelayPoolImpl final : public IDelayPool {
  private:
-  enum class PoolState { kCreated, kRunning, kStopping, kStopped, kFailed };
+  static constexpr std::uint64_t kClosed = std::uint64_t{1} << 63;
+  static constexpr std::uint64_t kStarted = std::uint64_t{1} << 62;
+  static constexpr std::uint64_t kCountMask = kStarted - 1;
   struct SharedState;
   struct DelayTask;
+  using TimerQueue = std::multimap<std::chrono::steady_clock::time_point,
+                                    std::shared_ptr<DelayTask>>;
   using CancelCallback = std::stop_callback<std::function<void()>>;
 
   struct DelayTask final {
     std::shared_ptr<SharedState> state;
     Context ctx;
     std::function<void()> fn;
-    std::unique_ptr<boost::asio::steady_timer> timer;
+    std::optional<TimerQueue::iterator> queued;  // strand only
+    bool expeditedByDeadline{};
     std::atomic<bool> claimed{false};
-    std::atomic<bool> admitted{false};
     std::atomic<bool> cancelRequested{false};
     std::optional<CancelCallback> cancelCallback;
     std::vector<std::unique_ptr<CancelCallback>> externalCancelCallbacks;
@@ -49,7 +54,9 @@ class DelayPoolImpl final : public IDelayPool {
   struct SharedState final {
     explicit SharedState(IServiceEnvironment& environment)
         : env(environment),
-          executor(detail::ParallelExecutorRegistry::Get()) {
+          executor(detail::ParallelExecutorRegistry::Get()),
+          strand(boost::asio::make_strand(executor)), timer(strand),
+          drained(drainPromise.get_future().share()) {
       const auto serviceSnapshot = env.getServiceConfigSnapshot();
       const auto* service = serviceSnapshot.get();
       metricsEnabled = env.getMetrics().enabled();
@@ -76,10 +83,17 @@ class DelayPoolImpl final : public IDelayPool {
 
     IServiceEnvironment& env;
     boost::asio::any_io_executor executor;
-    std::mutex mu;
-    std::condition_variable cv;
-    PoolState poolState = PoolState::kCreated;
-    std::int64_t pending = 0;
+    // Queue/timer ownership is confined to this strand, never user callbacks.
+    boost::asio::strand<boost::asio::any_io_executor> strand;
+    boost::asio::steady_timer timer;
+    TimerQueue timers;
+    std::optional<std::chrono::steady_clock::time_point> armedAt;
+    std::uint64_t generation{};
+    // Admission and shutdown are linearized without blocking reactor threads.
+    std::atomic<std::uint64_t> activity{0};
+    std::atomic<bool> drainSignalled{false};
+    std::promise<void> drainPromise;
+    std::shared_future<void> drained;
     bool metricsEnabled{};
     std::unique_ptr<metrics::Int64Gauge> gaugeWaitQueueLength;
     std::unique_ptr<metrics::Int64Counter> tasksTotal;
@@ -94,64 +108,32 @@ class DelayPoolImpl final : public IDelayPool {
       : state_(std::make_shared<SharedState>(env)) {}
 
   ~DelayPoolImpl() override {
-    const auto state = state_;
-    std::lock_guard lock(state->mu);
-    const bool unused =
-        state->poolState == PoolState::kCreated && state->pending == 0;
-    if (!unused && state->poolState != PoolState::kStopped) {
-      std::terminate();
-    }
+    const auto activity = state_->activity.load(std::memory_order_acquire);
+    if ((activity & kCountMask) != 0 ||
+        ((activity & kStarted) && !(activity & kClosed))) std::terminate();
   }
 
   void start([[maybe_unused]] Context ctx) override {
-    const auto state = state_;
-    std::lock_guard lock(state->mu);
-    switch (state->poolState) {
-      case PoolState::kCreated:
-        state->poolState = PoolState::kRunning;
-        return;
-      case PoolState::kStopping:
-      case PoolState::kStopped:
-        throw PoolStoppedError();
-      case PoolState::kRunning:
-      case PoolState::kFailed:
-        throw PoolAlreadyStartedError();
+    auto activity = state_->activity.load(std::memory_order_acquire);
+    for (;;) {
+      if (activity & kClosed) throw PoolStoppedError();
+      if (activity & kStarted) throw PoolAlreadyStartedError();
+      if (state_->activity.compare_exchange_weak(activity, activity | kStarted,
+                                                std::memory_order_acq_rel)) return;
     }
   }
 
   void stop(Context ctx) override {
     const auto state = state_;
-    if (currentExecutingPool_ == state.get()) {
-      throw PoolSelfStopError();
+    if (currentExecutingPool_ == state.get()) throw PoolSelfStopError();
+    const auto activity = state->activity.fetch_or(kClosed, std::memory_order_acq_rel);
+    if ((activity & kCountMask) == 0) signalDrained(state);
+    // This synchronous lifecycle boundary is called off-reactor by ServiceApp.
+    // Neither scheduling nor executing callbacks waits on a future or OS lock.
+    if (ctx.deadline() && state->drained.wait_until(*ctx.deadline()) == std::future_status::timeout) {
+      recordStopTimeout(state);
     }
-
-    bool ownsStop = false;
-    bool timedOut = false;
-    {
-      std::unique_lock lock(state->mu);
-      if (state->poolState == PoolState::kStopped) return;
-      if (state->poolState != PoolState::kStopping) {
-        state->poolState = PoolState::kStopping;
-        ownsStop = true;
-      }
-      timedOut = !waitWithContext(*state, lock, ctx, [state] {
-        return state->pending == 0 || state->poolState == PoolState::kStopped;
-      });
-    }
-    if (timedOut) recordStopTimeout(state);
-
-    // A shutdown deadline is diagnostic, not permission for accepted work to
-    // outlive the graph captured by its callback. Keep the graph owner blocked
-    // until all previously admitted tasks have retired.
-    std::unique_lock lock(state->mu);
-    if (ownsStop) {
-      state->cv.wait(lock, [state] { return state->pending == 0; });
-      state->poolState = PoolState::kStopped;
-      state->cv.notify_all();
-    } else {
-      state->cv.wait(
-          lock, [state] { return state->poolState == PoolState::kStopped; });
-    }
+    state->drained.wait();
   }
 
   void delay(Context ctx, Duration delayDuration,
@@ -174,15 +156,21 @@ class DelayPoolImpl final : public IDelayPool {
     task->state = state;
     task->ctx = std::move(ctx);
     task->fn = std::move(fn);
-    task->timer = std::make_unique<boost::asio::steady_timer>(state->executor);
+    task->expeditedByDeadline = expeditedByDeadline;
 
     const std::weak_ptr<DelayTask> weakTask(task);
     const auto onCancel = [weakTask] {
-      if (const auto locked = weakTask.lock()) {
-        locked->cancelRequested.store(true, std::memory_order_release);
-        if (locked->admitted.load(std::memory_order_acquire)) {
-          locked->timer->cancel();
-        }
+      if (const auto task = weakTask.lock()) {
+        if (task->cancelRequested.exchange(true, std::memory_order_acq_rel)) return;
+        boost::asio::post(task->state->strand, [weakTask] {
+          if (const auto task = weakTask.lock(); task && task->queued) {
+            auto state = task->state;
+            state->timers.erase(*task->queued);
+            task->queued.reset();
+            dispatch(task, true);
+            armNext(state);
+          }
+        });
       }
     };
     if (runAt > now) {
@@ -199,54 +187,39 @@ class DelayPoolImpl final : public IDelayPool {
       }
     }
 
-    {
-      std::lock_guard lock(state->mu);
-      if (state->poolState == PoolState::kStopping ||
-          state->poolState == PoolState::kStopped) {
+    // Allocate the queue node before admission so allocation failures cannot
+    // silently discard accepted work. The strand inserts this node allocation-free.
+    TimerQueue staging;
+    auto node = staging.extract(staging.emplace(runAt, task));
+    auto activity = state->activity.load(std::memory_order_acquire);
+    for (;;) {
+      if (activity & kClosed) {
         bestEffort([state] { state->taskRejectedCounter->inc(); });
         throw PoolStoppedError();
       }
-      if (state->poolState == PoolState::kFailed) {
-        bestEffort([state] { state->taskRejectedCounter->inc(); });
-        throw PoolNotStartedError();
-      }
-      ++state->pending;
-      publishPendingGaugeLocked(*state);
+      if ((activity & kCountMask) == kCountMask) throw std::overflow_error("too many delay tasks");
+      if (state->activity.compare_exchange_weak(activity, activity + 1,
+                                               std::memory_order_acq_rel)) break;
     }
-
+    if (state->metricsEnabled) bestEffort([state] { state->gaugeWaitQueueLength->inc(); });
     try {
-      if (runAt <= now) {
-        boost::asio::post(state->executor,
-                          [task] { execute(task, false); });
-      } else {
-        task->timer->expires_at(runAt);
-        task->timer->async_wait(
-            [task, expeditedByDeadline](const boost::system::error_code& ec) {
-              if (!ec || ec == boost::asio::error::operation_aborted) {
-                execute(task,
-                        expeditedByDeadline ||
-                            task->cancelRequested.load(
-                                std::memory_order_acquire));
-              }
-            });
-      }
-      task->admitted.store(true, std::memory_order_release);
-      if (task->cancelRequested.load(std::memory_order_acquire)) {
-        task->timer->cancel();
-      }
+      boost::asio::post(state->strand, [state, task, node = std::move(node)]() mutable {
+        if (task->cancelRequested.load(std::memory_order_acquire) ||
+            node.key() <= std::chrono::steady_clock::now()) {
+          dispatch(task, task->expeditedByDeadline || task->cancelRequested.load(std::memory_order_acquire));
+        } else {
+          task->queued = state->timers.insert(std::move(node));
+          armNext(state);
+        }
+      });
     } catch (...) {
-      std::lock_guard lock(state->mu);
-      --state->pending;
-      publishPendingGaugeLocked(*state);
-      state->cv.notify_all();
+      retire(state);
       throw;
     }
   }
 
   [[nodiscard]] std::int64_t activeTasksApprox() const noexcept {
-    const auto state = state_;
-    std::lock_guard lock(state->mu);
-    return state->pending;
+    return state_->activity.load(std::memory_order_acquire) & kCountMask;
   }
 
  private:
@@ -258,16 +231,43 @@ class DelayPoolImpl final : public IDelayPool {
     }
   }
 
-  template <typename Predicate>
-  static bool waitWithContext(SharedState& state,
-                              std::unique_lock<std::mutex>& lock,
-                              const Context& ctx, Predicate&& predicate) {
-    if (const auto& deadline = ctx.deadline(); deadline) {
-      return state.cv.wait_until(lock, *deadline,
-                                 std::forward<Predicate>(predicate));
-    }
-    state.cv.wait(lock, std::forward<Predicate>(predicate));
-    return true;
+  static void signalDrained(const std::shared_ptr<SharedState>& state) {
+    if (!state->drainSignalled.exchange(true, std::memory_order_acq_rel)) state->drainPromise.set_value();
+  }
+
+  static void retire(const std::shared_ptr<SharedState>& state) {
+    if (state->metricsEnabled) bestEffort([state] { state->gaugeWaitQueueLength->dec(); });
+    const auto previous = state->activity.fetch_sub(1, std::memory_order_acq_rel);
+    if ((previous & kClosed) && (previous & kCountMask) == 1) signalDrained(state);
+  }
+
+  static void dispatch(const std::shared_ptr<DelayTask>& task, bool expedited) {
+    // Independent executor task, never execute user code on the timer strand.
+    boost::asio::post(task->state->executor, [task, expedited] { execute(task, expedited); });
+  }
+
+  static void armNext(const std::shared_ptr<SharedState>& state) {
+    const auto next = state->timers.empty()
+        ? std::optional<std::chrono::steady_clock::time_point>{}
+        : std::optional{state->timers.begin()->first};
+    if (next == state->armedAt) return;
+    const auto generation = ++state->generation;
+    state->armedAt = next;
+    if (!next) { state->timer.cancel(); return; }
+    state->timer.expires_at(*next);
+    state->timer.async_wait([state, generation](const boost::system::error_code& error) {
+      if (generation != state->generation || error == boost::asio::error::operation_aborted) return;
+      state->armedAt.reset();
+      const auto now = std::chrono::steady_clock::now();
+      unsigned batch = 0;
+      while (!state->timers.empty() && state->timers.begin()->first <= now && batch++ < 64) {
+        auto node = state->timers.extract(state->timers.begin());
+        auto task = std::move(node.mapped());
+        task->queued.reset();
+        dispatch(task, task->expeditedByDeadline || task->cancelRequested.load(std::memory_order_acquire));
+      }
+      armNext(state);
+    });
   }
 
   static void recordStopTimeout(const std::shared_ptr<SharedState>& state) {
@@ -290,11 +290,6 @@ class DelayPoolImpl final : public IDelayPool {
       const std::shared_ptr<SharedState>& state) {
     bestEffort([state] { state->taskRejectedCounter->inc(); });
     throw PoolCancelledError();
-  }
-
-  static void publishPendingGaugeLocked(SharedState& state) noexcept {
-    if (!state.metricsEnabled) return;
-    bestEffort([&state] { state.gaugeWaitQueueLength->set(state.pending); });
   }
 
   static void execute(const std::shared_ptr<DelayTask>& task,
@@ -342,10 +337,7 @@ class DelayPoolImpl final : public IDelayPool {
       }
     }
 
-    std::lock_guard lock(state->mu);
-    --state->pending;
-    publishPendingGaugeLocked(*state);
-    if (state->pending == 0) state->cv.notify_all();
+    retire(state);
   }
 
   inline static thread_local const SharedState* currentExecutingPool_{};

@@ -199,7 +199,7 @@ TEST(PriorityTaskPool, PriorityFifoAndDeadlinePromotion) {
   EXPECT_EQ(execution_order, (std::vector<int>{2, 3, 4, 1}));
   EXPECT_EQ(environment.metrics()
                 .counter("priority_task_pool.events_total",
-                         PriorityEventLabels("task_expedited"))
+                         PriorityEventLabels("task_expired"))
                 .count(),
             1);
   EXPECT_EQ(environment.metrics()
@@ -247,7 +247,7 @@ TEST(PriorityTaskPool, ExplicitCancellationPromotesOnlyOnce) {
   pool.stop(servicelib::Context{});
   EXPECT_EQ(environment.metrics()
                 .counter("priority_task_pool.events_total",
-                         PriorityEventLabels("task_expedited"))
+                         PriorityEventLabels("task_expired"))
                 .count(),
             1);
 }
@@ -291,7 +291,7 @@ TEST(PriorityTaskPool, ExternalCancellationPromotesQueuedTask) {
   EXPECT_EQ(execution_order, (std::vector<int>{1, 2}));
   EXPECT_EQ(environment.metrics()
                 .counter("priority_task_pool.events_total",
-                         PriorityEventLabels("task_expedited"))
+                         PriorityEventLabels("task_expired"))
                 .count(),
             1);
 }
@@ -339,7 +339,7 @@ TEST(PriorityTaskPool, HotResizeUsesLatestRuntimeConfig) {
   pool.stop(servicelib::Context{});
 }
 
-TEST(PriorityTaskPool, LifecycleCancellationDrainsAndRejectsNewTasks) {
+TEST(PriorityTaskPool, LifecycleCancellationOnlyStopsResizeManager) {
   TestEnvironment environment;
   servicelib::pool::PriorityTaskPoolImpl pool{kPoolName, environment};
   std::stop_source lifecycle;
@@ -359,22 +359,15 @@ TEST(PriorityTaskPool, LifecycleCancellationDrainsAndRejectsNewTasks) {
                [&] { completed.fetch_add(1, std::memory_order_relaxed); });
 
   lifecycle.request_stop();
-  bool rejected = false;
-  const auto reject_deadline = std::chrono::steady_clock::now() + 3s;
-  while (!rejected && std::chrono::steady_clock::now() < reject_deadline) {
-    try {
-      pool.addTask({}, 20,
-                   [&] { completed.fetch_add(1, std::memory_order_relaxed); });
-    } catch (const servicelib::pool::PoolStoppedError&) {
-      rejected = true;
-    }
-    if (!rejected) test_async::SleepFor(1ms);
-  }
-  ASSERT_TRUE(rejected);
+  test_async::SleepFor(30ms);
+  environment.setExecutorsCount(2);
+  test_async::SleepFor(1100ms);
+  EXPECT_EQ(pool.getExecutorsCount(), 1);
+  pool.addTask({}, 20, [&] { completed.fetch_add(1, std::memory_order_relaxed); });
 
   release_blocker.Send();
   pool.stop({});
-  EXPECT_GE(completed.load(std::memory_order_relaxed), 2);
+  EXPECT_EQ(completed.load(std::memory_order_relaxed), 3);
 }
 
 TEST(PriorityTaskPool, ConcurrentStopJoinsTheSameDrain) {
@@ -744,5 +737,175 @@ TEST(DelayPool, RejectsExpiredDeadline) {
                           1h, [] {}),
                servicelib::pool::PoolCancelledError);
 }
+
+
+TEST(DelayPool, CallbackDoesNotBlockOtherDeadlines) {
+  TestEnvironment environment;
+  servicelib::pool::DelayPoolImpl pool{environment};
+  pool.start(servicelib::Context{});
+  StopPoolOnExit stop_guard{pool};
+  test_async::Event started, release, second;
+  pool.delay(servicelib::Context{}, 1ms, [&] {
+    started.Send();
+    static_cast<void>(release.WaitForEvent());
+  });
+  const bool first = started.WaitForEvent();
+  pool.delay(servicelib::Context{}, 1ms, [&] { second.Send(); });
+  const bool independent = second.WaitForEvent();
+  release.Send();
+  pool.stop(servicelib::Context{});
+  EXPECT_TRUE(first);
+  EXPECT_TRUE(independent);
+}
+
+TEST(DelayPool, EarlierDeadlineAndCancellationReleaseFarTimers) {
+  TestEnvironment environment;
+  servicelib::pool::DelayPoolImpl pool{environment};
+  pool.start(servicelib::Context{});
+  StopPoolOnExit stop_guard{pool};
+  std::stop_source source;
+  auto payload = std::make_shared<int>(42);
+  std::weak_ptr<int> weak = payload;
+  std::atomic<int> executions{0};
+  for (int i = 0; i < 1000; ++i) {
+    pool.delay(servicelib::Context{}.withStopToken(source.get_token()), 1h,
+               [payload, &executions] { ++executions; });
+  }
+  payload.reset();
+  test_async::Event earlier;
+  pool.delay(servicelib::Context{}, 1ms, [&] { earlier.Send(); });
+  const bool early = earlier.WaitForEvent();
+  source.request_stop();
+  pool.stop(servicelib::Context{});
+  EXPECT_TRUE(early);
+  EXPECT_EQ(executions.load(), 1000);
+  EXPECT_TRUE(weak.expired());
+}
+
+TEST(DelayPool, CancellationRacesAdmissionAndExpiryExactlyOnce) {
+  TestEnvironment environment;
+  servicelib::pool::DelayPoolImpl pool{environment};
+  pool.start(servicelib::Context{});
+  StopPoolOnExit stop_guard{pool};
+  std::vector<std::atomic<int>> executions(300);
+  for (int i = 0; i < 300; ++i) {
+    std::stop_source source;
+    std::thread canceller([source, i]() mutable {
+      if (i % 2) test_async::SleepFor(1ms);
+      source.request_stop();
+    });
+    try {
+      pool.delay(servicelib::Context{}.withStopToken(source.get_token()), 1ms,
+                 [&, i] { ++executions[i]; });
+    } catch (const servicelib::pool::PoolCancelledError&) {
+      executions[i] = -1;
+    }
+    canceller.join();
+  }
+  pool.stop(servicelib::Context{});
+  for (const auto& count : executions) EXPECT_TRUE(count == 1 || count == -1);
+}
+
+
+template <bool Priority>
+void checkGoAdmissionAndDefaultExecutors() {
+  TestEnvironment environment;
+  environment.setExecutorsCount(0);
+  servicelib::pool::detail_pool::QueuedPool<Priority> pool{kPoolName, environment};
+  EXPECT_EQ(pool.getExecutorsCount(), std::max(1u, std::thread::hardware_concurrency()));
+  test_async::Event completed;
+  pool.addTask({}, 0, [&] { completed.Send(); });
+  const bool ranBeforeStart = completed.WaitForEventFor(10ms);
+  std::stop_source lifecycle;
+  lifecycle.request_stop();
+  pool.start(servicelib::Context{}.withStopToken(lifecycle.get_token()));
+  const bool ran = completed.WaitForEventFor(test_async::kMaxTestWaitTime);
+  pool.stop({});
+  EXPECT_FALSE(ranBeforeStart);
+  EXPECT_TRUE(ran);
+  EXPECT_THROW(pool.addTask({}, 0, [] {}), servicelib::pool::PoolStoppedError);
+}
+
+TEST(TaskPoolGoContract, FifoAcceptsBeforeStartAndZeroExecutors) {
+  checkGoAdmissionAndDefaultExecutors<false>();
+}
+TEST(TaskPoolGoContract, PriorityAcceptsBeforeStartAndZeroExecutors) {
+  checkGoAdmissionAndDefaultExecutors<true>();
+}
+
+template <bool Priority>
+void checkConfiguredConcurrency() {
+  TestEnvironment environment;
+  environment.setExecutorsCount(2);
+  servicelib::pool::detail_pool::QueuedPool<Priority> pool{kPoolName, environment};
+  pool.start({});
+  std::atomic<int> started{0};
+  test_async::Event twoStarted, release;
+  for (int i = 0; i < 10; ++i) {
+    pool.addTask({}, i, [&] {
+      if (++started == 2) twoStarted.Send();
+      static_cast<void>(release.WaitForEvent());
+    });
+  }
+  const bool parallel = twoStarted.WaitForEventFor(test_async::kMaxTestWaitTime);
+  test_async::SleepFor(20ms);
+  const int beforeRelease = started.load();
+  release.Send();
+  pool.stop({});
+  EXPECT_TRUE(parallel);
+  EXPECT_EQ(beforeRelease, 2);
+  EXPECT_EQ(started.load(), 10);
+}
+TEST(TaskPoolGoContract, FifoHonorsConfiguredConcurrency) { checkConfiguredConcurrency<false>(); }
+TEST(TaskPoolGoContract, PriorityHonorsConfiguredConcurrency) { checkConfiguredConcurrency<true>(); }
+
+template <bool Priority>
+void checkAdmissionStopRace() {
+  for (int iteration = 0; iteration < 50; ++iteration) {
+    TestEnvironment environment;
+    servicelib::pool::detail_pool::QueuedPool<Priority> pool{kPoolName, environment};
+    std::atomic<int> executions{0};
+    std::thread starter([&] { try { pool.start({}); } catch (const servicelib::pool::PoolStoppedError&) {} });
+    auto stopper = std::async(std::launch::async, [&] { pool.stop({}); });
+    bool accepted = false;
+    try { pool.addTask({}, 0, [&] { ++executions; }); accepted = true; }
+    catch (const servicelib::pool::PoolStoppedError&) {}
+    starter.join();
+    stopper.get();
+    EXPECT_EQ(executions.load(), accepted ? 1 : 0);
+  }
+}
+TEST(TaskPoolGoContract, FifoAdmissionStartStopRace) { checkAdmissionStopRace<false>(); }
+TEST(TaskPoolGoContract, PriorityAdmissionStartStopRace) { checkAdmissionStopRace<true>(); }
+
+
+template <bool Priority>
+void checkDownsize() {
+  TestEnvironment environment;
+  environment.setExecutorsCount(2);
+  servicelib::pool::detail_pool::QueuedPool<Priority> pool{kPoolName, environment};
+  pool.start({});
+  test_async::Event twoStarted, releaseFirst, releaseSecond;
+  std::atomic<int> started{0};
+  pool.addTask({}, 0, [&] { if (++started == 2) twoStarted.Send(); static_cast<void>(releaseFirst.WaitForEvent()); });
+  pool.addTask({}, 0, [&] { if (++started == 2) twoStarted.Send(); static_cast<void>(releaseSecond.WaitForEvent()); });
+  pool.addTask({}, 0, [&] { ++started; });
+  const bool parallel = twoStarted.WaitForEventFor(test_async::kMaxTestWaitTime);
+  environment.setExecutorsCount(1);
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (pool.getExecutorsCount() != 1 && std::chrono::steady_clock::now() < deadline) test_async::SleepFor(5ms);
+  const auto target = pool.getExecutorsCount();
+  releaseFirst.Send();
+  test_async::SleepFor(20ms);
+  const auto beforeRelease = started.load();
+  releaseSecond.Send();
+  pool.stop({});
+  EXPECT_TRUE(parallel);
+  EXPECT_EQ(target, 1);
+  EXPECT_EQ(beforeRelease, 2);
+  EXPECT_EQ(started.load(), 3);
+}
+TEST(TaskPoolGoContract, FifoDownsizeWaitsForBusyExecutors) { checkDownsize<false>(); }
+TEST(TaskPoolGoContract, PriorityDownsizeWaitsForBusyExecutors) { checkDownsize<true>(); }
 
 }  // namespace

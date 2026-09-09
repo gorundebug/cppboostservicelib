@@ -56,15 +56,15 @@ class IDelayPool {
 
   virtual ~IDelayPool() = default;
 
-  // start() marks the scheduler as explicitly started. delay() may lazily
-  // initialize it on the current userver TaskProcessor before start(), matching
-  // Go. The context exists for lifecycle API compatibility: it is neither
+  // start() marks the scheduler as explicitly started. delay() may enqueue
+  // work on the configured Asio executor before start(), matching Go.
+  // The context exists for lifecycle API compatibility: it is neither
   // inspected nor retained.
   virtual void start(Context ctx) = 0;
 
-  // Stops admission and waits for accepted tasks, bounded by the context
-  // deadline. After timeout, accepted work continues on shared state that may
-  // outlive the IDelayPool object. Calling stop() directly or indirectly from
+  // Stops admission and drains all accepted tasks. The context deadline is
+  // diagnostic only: expiry records a timeout but does not end the drain.
+  // Call from outside the reactor. Calling stop() directly or indirectly from
   // work accounted by this pool is forbidden; the direct case is detected.
   virtual void stop(Context ctx) = 0;
 
@@ -86,12 +86,9 @@ class ITaskPool {
   virtual const std::string& getName() const noexcept = 0;
   virtual int getExecutorsCount() const = 0;
 
-  // The start context controls the pool lifecycle. Cancellation before the
-  // pool becomes ready fails start(). Cancellation after readiness enters an
-  // internal draining phase: tasks already accepted continue to execute,
-  // addTask() rejects every new task with PoolStoppedError, and there is no
-  // public state value to query. The owner must still call stop() to join the
-  // manager/executors and finish lifecycle cleanup.
+  // The start context controls only the executor resize manager, as in Go.
+  // Cancelling it does not reject new work or cancel accepted callbacks.
+  // addTask() may enqueue before start(). stop() closes admission and drains.
   virtual void start(Context ctx) = 0;
   virtual void stop(Context ctx) = 0;
 

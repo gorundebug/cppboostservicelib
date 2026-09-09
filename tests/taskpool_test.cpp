@@ -153,8 +153,6 @@ void expectThrow(Function&& function) {
 void lifecycleFifoAndMetrics() {
   TestEnvironment environment;
   servicelib::pool::TaskPoolImpl pool{kPoolName, environment};
-  expectThrow<servicelib::pool::PoolNotStartedError>(
-      [&] { pool.addTask({}, [] {}); });
   pool.start({});
   assert(pool.getExecutorsCount() == 1);
   Event firstStarted;
@@ -210,7 +208,7 @@ void lifecycleFifoAndMetrics() {
              .value() == 0);
   assert(environment.metrics()
              .counter("task_pool.events_total", EventLabels("task_rejected"))
-             .count() == 2);
+             .count() == 1);
 }
 
 void cancellationAndFailureIsolation() {
@@ -384,7 +382,7 @@ void hotResizeUsesLatestRuntimeConfig() {
   pool.stop({});
 }
 
-void lifecycleCancellationDrainsAndRejectsNewTasks() {
+void lifecycleCancellationOnlyStopsResizeManager() {
   TestEnvironment environment;
   servicelib::pool::TaskPoolImpl pool{kPoolName, environment};
   std::stop_source lifecycle;
@@ -402,21 +400,15 @@ void lifecycleCancellationDrainsAndRejectsNewTasks() {
   pool.addTask({}, [&] { completed.fetch_add(1, std::memory_order_relaxed); });
 
   lifecycle.request_stop();
-  bool rejected = false;
-  const auto rejectDeadline = std::chrono::steady_clock::now() + 3s;
-  while (!rejected && std::chrono::steady_clock::now() < rejectDeadline) {
-    try {
-      pool.addTask({}, [&] { completed.fetch_add(1, std::memory_order_relaxed); });
-    } catch (const servicelib::pool::PoolStoppedError&) {
-      rejected = true;
-    }
-    if (!rejected) std::this_thread::sleep_for(1ms);
-  }
-  assert(rejected);
+  std::this_thread::sleep_for(30ms);
+  environment.setExecutorsCount(2);
+  std::this_thread::sleep_for(1100ms);
+  assert(pool.getExecutorsCount() == 1);
+  pool.addTask({}, [&] { completed.fetch_add(1, std::memory_order_relaxed); });
 
   releaseBlocker.send();
   pool.stop({});
-  assert(completed.load(std::memory_order_relaxed) >= 2);
+  assert(completed.load(std::memory_order_relaxed) == 3);
 }
 
 void concurrentStopJoinsTheSameDrain() {
@@ -514,7 +506,7 @@ int main() {
   externalCancellationMovesQueuedTaskToFront();
   rejectsExpiredDeadline();
   hotResizeUsesLatestRuntimeConfig();
-  lifecycleCancellationDrainsAndRejectsNewTasks();
+  lifecycleCancellationOnlyStopsResizeManager();
   concurrentStopJoinsTheSameDrain();
   stopDeadlineReportsButStillDrains();
   selfStopIsRejectedWithoutBreakingThePool();
