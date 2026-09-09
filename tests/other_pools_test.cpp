@@ -788,7 +788,7 @@ TEST(DelayPool, CancellationRacesAdmissionAndExpiryExactlyOnce) {
   pool.start(servicelib::Context{});
   StopPoolOnExit stop_guard{pool};
   std::vector<std::atomic<int>> executions(300);
-  for (int i = 0; i < 300; ++i) {
+  for (std::size_t i = 0; i < executions.size(); ++i) {
     std::stop_source source;
     std::thread canceller([source, i]() mutable {
       if (i % 2) test_async::SleepFor(1ms);

@@ -298,11 +298,14 @@ class QueuedPool {
       state.gaugeQueueLength->set(
           static_cast<std::int64_t>(state.queue.size()));
       const auto target = state.target.load();
-      state.gaugeExecutorsTarget->set(target);
+      state.gaugeExecutorsTarget->set(static_cast<std::int64_t>(target));
       state.gaugeExecutorsAllocated->set(
-          state.completed ? 0
-          : state.started ? std::max<std::size_t>(target, state.busy)
-                          : 0);
+          state.completed
+              ? std::int64_t{0}
+              : state.started
+                    ? static_cast<std::int64_t>(std::max<std::size_t>(
+                          static_cast<std::size_t>(target), state.busy))
+                    : std::int64_t{0});
       state.gaugeExecutorsBusy->set(static_cast<std::int64_t>(state.busy));
     });
   }
