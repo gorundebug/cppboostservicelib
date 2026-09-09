@@ -249,6 +249,67 @@ TEST(HttpDataSource, PreservesCanonicalHandlerAndCorrelationContract) {
   servicelib::detail::ParallelExecutorRegistry::Clear();
 }
 
+struct RetainedCallbackHandler final {
+  using State = int;
+  using Request = std::string;
+  using Response = std::string;
+  servicelib::BeginResult<State> beginRequest(servicelib::MessageContext context,
+      auto&, servicelib::datasource::http::HandlerData&) {
+    return {std::move(context), 0};
+  }
+  void consumeMessage(servicelib::MessageContext context, auto& stream, State&,
+      servicelib::datasource::http::HandlerData&, auto result) {
+    result.setResultCallback("result",
+        [result, local = 0](servicelib::MessageContext, auto&, State& count,
+            const std::string&, servicelib::datasource::http::HandlerData& data) mutable {
+          data.responseBody += std::to_string(++local);
+          if (++count == 2) result.done();
+          return false;
+        });
+    stream.collect(context, std::string{"first"});
+    stream.collect(std::move(context), std::string{"second"});
+  }
+  std::string getMessageId(servicelib::MessageContext, auto&, State&, const std::string&) {
+    return "result";
+  }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr, State&,
+      servicelib::datasource::http::HandlerData&) noexcept {}
+};
+
+TEST(HttpDataSource, RetainedCallbackKeepsCopySemanticsAndTraceOrder) {
+  boost::asio::io_context io;
+  servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+  servicelib::testtracing::TestTracing tracing;
+  TestEnvironment environment{&tracing};
+  using Endpoint = servicelib::datasource::http::BeastEndpoint<
+      std::string, std::string, RetainedCallbackHandler>;
+  Endpoint* pointer{};
+  Endpoint endpoint{environment, 1, RetainedCallbackHandler{},
+      [&](servicelib::MessageContext context, servicelib::Payload<std::string> value) {
+        pointer->consumeResult(std::move(context), std::move(value));
+      }, true};
+  pointer = &endpoint;
+  endpoint.start(servicelib::Context{});
+  servicelib::http::Request request;
+  request.method = "POST";
+  request.path = request.target = "/orders";
+  auto response = boost::asio::co_spawn(io,
+      endpoint.handle(std::move(request), servicelib::tracing::EnableSampling(
+          servicelib::MessageContext{}.withStreamId("retained-callback"))),
+      boost::asio::use_future);
+  while (response.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready)
+    ASSERT_GT(io.run_one(), 0U);
+  EXPECT_EQ(response.get().body, "11");
+  const auto spans = tracing.spans();
+  ASSERT_EQ(spans.size(), 1U);
+  std::vector<std::string> events;
+  for (const auto& event : spans.front().events) events.push_back(event.name);
+  EXPECT_EQ(events, (std::vector<std::string>{"begin_request", "result_consumed",
+      "done_called", "result_consumed", "consume_message", "done_received"}));
+  endpoint.stop(servicelib::Context{});
+  servicelib::detail::ParallelExecutorRegistry::Clear();
+}
+
 TEST(HttpDataSource, StopCancelsPendingCanonicalRequest) {
   boost::asio::io_context io;
   servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
@@ -881,6 +942,59 @@ TEST(HttpClient, PoolLimitQueuesAndHonorsAcquisitionDeadline) {
   ASSERT_EQ(first.wait_for(std::chrono::seconds{2}),
             std::future_status::ready);
   EXPECT_EQ(first.get().status, 200);
+  client.Stop();
+  server.Stop();
+  io.stop();
+}
+
+TEST(HttpClient, CancelledPoolWaiterDoesNotLeakTheConnectionOrPoll) {
+  boost::asio::io_context io;
+  servicelib::detail::SingleUseEvent accepted;
+  servicelib::detail::SingleUseEvent release;
+  auto router = std::make_shared<servicelib::http::Router>();
+  router->Add("GET", "/hold",
+      [&](servicelib::http::Request, servicelib::MessageContext)
+          -> boost::asio::awaitable<servicelib::http::Response> {
+        accepted.Send();
+        co_await release.AsyncWait();
+        co_return servicelib::http::Response{200, {}, "ok", "text/plain", true};
+      });
+  servicelib::http::Server::Options serverOptions;
+  serverOptions.address = "127.0.0.1";
+  serverOptions.port = 0;
+  servicelib::http::Server server(io.get_executor(), router, serverOptions);
+  server.Start();
+  servicelib::http::Client::Options options;
+  options.connections = 1;
+  options.timeout = std::chrono::seconds{3};
+  options.acquirePollInterval = std::chrono::seconds{10};
+  servicelib::http::Client client(io.get_executor(), options);
+  const auto send = [&]() {
+    servicelib::http::Request request;
+    request.method = "GET";
+    request.target = "/hold";
+    return client.Send("127.0.0.1", std::to_string(server.port()), std::move(request));
+  };
+  auto first = boost::asio::co_spawn(io, send(), boost::asio::use_future);
+  std::jthread worker([&] { io.run(); });
+  EXPECT_TRUE(accepted.WaitUntil(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+  boost::asio::cancellation_signal cancel;
+  auto cancelled = boost::asio::co_spawn(io, send(),
+      boost::asio::bind_cancellation_slot(cancel.slot(), boost::asio::use_future));
+  // Emit on the same executor as the cancellation slot, after admission.
+  auto cancelTimer = std::make_shared<boost::asio::steady_timer>(io, std::chrono::milliseconds{20});
+  cancelTimer->async_wait([&cancel, cancelTimer](boost::system::error_code) {
+    cancel.emit(boost::asio::cancellation_type::all);
+  });
+  EXPECT_EQ(cancelled.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+  EXPECT_THROW(static_cast<void>(cancelled.get()), boost::system::system_error);
+  auto next = boost::asio::co_spawn(io, send(), boost::asio::use_future);
+  release.Send();
+  EXPECT_EQ(first.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+  EXPECT_EQ(first.get().status, 200);
+  EXPECT_EQ(next.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+  EXPECT_EQ(next.get().status, 200);
+  EXPECT_EQ(client.connectionCount(), 1U);
   client.Stop();
   server.Stop();
   io.stop();

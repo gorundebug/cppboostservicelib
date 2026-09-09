@@ -481,9 +481,47 @@ struct PendingResult final {
   std::shared_ptr<tracing::Span> span;
   servicelib::detail::SingleUseEvent done;
   std::atomic<bool> doneSent{false};
-  std::shared_mutex lifetimeMutex;
-  std::mutex callbacksMutex;
-  std::unordered_map<std::string, Callback> callbacks;
+  using CallbackMap = std::unordered_map<std::string, std::shared_ptr<Callback>>;
+  std::atomic<std::shared_ptr<const CallbackMap>> callbacks;
+  static constexpr std::uint64_t kRetired = std::uint64_t{1} << 63;
+  std::atomic<std::uint64_t> readers{};
+  boost::asio::experimental::concurrent_channel<void(boost::system::error_code)>
+      retired{servicelib::detail::ParallelExecutorRegistry::Get(), 1};
+
+  bool enter() noexcept {
+    auto value = readers.load(std::memory_order_acquire);
+    while (!(value & kRetired)) {
+      if (readers.compare_exchange_weak(value, value + 1,
+                                       std::memory_order_acq_rel)) return true;
+    }
+    return false;
+  }
+  void leave() noexcept {
+    if (readers.fetch_sub(1, std::memory_order_acq_rel) == kRetired + 1)
+      static_cast<void>(retired.try_send(boost::system::error_code{}));
+  }
+  boost::asio::awaitable<void> retire() {
+    if (readers.fetch_or(kRetired, std::memory_order_acq_rel) != 0)
+      co_await retired.async_receive(boost::asio::use_awaitable);
+  }
+  void setCallback(std::string id, std::shared_ptr<Callback> callback) {
+    auto before = callbacks.load();
+    for (;;) {
+      auto next = before ? std::make_shared<CallbackMap>(*before)
+                         : std::make_shared<CallbackMap>();
+      (*next)[id] = callback;
+      if (callbacks.compare_exchange_weak(before, std::move(next))) return;
+    }
+  }
+  bool eraseCallback(const std::string& id) {
+    auto before = callbacks.load();
+    while (before && before->contains(id)) {
+      auto next = std::make_shared<CallbackMap>(*before);
+      next->erase(id);
+      if (callbacks.compare_exchange_weak(before, std::move(next))) return true;
+    }
+    return false;
+  }
 };
 
 template <typename HandlerState, typename ReqT, typename ResR, typename T,
@@ -497,8 +535,8 @@ class ResultContext final {
       : result_(std::move(result)) {}
 
   void setResultCallback(std::string messageId, Callback callback) {
-    std::lock_guard lock(result_->callbacksMutex);
-    result_->callbacks[std::move(messageId)] = std::move(callback);
+    result_->setCallback(std::move(messageId),
+                         std::make_shared<Callback>(std::move(callback)));
   }
 
   void done() noexcept {
@@ -572,21 +610,13 @@ class BeastEndpoint final : public IBeastEndpoint {
 
   [[nodiscard]] int id() const noexcept override { return endpointId_; }
   void start(Context context) override {
+    cancellationGeneration_.store(std::make_shared<std::stop_source>());
     accepting_.store(true, std::memory_order_release);
     if (hasResult_) pending_.start(std::move(context));
   }
   void stop(Context context) override {
     accepting_.store(false, std::memory_order_release);
-    std::vector<std::shared_ptr<std::stop_source>> cancellations;
-    {
-      std::lock_guard lock(activeMutex_);
-      for (const auto& [_, cancellation] : active_) {
-        cancellations.push_back(cancellation);
-      }
-    }
-    for (const auto& cancellation : cancellations) {
-      cancellation->request_stop();
-    }
+    cancellationGeneration_.load()->request_stop();
     if (hasResult_) pending_.stop(std::move(context));
   }
 
@@ -617,6 +647,8 @@ class BeastEndpoint final : public IBeastEndpoint {
     auto& externalCancellation = *admission->cancellation;
     requestContext = std::move(requestContext).withExternalCancellation(
         externalCancellation.get_token());
+    requestContext = std::move(requestContext).withExternalCancellation(
+        admission->generation->get_token());
     std::shared_ptr<tracing::Tracer> tracer;
     if (tracing::SamplingEnabled(requestContext)) {
       if (auto* tracingEngine = environment_.getTracing()) {
@@ -725,8 +757,12 @@ class BeastEndpoint final : public IBeastEndpoint {
       }
     }
 
+    // Retirement must outlive every admitted result callback, even when
+    // the transport coroutine has received Asio cancellation.
+    co_await boost::asio::this_coro::reset_cancellation_state(
+        boost::asio::disable_cancellation());
     if (hasResult_) {
-      std::unique_lock lifetimeLock(result->lifetimeMutex);
+      co_await result->retire();
       if (pendingInserted) {
         static_cast<void>(pending_.pop(streamId));
         metrics_.pendingRemove(streamId);
@@ -749,13 +785,10 @@ class BeastEndpoint final : public IBeastEndpoint {
       }
       // Canonical handlers commonly capture ResultContext in their callbacks.
       // Once the request is retired those callbacks are no longer reachable by
-      // correlation, so clear them while the lifetime lock excludes an
-      // in-flight consumeResult. This breaks PendingResult -> callback ->
+      // correlation, so clear them after all admitted consumeResult calls
+      // have left. This breaks PendingResult -> callback ->
       // ResultContext -> PendingResult ownership cycles on every exit path.
-      {
-        std::lock_guard callbacksLock(result->callbacksMutex);
-        result->callbacks.clear();
-      }
+      result->callbacks.store(nullptr);
       callEndRequest(context, error, *result, data);
     } else {
       callEndRequest(context, error, *result, data);
@@ -778,34 +811,42 @@ class BeastEndpoint final : public IBeastEndpoint {
       return;
     }
     const auto result = *found;
-    std::shared_lock lifetimeLock(result->lifetimeMutex);
+    if (!result->enter()) {
+      metrics_.lateResult(streamId);
+      tracing::SpanEvent(result->span.get(), "late_result");
+      return;
+    }
+    struct ReadGuard {
+      Result& result;
+      ~ReadGuard() { result.leave(); }
+    } readGuard{*result};
+    // Rotation may remove correlation independently of request retirement.
     const auto current = pending_.get(streamId);
     if (!current || *current != result) {
       metrics_.lateResult(streamId);
       tracing::SpanEvent(result->span.get(), "late_result");
       return;
     }
+
     const std::string messageId = handler_.getMessageId(
         context, streamContext_, result->state, payload.get());
-    typename Result::Callback callback;
-    {
-      std::lock_guard callbacksLock(result->callbacksMutex);
-      const auto it = result->callbacks.find(messageId);
-      if (it != result->callbacks.end()) callback = it->second;
+    std::shared_ptr<typename Result::Callback> callback;
+    const auto callbacks = result->callbacks.load();
+    if (callbacks) {
+      const auto it = callbacks->find(messageId);
+      if (it != callbacks->end()) callback = it->second;
     }
-    if (!callback) {
+    if (!callback || !*callback) {
       metrics_.unknownMessageId(streamId, messageId);
       tracing::SpanEvent(result->span.get(), "unknown_message_id",
                          {tracing::Attribute::String("message_id", messageId)});
       return;
     }
-    if (callback(context, streamContext_, result->state, payload.get(),
-                 result->data)) {
-      bool duplicate = false;
-      {
-        std::lock_guard callbacksLock(result->callbacksMutex);
-        duplicate = result->callbacks.erase(messageId) == 0;
-      }
+    // Keep the public callback's per-invocation capture semantics.
+    auto invocation = *callback;
+    if (invocation(context, streamContext_, result->state, payload.get(),
+                   result->data)) {
+      const bool duplicate = !result->eraseCallback(messageId);
       if (duplicate) {
         metrics_.duplicateMessageId(streamId, messageId);
         tracing::SpanEvent(
@@ -819,35 +860,14 @@ class BeastEndpoint final : public IBeastEndpoint {
 
  private:
   struct Admission final {
-    Admission(BeastEndpoint* endpoint,
-              std::shared_ptr<std::stop_source> stopSource)
-        : owner(endpoint), cancellation(std::move(stopSource)) {}
-    Admission(const Admission&) = delete;
-    Admission& operator=(const Admission&) = delete;
-    Admission(Admission&& other) noexcept
-        : owner(std::exchange(other.owner, nullptr)),
-          cancellation(std::move(other.cancellation)) {}
-    Admission& operator=(Admission&&) = delete;
-    BeastEndpoint* owner;
     std::shared_ptr<std::stop_source> cancellation;
-    ~Admission() {
-      if (owner) owner->release(cancellation.get());
-    }
+    std::shared_ptr<std::stop_source> generation;
   };
 
   [[nodiscard]] std::optional<Admission> admit() {
+    auto generation = cancellationGeneration_.load();
     if (!accepting_.load(std::memory_order_acquire)) return std::nullopt;
-    auto cancellation = std::make_shared<std::stop_source>();
-    std::lock_guard lock(activeMutex_);
-    if (!accepting_.load(std::memory_order_relaxed)) return std::nullopt;
-    active_.emplace(cancellation.get(), cancellation);
-    return std::optional<Admission>{std::in_place, this,
-                                    std::move(cancellation)};
-  }
-
-  void release(const std::stop_source* cancellation) noexcept {
-    std::lock_guard lock(activeMutex_);
-    active_.erase(cancellation);
+    return Admission{std::make_shared<std::stop_source>(), std::move(generation)};
   }
 
   bool methodMatches(std::string_view method) const noexcept {
@@ -923,9 +943,8 @@ class BeastEndpoint final : public IBeastEndpoint {
   store::RotatingMap<std::string, std::shared_ptr<Result>> pending_;
   servicelib::DataSourceEndpointMetrics metrics_;
   std::atomic<bool> accepting_{true};
-  std::mutex activeMutex_;
-  std::unordered_map<const std::stop_source*,
-                     std::shared_ptr<std::stop_source>> active_;
+  std::atomic<std::shared_ptr<std::stop_source>> cancellationGeneration_{
+      std::make_shared<std::stop_source>()};
 };
 
 template <typename T, typename R, typename E, typename Context,

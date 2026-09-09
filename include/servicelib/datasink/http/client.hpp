@@ -20,12 +20,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <condition_variable>
+#include <future>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
-#include <mutex>
+
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -69,7 +71,8 @@ class Client final {
   explicit Client(boost::asio::any_io_executor executor)
       : Client(std::move(executor), Options{}) {}
   Client(boost::asio::any_io_executor executor, Options options)
-      : executor_(std::move(executor)), options_(Validate(std::move(options))) {}
+      : executor_(std::move(executor)), options_(Validate(std::move(options))),
+        state_(std::make_shared<PoolState>(executor_, options_)) {}
   Client(const Client&) = delete;
   Client& operator=(const Client&) = delete;
   ~Client() { Stop(); }
@@ -80,12 +83,9 @@ class Client final {
     Operation operation{*this};
     InjectContext(context, request.headers);
     const auto deadline = EffectiveDeadline(context);
-    auto connection = co_await Acquire(context, deadline);
-    struct Release final {
-      Client* owner;
-      std::shared_ptr<Connection> connection;
-      ~Release() { owner->ReleaseConnection(connection); }
-    } release{this, connection};
+    auto connection = co_await boost::asio::co_spawn(
+        state_->strand, Acquire(state_, host, port, context, deadline),
+        boost::asio::use_awaitable);
 
     co_await boost::asio::dispatch(connection->stream.get_executor(),
                                    boost::asio::use_awaitable);
@@ -180,52 +180,38 @@ class Client final {
     co_return response;
   }
 
+  // Preserve the synchronous shutdown contract for existing callers.
   void Stop() noexcept {
-    const bool firstStop =
-        !stopped_.exchange(true, std::memory_order_acq_rel);
-    std::vector<std::shared_ptr<Connection>> connections;
-    if (firstStop) {
-      std::lock_guard lock(mutex_);
-      connections = connections_;
-      for (const auto& connection : connections) {
-        if (connection->busy) Interrupt(connection);
-      }
-    }
-    {
-      std::unique_lock lock(operationsMutex_);
-      operationsDrained_.wait(lock, [this] { return activeOperations_ == 0; });
-    }
-    if (firstStop) {
-      for (const auto& connection : connections) Close(*connection);
-    }
+    BeginStop(state_);
+    state_->drained.wait();
   }
 
   [[nodiscard]] std::size_t connectionCount() const {
-    std::lock_guard lock(mutex_);
-    return connections_.size();
+    return state_->connectionCount.load(std::memory_order_acquire);
   }
 
  private:
+  static constexpr std::uint64_t kClosed = std::uint64_t{1} << 63;
+  struct PoolState;
   class Operation final {
    public:
-    explicit Operation(Client& owner) : owner_(&owner) {
-      std::lock_guard lock(owner_->operationsMutex_);
-      if (owner_->stopped_.load(std::memory_order_acquire)) {
-        throw ClientError(ClientErrorCode::kStopped, "HTTP client is stopped");
+    explicit Operation(Client& owner) : state_(owner.state_) {
+      auto value = state_->operations.load(std::memory_order_acquire);
+      for (;;) {
+        if (value & kClosed)
+          throw ClientError(ClientErrorCode::kStopped, "HTTP client is stopped");
+        if (state_->operations.compare_exchange_weak(value, value + 1,
+                                                     std::memory_order_acq_rel)) break;
       }
-      ++owner_->activeOperations_;
     }
     Operation(const Operation&) = delete;
     Operation& operator=(const Operation&) = delete;
     ~Operation() {
-      std::lock_guard lock(owner_->operationsMutex_);
-      if (--owner_->activeOperations_ == 0) {
-        owner_->operationsDrained_.notify_all();
-      }
+      if (state_->operations.fetch_sub(1, std::memory_order_acq_rel) == kClosed + 1)
+        boost::asio::post(state_->strand, [state = state_] { Finish(state); });
     }
-
    private:
-    Client* owner_;
+    std::shared_ptr<PoolState> state_;
   };
 
   struct Connection final {
@@ -239,30 +225,70 @@ class Client final {
     std::atomic<std::uint64_t> cancellationGeneration{};
   };
 
-  struct PoolWaiter final {};
-
-  class WaiterRegistration final {
-   public:
-    explicit WaiterRegistration(Client& owner) : owner_(&owner) {}
-    WaiterRegistration(const WaiterRegistration&) = delete;
-    WaiterRegistration& operator=(const WaiterRegistration&) = delete;
-    ~WaiterRegistration() {
-      if (waiter_) owner_->RemoveWaiter(waiter_);
-    }
-
-    void Set(std::shared_ptr<PoolWaiter> waiter) {
-      waiter_ = std::move(waiter);
-    }
-    void Release() noexcept { waiter_.reset(); }
-    [[nodiscard]] const std::shared_ptr<PoolWaiter>& Get() const noexcept {
-      return waiter_;
-    }
-
-   private:
-    Client* owner_;
-    std::shared_ptr<PoolWaiter> waiter_;
+  using ConnectionSignal = boost::asio::experimental::concurrent_channel<
+      void(boost::system::error_code, std::shared_ptr<Connection>)>;
+  struct PoolWaiter final {
+    PoolWaiter(boost::asio::any_io_executor executor, std::string h, std::string p)
+        : signal(executor, 1), host(std::move(h)), port(std::move(p)) {}
+    ConnectionSignal signal;
+    std::string host, port;
+  };
+  struct PoolState final {
+    PoolState(boost::asio::any_io_executor executor, Options o)
+        : strand(boost::asio::make_strand(executor)), options(o),
+          drained(drainPromise.get_future().share()) {}
+    boost::asio::strand<boost::asio::any_io_executor> strand;
+    Options options;
+    std::atomic<std::uint64_t> operations{};
+    std::atomic<std::size_t> connectionCount{};
+    std::vector<std::shared_ptr<Connection>> connections;
+    std::deque<std::shared_ptr<PoolWaiter>> waiters;
+    std::atomic<bool> finishing{}, done{};
+    std::size_t closing{};
+    std::promise<void> drainPromise;
+    std::shared_future<void> drained;
+    bool stopped() const { return operations.load(std::memory_order_acquire) & kClosed; }
   };
 
+  static void CompleteStop(const std::shared_ptr<PoolState>& state) {
+    state->done.store(true, std::memory_order_release);
+    state->drainPromise.set_value();
+  }
+  static void Finish(const std::shared_ptr<PoolState>& state) {
+    if (state->operations.load() != kClosed || state->finishing.exchange(true)) return;
+    state->closing = state->connections.size();
+    if (!state->closing) { CompleteStop(state); return; }
+    // Closing on the socket executor also orders it after outstanding cancel
+    // notifications. Pool bookkeeping never runs application callbacks.
+    for (const auto& connection : state->connections) {
+      boost::asio::post(connection->stream.get_executor(), [state, connection] {
+        Close(*connection);
+        boost::asio::post(state->strand, [state] {
+          if (--state->closing == 0) CompleteStop(state);
+        });
+      });
+    }
+  }
+  static void BeginStop(const std::shared_ptr<PoolState>& state) {
+    const auto before = state->operations.fetch_or(kClosed, std::memory_order_acq_rel);
+    if (before & kClosed) return;
+    if (before == 0 && !state->finishing.exchange(true)) {
+      // No operation can still access sockets, including when an external
+      // caller has already stopped its io_context.
+      for (const auto& connection : state->connections) Close(*connection);
+      state->done.store(true, std::memory_order_release);
+      state->drainPromise.set_value();
+      return;
+    }
+    boost::asio::post(state->strand, [state] {
+      for (const auto& waiter : state->waiters)
+        static_cast<void>(waiter->signal.try_send(boost::system::error_code{},
+                                                  std::shared_ptr<Connection>{}));
+      for (const auto& connection : state->connections)
+        if (connection->busy) Interrupt(connection);
+      Finish(state);
+    });
+  }
   using StopCallback = std::stop_callback<std::function<void()>>;
 
   class ResolveCancellation final {
@@ -309,7 +335,7 @@ class Client final {
       };
       Add(context.stopToken(), cancel);
       for (const auto& token : context.externalStopTokens()) Add(token, cancel);
-      if (owner.stopped_.load(std::memory_order_acquire)) cancel();
+      if (owner.state_->stopped()) cancel();
     }
     ConnectionCancellation(const ConnectionCancellation&) = delete;
     ConnectionCancellation& operator=(const ConnectionCancellation&) = delete;
@@ -351,70 +377,77 @@ class Client final {
     return deadline;
   }
 
-  boost::asio::awaitable<std::shared_ptr<Connection>> Acquire(
-      const MessageContext& context,
-      std::chrono::steady_clock::time_point deadline) {
-    boost::asio::steady_timer timer(executor_);
-    WaiterRegistration registration{*this};
-    for (;;) {
-      if (stopped_.load(std::memory_order_acquire))
-        throw ClientError(ClientErrorCode::kStopped, "HTTP client is stopped");
-      if (context.cancelled()) {
-        if (context.deadline() &&
-            *context.deadline() <= std::chrono::steady_clock::now()) {
-          throw ClientError(ClientErrorCode::kPoolTimeout,
-                            "HTTP connection pool deadline expired");
-        }
-        throw ClientError(ClientErrorCode::kCancelled,
-                          "HTTP connection pool acquisition cancelled");
+  static void Pump(const std::shared_ptr<PoolState>& state) {
+    if (state->stopped()) return;
+    while (!state->waiters.empty()) {
+      const auto waiter = state->waiters.front();
+      std::shared_ptr<Connection> available;
+      for (const auto& connection : state->connections) {
+        if (!connection->busy && connection->host == waiter->host &&
+            connection->port == waiter->port) { available = connection; break; }
       }
-      if (std::chrono::steady_clock::now() >= deadline) {
-        throw ClientError(ClientErrorCode::kPoolTimeout,
-                          "HTTP connection pool acquisition timed out");
+      if (!available) {
+        for (const auto& connection : state->connections)
+          if (!connection->busy) { available = connection; break; }
       }
-      {
-        std::lock_guard lock(mutex_);
-        const bool mayAcquire =
-            waiters_.empty() ||
-            (registration.Get() && waiters_.front() == registration.Get());
-        if (mayAcquire) {
-          for (const auto& connection : connections_) {
-            if (!connection->busy) {
-              connection->busy = true;
-              if (registration.Get()) {
-                waiters_.pop_front();
-                registration.Release();
-              }
-              co_return connection;
-            }
-          }
-          if (connections_.size() < options_.connections) {
-            auto connection = std::make_shared<Connection>(executor_);
-            connection->busy = true;
-            connections_.push_back(connection);
-            if (registration.Get()) {
-              waiters_.pop_front();
-              registration.Release();
-            }
-            co_return connection;
-          }
-        }
-        if (!registration.Get()) {
-          auto waiter = std::make_shared<PoolWaiter>();
-          waiters_.push_back(waiter);
-          registration.Set(std::move(waiter));
-        }
+      if (!available && state->connections.size() < state->options.connections) {
+        available = std::make_shared<Connection>(state->strand.get_inner_executor());
+        state->connections.push_back(available);
+        state->connectionCount.store(state->connections.size());
       }
-      timer.expires_at(std::min(deadline, std::chrono::steady_clock::now() +
-                                             options_.acquirePollInterval));
-      co_await timer.async_wait(boost::asio::use_awaitable);
+      if (!available) return;
+      state->waiters.pop_front();
+      // The lease releases admission even if cancellation discards the
+      // co_spawn result before Send resumes and takes ownership.
+      available->busy = true;
+      auto lease = std::shared_ptr<Connection>(available.get(),
+          [state, available](Connection*) {
+            boost::asio::post(state->strand, [state, available] {
+              available->busy = false;
+              Pump(state);
+            });
+          });
+      static_cast<void>(waiter->signal.try_send(boost::system::error_code{},
+                                               std::move(lease)));
     }
   }
 
-  void RemoveWaiter(const std::shared_ptr<PoolWaiter>& waiter) noexcept {
-    std::lock_guard lock(mutex_);
-    const auto position = std::find(waiters_.begin(), waiters_.end(), waiter);
-    if (position != waiters_.end()) waiters_.erase(position);
+  static boost::asio::awaitable<std::shared_ptr<Connection>> Acquire(
+      std::shared_ptr<PoolState> state, std::string host, std::string port,
+      MessageContext context, std::chrono::steady_clock::time_point deadline) {
+    if (state->stopped())
+      throw ClientError(ClientErrorCode::kStopped, "HTTP client is stopped");
+    auto waiter = std::make_shared<PoolWaiter>(state->strand, std::move(host), std::move(port));
+    auto wake = [waiter] {
+      static_cast<void>(waiter->signal.try_send(boost::system::error_code{},
+                                               std::shared_ptr<Connection>{}));
+    };
+    std::vector<std::unique_ptr<StopCallback>> callbacks;
+    if (context.stopToken().stop_possible())
+      callbacks.push_back(std::make_unique<StopCallback>(context.stopToken(), wake));
+    for (const auto& token : context.externalStopTokens())
+      if (token.stop_possible()) callbacks.push_back(std::make_unique<StopCallback>(token, wake));
+    boost::asio::steady_timer timer(state->strand, deadline);
+    timer.async_wait([wake](boost::system::error_code error) { if (!error) wake(); });
+    struct RemoveWaiter final {
+      std::shared_ptr<PoolState> state;
+      std::shared_ptr<PoolWaiter> waiter;
+      ~RemoveWaiter() {
+        const auto position = std::find(state->waiters.begin(), state->waiters.end(), waiter);
+        if (position != state->waiters.end()) state->waiters.erase(position);
+        Pump(state);
+      }
+    } removeWaiter{state, waiter};
+    state->waiters.push_back(waiter);
+    Pump(state);
+    auto connection = co_await waiter->signal.async_receive(boost::asio::use_awaitable);
+    timer.cancel();
+    if (connection) co_return connection;
+    if (state->stopped())
+      throw ClientError(ClientErrorCode::kStopped, "HTTP client is stopped");
+    if (std::chrono::steady_clock::now() >= deadline)
+      throw ClientError(ClientErrorCode::kPoolTimeout, "HTTP connection pool acquisition timed out");
+    throw ClientError(ClientErrorCode::kCancelled, "HTTP connection pool acquisition cancelled");
   }
 
   [[noreturn]] void ThrowOperationError(
@@ -422,7 +455,7 @@ class Client final {
       std::chrono::steady_clock::time_point deadline,
       ClientErrorCode fallbackCode, std::string_view operation,
       const boost::system::error_code& error) const {
-    if (stopped_.load(std::memory_order_acquire)) {
+    if (state_->stopped()) {
       throw ClientError(ClientErrorCode::kStopped,
                         "HTTP client stopped during " + std::string(operation));
     }
@@ -443,7 +476,7 @@ class Client final {
       const MessageContext& context,
       std::chrono::steady_clock::time_point deadline,
       std::string_view operation) const {
-    if (stopped_.load(std::memory_order_acquire)) {
+    if (state_->stopped()) {
       throw ClientError(ClientErrorCode::kStopped,
                         "HTTP client stopped during " + std::string(operation));
     }
@@ -457,11 +490,6 @@ class Client final {
       throw ClientError(ClientErrorCode::kCancelled,
                         std::string(operation) + ": cancelled");
     }
-  }
-
-  void ReleaseConnection(const std::shared_ptr<Connection>& connection) noexcept {
-    std::lock_guard lock(mutex_);
-    connection->busy = false;
   }
 
   static void Close(Connection& connection) noexcept {
@@ -492,13 +520,7 @@ class Client final {
 
   boost::asio::any_io_executor executor_;
   Options options_;
-  std::atomic<bool> stopped_{};
-  mutable std::mutex mutex_;
-  std::vector<std::shared_ptr<Connection>> connections_;
-  std::deque<std::shared_ptr<PoolWaiter>> waiters_;
-  std::mutex operationsMutex_;
-  std::condition_variable operationsDrained_;
-  std::size_t activeOperations_{};
+  std::shared_ptr<PoolState> state_;
 };
 
 }  // namespace servicelib::http
