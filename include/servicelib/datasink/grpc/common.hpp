@@ -298,7 +298,7 @@ class Endpoint : public IEndpoint {
   Handler handler_;
   ContextType streamContext_;
   DataSinkEndpointMetrics metrics_;
-  detail::AsyncOperations asyncOperations_;
+  servicelib::detail::AsyncOperations asyncOperations_;
 
  private:
   [[nodiscard]] static std::string resolveStreamName(

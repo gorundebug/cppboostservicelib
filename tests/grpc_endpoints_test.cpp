@@ -13,6 +13,7 @@
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/testlog/testlog.hpp>
 #include <servicelib/runtime/testmetrics/testmetrics.hpp>
+#include <servicelib/runtime/testtracing/testtracing.hpp>
 #include "test_async.hpp"
 #include "test_sink_endpoint_stream.hpp"
 
@@ -94,7 +95,8 @@ class TestEnvironment final : public servicelib::IRuntimeEnvironment {
   }
   servicelib::log::Logger& getLogger() override { return log_; }
   servicelib::metrics::Metrics& getMetrics() override { return metrics_; }
-  servicelib::tracing::Tracing* getTracing() override { return nullptr; }
+  servicelib::tracing::Tracing* getTracing() override { return tracingEngine; }
+  servicelib::tracing::Tracing* tracingEngine{};
 
  private:
   TestConfig config_;
@@ -104,7 +106,7 @@ class TestEnvironment final : public servicelib::IRuntimeEnvironment {
   servicelib::testmetrics::TestMetrics metrics_;
 };
 
-struct SourceHandler final {
+struct SourceHandler {
   using State = int;
   servicelib::BeginResult<State> beginRequest(
       servicelib::MessageContext context, auto&) {
@@ -146,6 +148,40 @@ struct FakeReader {
 };
 
 struct FakeReaderWriter : FakeReader, FakeWriter {};
+
+struct RetainedSourceHandler final : SourceHandler {
+  void consumeMessage(servicelib::MessageContext context, auto& sc, State&,
+                      const std::string& request, auto result, auto&) {
+    result.setResultCallback(
+        "result", [result, calls = 0](servicelib::MessageContext, auto&, State&,
+                                     const std::string&, auto& sender) mutable {
+          sender.send(std::to_string(++calls));
+          if (calls == 2) result.done();
+          return calls == 2;
+        });
+    sc.collect(context, request);
+    sc.collect(std::move(context), request);
+  }
+};
+
+TEST(GrpcDataSource, RetainsCallbackAcrossResults) {
+  TestEnvironment environment;
+  using Server = servicelib::datasource::grpc::ServerStreamingEndpoint<
+      std::string, std::string, std::string, std::string, RetainedSourceHandler>;
+  Server* endpointPtr{};
+  Server endpoint{environment, 2, RetainedSourceHandler{},
+                  [&](servicelib::MessageContext context,
+                      servicelib::Payload<std::string> value) {
+                    endpointPtr->consumeResult(std::move(context), std::move(value));
+                  }, true};
+  endpointPtr = &endpoint;
+  endpoint.start(servicelib::Context{});
+  FakeWriter writer;
+  endpoint.handle(servicelib::MessageContext{}.withStreamId("retained"),
+                  "request", writer);
+  endpoint.stop(servicelib::Context{});
+  EXPECT_EQ(writer.values, (std::vector<std::string>{"1", "2"}));
+}
 
 TEST(GrpcTracing, RequiresExplicitSampledTraceParent) {
   using servicelib::tracing::SampledTraceParent;
@@ -382,5 +418,280 @@ TEST(GrpcDataSink, SupportsAllFourMethodTypesAndStreamIdSessions) {
   EXPECT_EQ(responses, (std::vector<std::string>{"unary:one", "server:two",
                                                  "client:last", "bidi:last"}));
 }
+
+struct AsyncStreamControl final {
+  servicelib::detail::SingleUseEvent beginEntered, beginRelease, started;
+  servicelib::detail::SingleUseEvent holdEntered, holdRelease, secondEntered, ended;
+  std::atomic<int> begins{0}, consumes{0}, writes{0}, responses{0}, ends{0}, cancels{0};
+  std::atomic<bool> finished{false};
+  bool holdBegin{false};
+  bool earlyFinish{false};
+  bool throwStart{false};
+  bool holdResponse{false};
+  std::function<void(std::string)> response;
+  std::function<void(std::exception_ptr)> completion;
+  void finish() {
+    if (!finished.exchange(true)) completion({});
+  }
+};
+
+struct AsyncStreamRpc final {
+  std::shared_ptr<AsyncStreamControl> control;
+  void write(std::string) { ++control->writes; }
+  void done() { control->finish(); }
+  void cancel() { ++control->cancels; control->finish(); }
+};
+struct AsyncStreamClient final {
+  using AsyncSession = std::shared_ptr<AsyncStreamRpc>;
+  std::shared_ptr<AsyncStreamControl> control;
+  AsyncSession start(servicelib::datasink::grpc::CallOptions,
+                     std::function<void(std::string)> response,
+                     std::function<void(std::exception_ptr)> completion) {
+    control->response = std::move(response);
+    control->completion = std::move(completion);
+    if (control->throwStart) throw std::runtime_error("start failed");
+    auto rpc = std::make_shared<AsyncStreamRpc>(control);
+    if (control->earlyFinish) {
+      control->response("early");
+      control->finish();
+    }
+    control->started.Send();
+    return rpc;
+  }
+};
+struct AsyncStreamHandler final {
+  using State = int;
+  std::shared_ptr<AsyncStreamControl> control;
+  servicelib::BeginResult<State> beginRequest(servicelib::MessageContext context, auto&) {
+    ++control->begins;
+    control->beginEntered.Send();
+    if (control->holdBegin) control->beginRelease.Wait();
+    return {std::move(context), 0};
+  }
+  void consumeMessage(servicelib::MessageContext, auto&, State&,
+                      const std::string& value, auto& sender, auto result) {
+    ++control->consumes;
+    if (value == "hold") {
+      control->holdEntered.Send();
+      control->holdRelease.Wait();
+    }
+    sender.send(value);
+    if (value == "second") control->secondEntered.Send();
+    if (value == "done") result.done();
+  }
+  void handleResponse(servicelib::MessageContext, auto&, State&, const std::string&) {
+    ++control->responses;
+    if (control->holdResponse) {
+      control->holdEntered.Send();
+      control->holdRelease.Wait();
+    }
+  }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr, State&) noexcept {
+    ++control->ends;
+    control->ended.Send();
+  }
+};
+
+template <bool Bidi>
+using AsyncStreamEndpoint = std::conditional_t<Bidi,
+    servicelib::datasink::grpc::BidirectionalStreamingEndpoint<
+        std::string, std::string, std::string, std::string,
+        AsyncStreamHandler, AsyncStreamClient>,
+    servicelib::datasink::grpc::ClientStreamingEndpoint<
+        std::string, std::string, std::string, std::string,
+        AsyncStreamHandler, AsyncStreamClient>>;
+
+bool Await(servicelib::detail::SingleUseEvent& event) {
+  return event.WaitUntil(std::chrono::steady_clock::now() + std::chrono::seconds{5});
+}
+
+template <bool Bidi>
+void CheckAsyncSessionLifecycle() {
+  TestEnvironment environment;
+  auto control = std::make_shared<AsyncStreamControl>();
+  control->holdBegin = true;
+  TestSinkEndpointStream<std::string, std::string> stream{environment, Bidi ? 4 : 3};
+  AsyncStreamEndpoint<Bidi> endpoint{stream, AsyncStreamHandler{control},
+                                    AsyncStreamClient{control}};
+  endpoint.start({});
+  auto context = servicelib::MessageContext{}.withStreamId("shared");
+  std::thread creator([&] { endpoint.consume(context, servicelib::Payload<std::string>::make("first")); });
+  EXPECT_TRUE(Await(control->beginEntered));
+  // These calls must return before the creator finishes beginRequest.
+  auto waiting = std::async(std::launch::async, [&] {
+    endpoint.consume(context, servicelib::Payload<std::string>::make("hold"));
+    endpoint.consume(context, servicelib::Payload<std::string>::make("second"));
+    std::stop_source cancellation;
+    auto cancelled = context.withStopToken(cancellation.get_token());
+    endpoint.consume(cancelled, servicelib::Payload<std::string>::make("cancelled"));
+    cancellation.request_stop();
+  });
+  EXPECT_EQ(waiting.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+  control->beginRelease.Send();
+  creator.join();
+  waiting.get();
+  EXPECT_TRUE(Await(control->holdEntered));
+  EXPECT_TRUE(Await(control->secondEntered));
+  // Completion must not wait synchronously for the outstanding handler.
+  auto completion = std::async(std::launch::async, [&] { control->finish(); });
+  EXPECT_EQ(completion.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+  EXPECT_EQ(control->ends.load(), 0);
+  control->completion({});
+  control->holdRelease.Send();
+  completion.get();
+  EXPECT_TRUE(Await(control->ended));
+  endpoint.stop({});
+  EXPECT_EQ(control->begins.load(), 1);
+  EXPECT_EQ(control->consumes.load(), 3);
+  EXPECT_EQ(control->writes.load(), 3);
+  EXPECT_EQ(control->ends.load(), 1);
+  control->response("late");
+  control->completion({});
+  EXPECT_EQ(control->responses.load(), 0);
+  EXPECT_EQ(control->ends.load(), 1);
+}
+
+template <bool Bidi>
+void CheckStopDuringCreation() {
+  TestEnvironment environment;
+  auto control = std::make_shared<AsyncStreamControl>();
+  control->holdBegin = true;
+  TestSinkEndpointStream<std::string, std::string> stream{environment, Bidi ? 4 : 3};
+  AsyncStreamEndpoint<Bidi> endpoint{stream, AsyncStreamHandler{control}, AsyncStreamClient{control}};
+  endpoint.start({});
+  std::thread creator([&] {
+    endpoint.consume(servicelib::MessageContext{}.withStreamId("creating"),
+                     servicelib::Payload<std::string>::make("first"));
+  });
+  EXPECT_TRUE(Await(control->beginEntered));
+  auto stopped = std::async(std::launch::async, [&] { endpoint.stop({}); });
+  EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds{50}), std::future_status::timeout);
+  control->beginRelease.Send();
+  creator.join();
+  EXPECT_EQ(stopped.wait_for(std::chrono::seconds{5}), std::future_status::ready);
+  stopped.get();
+  EXPECT_EQ(control->cancels.load(), 1);
+  EXPECT_EQ(control->ends.load(), 1);
+}
+
+template <bool Bidi>
+void CheckImmediateTransportCompletion(bool early, bool fail = false) {
+  servicelib::testtracing::TestTracing tracing;
+  TestEnvironment environment;
+  environment.tracingEngine = &tracing;
+  auto control = std::make_shared<AsyncStreamControl>();
+  control->earlyFinish = early;
+  control->throwStart = fail;
+  TestSinkEndpointStream<std::string, std::string> stream{environment, Bidi ? 4 : 3};
+  AsyncStreamEndpoint<Bidi> endpoint{stream, AsyncStreamHandler{control}, AsyncStreamClient{control}};
+  endpoint.start({});
+  endpoint.consume(servicelib::MessageContext{}.withStreamId("immediate").withSampling(true),
+                   servicelib::Payload<std::string>::make("done"));
+  EXPECT_TRUE(Await(control->ended));
+  endpoint.stop({});
+  EXPECT_EQ(control->responses.load(), early ? 1 : 0);
+  EXPECT_EQ(control->ends.load(), 1);
+  const auto spans = tracing.spans();
+  ASSERT_EQ(spans.size(), 1U);
+  EXPECT_EQ(spans.front().name, "grpc.output");
+  std::vector<std::string> events;
+  for (const auto& event : spans.front().events) events.push_back(event.name);
+  if (early) {
+    EXPECT_EQ(events, (std::vector<std::string>{"begin_request", "grpc_call", "handle_response"}));
+  } else if (!fail) {
+    EXPECT_EQ(events, (std::vector<std::string>{"begin_request", "grpc_call", "send",
+        "done_called", "done_received", "consume_message"}));
+  }
+}
+
+TEST(GrpcStreamingLifecycle, ClientWaitersAndCompletionDoNotBlock) { CheckAsyncSessionLifecycle<false>(); }
+TEST(GrpcStreamingLifecycle, BidiWaitersAndCompletionDoNotBlock) { CheckAsyncSessionLifecycle<true>(); }
+TEST(GrpcStreamingLifecycle, ClientStopIncludesInitializingSession) { CheckStopDuringCreation<false>(); }
+TEST(GrpcStreamingLifecycle, BidiStopIncludesInitializingSession) { CheckStopDuringCreation<true>(); }
+TEST(GrpcStreamingLifecycle, ClientCompletionInsideStart) { CheckImmediateTransportCompletion<false>(true); }
+TEST(GrpcStreamingLifecycle, BidiCompletionInsideStart) { CheckImmediateTransportCompletion<true>(true); }
+TEST(GrpcStreamingLifecycle, ClientCompletionInsideDone) { CheckImmediateTransportCompletion<false>(false); }
+TEST(GrpcStreamingLifecycle, BidiCompletionInsideDone) { CheckImmediateTransportCompletion<true>(false); }
+
+
+template <bool Bidi>
+void CheckResponseDraining() {
+  TestEnvironment environment;
+  auto control = std::make_shared<AsyncStreamControl>();
+  control->holdResponse = true;
+  TestSinkEndpointStream<std::string, std::string> stream{environment, Bidi ? 4 : 3};
+  AsyncStreamEndpoint<Bidi> endpoint{stream, AsyncStreamHandler{control}, AsyncStreamClient{control}};
+  endpoint.start({});
+  endpoint.consume(servicelib::MessageContext{}.withStreamId("response"),
+                   servicelib::Payload<std::string>::make("first"));
+  std::thread response([&] { control->response("hold"); });
+  EXPECT_TRUE(Await(control->holdEntered));
+  auto completion = std::async(std::launch::async, [&] { control->finish(); });
+  EXPECT_EQ(completion.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+  EXPECT_EQ(control->ends.load(), 0);
+  control->holdRelease.Send();
+  response.join();
+  completion.get();
+  endpoint.stop({});
+  EXPECT_EQ(control->responses.load(), 1);
+  EXPECT_EQ(control->ends.load(), 1);
+}
+TEST(GrpcStreamingLifecycle, ClientResponseDrainsBeforeEnd) { CheckResponseDraining<false>(); }
+TEST(GrpcStreamingLifecycle, BidiResponseDrainsBeforeEnd) { CheckResponseDraining<true>(); }
+TEST(GrpcStreamingLifecycle, ClientStartFailureDrains) { CheckImmediateTransportCompletion<false>(false, true); }
+TEST(GrpcStreamingLifecycle, BidiStartFailureDrains) { CheckImmediateTransportCompletion<true>(false, true); }
+
+
+struct LegacyStreamRpc final {
+  std::shared_ptr<AsyncStreamControl> control;
+  bool read{false};
+  void WriteAndCheck(const std::string&) { ++control->writes; }
+  std::string Finish() { return "response"; }
+  bool WritesDone() { control->started.Send(); return true; }
+  bool Read(std::string& value) {
+    if (read) return false;
+    control->started.Wait();
+    read = true;
+    value = "response";
+    return true;
+  }
+};
+
+template <bool Bidi>
+void CheckLegacyWaiter() {
+  TestEnvironment environment;
+  auto control = std::make_shared<AsyncStreamControl>();
+  control->holdBegin = true;
+  auto client = [control](servicelib::datasink::grpc::CallOptions) {
+    return LegacyStreamRpc{control};
+  };
+  using Client = decltype(client);
+  using Endpoint = std::conditional_t<Bidi,
+      servicelib::datasink::grpc::BidirectionalStreamingEndpoint<
+          std::string, std::string, std::string, std::string, AsyncStreamHandler, Client>,
+      servicelib::datasink::grpc::ClientStreamingEndpoint<
+          std::string, std::string, std::string, std::string, AsyncStreamHandler, Client>>;
+  TestSinkEndpointStream<std::string, std::string> stream{environment, Bidi ? 4 : 3};
+  Endpoint endpoint{stream, AsyncStreamHandler{control}, client};
+  endpoint.start({});
+  auto context = servicelib::MessageContext{}.withStreamId("legacy");
+  std::thread creator([&] {
+    endpoint.consume(context, servicelib::Payload<std::string>::make("first"));
+  });
+  EXPECT_TRUE(Await(control->beginEntered));
+  auto waiter = std::async(std::launch::async, [&] {
+    endpoint.consume(context, servicelib::Payload<std::string>::make("done"));
+  });
+  EXPECT_EQ(waiter.wait_for(std::chrono::seconds{2}), std::future_status::ready);
+  control->beginRelease.Send();
+  creator.join();
+  waiter.get();
+  EXPECT_TRUE(Await(control->ended));
+  endpoint.stop({});
+  EXPECT_EQ(control->begins.load(), 1);
+  EXPECT_EQ(control->ends.load(), 1);
+}
+TEST(GrpcStreamingLifecycle, LegacyClientWaiterReturnsBeforeReady) { CheckLegacyWaiter<false>(); }
+TEST(GrpcStreamingLifecycle, LegacyBidiWaiterReturnsBeforeReady) { CheckLegacyWaiter<true>(); }
 
 }  // namespace

@@ -101,7 +101,7 @@ struct RequestState final {
   std::atomic<bool> pendingInserted{false};
   std::shared_mutex lifetimeMutex;
   std::mutex callbacksMutex;
-  std::unordered_map<std::string, Callback> callbacks;
+  std::unordered_map<std::string, std::shared_ptr<Callback>> callbacks;
 };
 
 template <typename State, typename T, typename Res, typename R,
@@ -115,10 +115,13 @@ class ResultContext final {
   explicit ResultContext(std::shared_ptr<Request> request)
       : request_(std::move(request)) {}
 
+  // The registered callable is retained and may be invoked concurrently.
+  // Handlers must synchronize mutable captures, just as shared handler State.
   void setResultCallback(std::string messageId, Callback callback) {
     if (!request_) return;
+    auto sharedCallback = std::make_shared<Callback>(std::move(callback));
     std::lock_guard lock(request_->callbacksMutex);
-    request_->callbacks[std::move(messageId)] = std::move(callback);
+    request_->callbacks[std::move(messageId)] = std::move(sharedCallback);
   }
 
   void done() noexcept {
@@ -440,19 +443,19 @@ class Endpoint : public IEndpoint {
     }
     const auto messageId = handler_.getMessageId(context, streamContext_,
                                                  request->state, payload.get());
-    typename Request::Callback callback;
+    std::shared_ptr<typename Request::Callback> callback;
     {
       std::lock_guard lock(request->callbacksMutex);
       const auto it = request->callbacks.find(messageId);
       if (it != request->callbacks.end()) callback = it->second;
     }
-    if (!callback) {
+    if (!callback || !*callback) {
       metrics_.unknownMessageId(streamId, messageId);
       tracing::SpanEvent(request->span.get(), "unknown_message_id",
                          {tracing::Attribute::String("message_id", messageId)});
       return;
     }
-    if (callback(std::move(context), streamContext_, request->state,
+    if ((*callback)(std::move(context), streamContext_, request->state,
                  payload.get(), *request->sender)) {
       bool duplicate = false;
       {

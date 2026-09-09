@@ -297,11 +297,11 @@ struct MultiResultSourceHandler final {
   void consumeMessage(servicelib::MessageContext context, auto& stream, State&,
                       const std::string&, auto result) {
     result.setResultCallback(
-        "answer", [result, observed = observed](servicelib::MessageContext,
+        "answer", [result, observed = observed, calls = 0](servicelib::MessageContext,
                                                 auto&, State& state,
                                                 const int& value) mutable {
           observed->fetch_add(value, std::memory_order_relaxed);
-          ++state;
+          EXPECT_EQ(++calls, ++state);
           if (state == 2) result.done();
           return state == 2;
         });

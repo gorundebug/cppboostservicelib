@@ -1,4 +1,9 @@
 #include <any>
+#include <barrier>
+#include <thread>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/use_future.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <atomic>
 #include <chrono>
 #include <stop_token>
@@ -110,6 +115,58 @@ servicelib::store::JoinStorageConfig JoinConfig(
   return {.name = kJoinStoreName, .ttl = ttl, .renewTtl = renew_ttl};
 }
 
+TEST(SingleUseEvent, SendBeforeWaitAndTimeoutAreStable) {
+  servicelib::detail::SingleUseEvent event;
+  EXPECT_FALSE(event.IsReady());
+  EXPECT_FALSE(event.WaitUntil(std::chrono::steady_clock::now() + 1ms));
+  event.Send();
+  event.Send();
+  EXPECT_TRUE(event.IsReady());
+  event.Wait();
+  EXPECT_TRUE(event.WaitUntil(std::chrono::steady_clock::now() - 1ms));
+}
+
+TEST(SingleUseEvent, RegistrationRacingWithSendDoesNotLoseWakeups) {
+  for (int iteration = 0; iteration != 200; ++iteration) {
+    servicelib::detail::SingleUseEvent event;
+    std::barrier start{5};
+    std::atomic<int> received{};
+    std::vector<std::jthread> waiters;
+    for (int n = 0; n != 4; ++n) waiters.emplace_back([&] {
+      start.arrive_and_wait();
+      if (event.WaitUntil(std::chrono::steady_clock::now() + 2s)) ++received;
+    });
+    start.arrive_and_wait();
+    event.Send();
+    waiters.clear();
+    EXPECT_EQ(received, 4);
+  }
+}
+
+TEST(SingleUseEvent, CancellingOneAsyncWaiterDoesNotSignalOthers) {
+  boost::asio::io_context io;
+  auto guard = boost::asio::make_work_guard(io);
+  servicelib::detail::SingleUseEvent event;
+  std::stop_source cancel;
+  auto context = servicelib::Context{}.withStopToken(cancel.get_token());
+  auto cancelled = boost::asio::co_spawn(io, event.AsyncWait(context), boost::asio::use_future);
+  std::vector<std::future<void>> pending;
+  for (int n = 0; n != 8; ++n)
+    pending.push_back(boost::asio::co_spawn(io, event.AsyncWait(), boost::asio::use_future));
+  std::jthread worker([&] { io.run(); });
+  cancel.request_stop();
+  EXPECT_EQ(cancelled.wait_for(2s), std::future_status::ready);
+  cancelled.get();
+  EXPECT_FALSE(event.IsReady());
+  for (auto& waiter : pending) EXPECT_EQ(waiter.wait_for(0ms), std::future_status::timeout);
+  event.Send();
+  for (auto& waiter : pending) {
+    EXPECT_EQ(waiter.wait_for(2s), std::future_status::ready);
+    waiter.get();
+  }
+  guard.reset();
+}
+
 TEST(RotatingMap, BasicOperationsAndLifecycle) {
   using Map = servicelib::store::RotatingMap<std::string, int>;
 
@@ -156,6 +213,52 @@ TEST(RotatingMap, RotationPreservesBothGenerations) {
   EXPECT_EQ(*map.pop("before"), 1);
   EXPECT_EQ(*map.pop("after"), 2);
   EXPECT_EQ(map.size(), 0);
+}
+
+TEST(RotatingMap, ConcurrentFactoryRunsOnceAndFailureDoesNotInsert) {
+  servicelib::store::RotatingMap<std::string, std::shared_ptr<int>> map{1h};
+  std::barrier start{17};
+  std::atomic<int> factories{}, existing{};
+  std::vector<std::jthread> tasks;
+  for (int n = 0; n != 16; ++n) tasks.emplace_back([&] {
+    start.arrive_and_wait();
+    const auto [value, found] = map.getOrCreate("same", [&] {
+      ++factories;
+      return std::make_shared<int>(42);
+    });
+    EXPECT_EQ(*value, 42);
+    if (found) ++existing;
+  });
+  start.arrive_and_wait();
+  tasks.clear();
+  EXPECT_EQ(factories, 1);
+  EXPECT_EQ(existing, 15);
+  EXPECT_THROW(static_cast<void>(map.getOrCreate("error", []() -> std::shared_ptr<int> {
+    throw std::runtime_error("factory failed");
+  })), std::runtime_error);
+  EXPECT_FALSE(map.get("error"));
+  EXPECT_EQ(map.size(), 1U);
+  EXPECT_FALSE(map.getOrCreate("error", [] { return std::make_shared<int>(7); }).second);
+}
+
+TEST(RotatingMap, SupportsMoveOnlyValuesAndConcurrentRotation) {
+  servicelib::store::RotatingMap<std::string, std::unique_ptr<int>> map{1ms, 0};
+  map.start(servicelib::Context{});
+  StopStorageOnExit stop{map};
+  map.set("retained", std::make_unique<int>(77));
+  std::vector<std::jthread> tasks;
+  for (int t = 0; t != 4; ++t) tasks.emplace_back([&, t] {
+    for (int n = 0; n != 5000; ++n) {
+      const auto key = std::to_string(t) + ":" + std::to_string(n);
+      map.set(key, std::make_unique<int>(n));
+      const auto value = map.pop(key);
+      ASSERT_TRUE(value);
+      EXPECT_EQ(**value, n);
+    }
+  });
+  tasks.clear();
+  EXPECT_EQ(map.size(), 1U);
+  EXPECT_EQ(**map.pop("retained"), 77);
 }
 
 TEST(HashMapJoinStorage, LifecycleAggregationAndMetrics) {

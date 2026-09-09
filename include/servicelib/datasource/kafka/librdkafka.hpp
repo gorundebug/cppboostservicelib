@@ -22,7 +22,7 @@
 #include <rdkafka.h>
 #endif
 
-#include <servicelib/datasource/localsource/custom.hpp>
+#include <servicelib/datasource/kafka/detail/endpoint.hpp>
 #include <servicelib/runtime/detail/kafka_admin.hpp>
 #include <servicelib/runtime/telemetry/librdkafka_statistics.hpp>
 #include <servicelib/runtime/detail/kafka_context.hpp>
@@ -35,7 +35,7 @@ class ConsumerMessage final {
                   std::uint32_t partition, std::int64_t offset,
                   std::function<void()> commit = {},
                   std::function<void(std::string)> markMessage = {},
-                  detail::KafkaHeaders headers = {})
+                  servicelib::detail::KafkaHeaders headers = {})
       : key_(std::move(key)),
         value_(std::move(value)),
         topic_(std::move(topic)),
@@ -50,7 +50,7 @@ class ConsumerMessage final {
   [[nodiscard]] const std::string& topic() const noexcept { return topic_; }
   [[nodiscard]] std::uint32_t partition() const noexcept { return partition_; }
   [[nodiscard]] std::int64_t offset() const noexcept { return offset_; }
-  [[nodiscard]] const detail::KafkaHeaders& headers() const noexcept {
+  [[nodiscard]] const servicelib::detail::KafkaHeaders& headers() const noexcept {
     return headers_;
   }
 
@@ -70,7 +70,7 @@ class ConsumerMessage final {
   std::int64_t offset_{};
   std::function<void()> commit_;
   std::function<void(std::string)> markMessage_;
-  detail::KafkaHeaders headers_;
+  servicelib::detail::KafkaHeaders headers_;
 };
 
 class ConsumerClient {
@@ -137,7 +137,7 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
     std::string topic;
     std::uint32_t partition{};
     std::int64_t offset{};
-    detail::KafkaHeaders headers;
+    servicelib::detail::KafkaHeaders headers;
   };
 
   struct PartitionLane final {
@@ -200,7 +200,7 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
     auto* kafkaConfig = rd_kafka_conf_new();
     try {
       SetConfig(kafkaConfig, "bootstrap.servers", connector->brokers);
-      detail::ApplyKafkaSecurity(kafkaConfig, *connector);
+      servicelib::detail::ApplyKafkaSecurity(kafkaConfig, *connector);
       SetConfig(kafkaConfig, "group.id", endpoint->consumerGroup);
       SetConfig(kafkaConfig, "enable.auto.commit", "true");
       SetConfig(kafkaConfig, "enable.auto.offset.store", "false");
@@ -382,9 +382,9 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
     return {static_cast<const char*>(data), size};
   }
 
-  static detail::KafkaHeaders CopyHeaders(
+  static servicelib::detail::KafkaHeaders CopyHeaders(
       const rd_kafka_message_t* message) {
-    detail::KafkaHeaders result;
+    servicelib::detail::KafkaHeaders result;
     rd_kafka_headers_t* headers{};
     if (!message || rd_kafka_message_headers(message, &headers) !=
                         RD_KAFKA_RESP_ERR_NO_ERROR ||
@@ -448,12 +448,12 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
 
 namespace detail {
 
-class ProducerAdapter final
-    : public datasource::localsource::DataProducer<ConsumerMessage> {
+class ProducerAdapter final {
  public:
+  using Consumer = std::function<void(MessageContext, Payload<ConsumerMessage>)>;
   explicit ProducerAdapter(ConsumerClient& client) : client_(client) {}
 
-  void start(Context, Consumer consumer) override {
+  void start(Context, Consumer consumer) {
     client_.start([consumer = std::move(consumer)](ConsumerMessage message) {
       auto context =
           servicelib::detail::ContextFromKafkaHeaders(message.headers());
@@ -461,7 +461,7 @@ class ProducerAdapter final
                Payload<ConsumerMessage>::make(std::move(message)));
     });
   }
-  void stop(Context) override { client_.stop(); }
+  void stop(Context) { client_.stop(); }
 
  private:
   ConsumerClient& client_;
@@ -483,7 +483,7 @@ class HandlerAdapter final {
   void consumeMessage(
       MessageContext context, SourceStreamContext<T, R, E>& stream,
       State& state, const ConsumerMessage& message,
-      datasource::localsource::ResultContext<State, T, R, E> result) {
+      ResultContext<State, T, R, E> result) {
     handler_.consumeMessage(std::move(context), stream, state, message,
                             std::move(result));
   }
@@ -509,7 +509,8 @@ class Endpoint final {
  public:
   using Adapter = detail::HandlerAdapter<Handler, T, R, E>;
   using Implementation =
-      datasource::localsource::Endpoint<T, R, Adapter, E, ConsumerMessage>;
+      detail::EndpointState<T, R, Adapter, E, ConsumerMessage,
+                            detail::ProducerAdapter>;
   using Output = typename SourceStreamContext<T, R, E>::Output;
   using ErrorOutput = typename SourceStreamContext<T, R, E>::ErrorOutput;
 
@@ -551,7 +552,7 @@ class Endpoint final {
             Adapter{std::move(handler)}, std::move(output), hasResult,
             connectorConfig(environment, endpointId).name,
             endpointConfig(environment, endpointId).name,
-            std::move(errorOutput), true, "kafka.input") {}
+            std::move(errorOutput)) {}
 
  public:
   void start(Context context) {

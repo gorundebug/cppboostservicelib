@@ -29,35 +29,13 @@
 
 #include <servicelib/datasource/detail/result_context.hpp>
 
-namespace servicelib::datasource::localsource {
+// Kafka owns its message lifecycle and pending correlations independently
+// from local source. ResultContext remains shared for public type compatibility.
+namespace servicelib::datasource::kafka::detail {
 
-inline constexpr auto kPendingRotationInterval = std::chrono::seconds{30};
-
-template <typename T>
-class DataProducer {
- public:
-  using Consumer = std::function<void(MessageContext, Payload<T>)>;
-  virtual ~DataProducer() = default;
-  // start may block for the complete producer lifetime. The endpoint runs it
-  // in managed runtime work, matching the Go producer goroutine.
-  virtual void start(Context context, Consumer consumer) = 0;
-  virtual void stop(Context context) = 0;
-};
-
-class IEndpoint {
- public:
-  virtual ~IEndpoint() = default;
-  [[nodiscard]] virtual int id() const noexcept = 0;
-  virtual void start(Context context) = 0;
-  virtual void stop(Context context) = 0;
-};
-
-// Handler lifecycle and callback contract are the C++ spelling of
-// datasource/localsource in Go:
-//   concurrency -> beginRequest -> consumeMessage -> [done] -> endRequest.
-template <typename T, typename R, typename Handler,
-          typename E = std::exception_ptr, typename Input = T>
-class Endpoint final : public IEndpoint {
+template <typename T, typename R, typename Handler, typename E,
+          typename Input, typename Producer>
+class EndpointState final {
  public:
   using State = typename Handler::State;
   using StreamContext = SourceStreamContext<T, R, E>;
@@ -65,107 +43,26 @@ class Endpoint final : public IEndpoint {
   using Output = typename StreamContext::Output;
   using ErrorOutput = typename StreamContext::ErrorOutput;
 
-  template <typename InputStreamType>
-  static std::shared_ptr<Endpoint> make(
-      IServiceEnvironment& environment,
-      InputStreamType& input, DataProducer<Input>& producer,
-      Handler& handler) {
-    auto endpoint = std::shared_ptr<Endpoint>(new Endpoint(
-        environment, input.getEndpointId(),
-        static_cast<int>(input.getConfigId()), producer, handler,
-        [input = &input](MessageContext context, Payload<T> value) {
-          input->consume(std::move(context), std::move(value));
-        },
-        input.getResultStream() != nullptr,
-        [input = &input](MessageContext context, Payload<E> error) {
-          input->consumeError(std::move(context), std::move(error));
-        }, nullptr));
-    if (input.getResultStream() != nullptr) {
-      auto* endpointObserver = endpoint.get();
-      input.setResultConsumer(
-          [endpointObserver](MessageContext context, Payload<R> result) {
-            endpointObserver->consumeResult(std::move(context),
-                                            std::move(result));
-          });
-    }
-    return endpoint;
-  }
-
-  Endpoint(IServiceEnvironment& environment, int endpointId,
-           DataProducer<Input>& producer, Handler handler, Output output,
-           bool hasResult, ErrorOutput errorOutput = {})
-      : Endpoint(environment, endpointId, 0, producer, std::move(handler),
-                 std::move(output), hasResult,
-                 connectorConfig(environment, endpointId).name,
-                 endpointConfig(environment, endpointId).name,
-                 std::move(errorOutput)) {}
-
-  Endpoint(IServiceEnvironment& environment, int endpointId, int streamConfigId,
-           DataProducer<Input>& producer, Handler handler, Output output,
-           bool hasResult, ErrorOutput errorOutput = {})
-      : Endpoint(environment, endpointId, streamConfigId, producer,
-                 std::move(handler), std::move(output), hasResult,
-                 connectorConfig(environment, endpointId).name,
-                 endpointConfig(environment, endpointId).name,
-                 std::move(errorOutput)) {}
-
-  Endpoint(IServiceEnvironment& environment, int endpointId,
-           DataProducer<Input>& producer, Handler handler, Output output,
-           bool hasResult, std::string connectorName, std::string endpointName,
-           ErrorOutput errorOutput = {}, bool processInline = false)
-      : Endpoint(environment, endpointId, 0, producer, std::move(handler),
-                 std::move(output), hasResult, std::move(connectorName),
-                 std::move(endpointName), std::move(errorOutput), processInline,
-                 "local.input") {}
-
-  Endpoint(IServiceEnvironment& environment, int endpointId, int streamConfigId,
-           DataProducer<Input>& producer, Handler handler, Output output,
-           bool hasResult, std::string connectorName, std::string endpointName,
-           ErrorOutput errorOutput = {}, bool processInline = false,
-           std::string traceOperation = "local.input")
-      : environment_(environment),
-        endpointId_(endpointId),
+  EndpointState(IServiceEnvironment& environment, int endpointId, int streamConfigId,
+                Producer& producer, Handler handler, Output output,
+                bool hasResult, std::string connectorName, std::string endpointName,
+                ErrorOutput errorOutput)
+      : environment_(environment), endpointId_(endpointId),
         streamName_(resolveStreamName(environment, streamConfigId)),
-        endpointName_(endpointName),
-        producer_(producer),
-        ownedHandler_(std::move(handler)),
-        handler_(&*ownedHandler_),
+        endpointName_(std::move(endpointName)), producer_(producer),
+        ownedHandler_(std::move(handler)), handler_(&*ownedHandler_),
         streamContext_(std::move(output), std::move(errorOutput)),
-        hasResult_(hasResult),
-        processInline_(processInline),
-        traceOperation_(std::move(traceOperation)),
-        pending_(kPendingRotationInterval),
+        hasResult_(hasResult), pending_(std::chrono::seconds{30}),
         metrics_(environment.getMetrics(), environment.getLogger(),
                  std::move(connectorName), endpointName_) {}
 
- private:
-  Endpoint(IServiceEnvironment& environment, int endpointId, int streamConfigId,
-           DataProducer<Input>& producer, Handler& handler, Output output,
-           bool hasResult, ErrorOutput errorOutput, std::nullptr_t)
-      : environment_(environment),
-        endpointId_(endpointId),
-        streamName_(resolveStreamName(environment, streamConfigId)),
-        endpointName_(endpointConfig(environment, endpointId).name),
-        producer_(producer),
-        handler_(&handler),
-        streamContext_(std::move(output), std::move(errorOutput)),
-        hasResult_(hasResult),
-        processInline_(false),
-        traceOperation_("local.input"),
-        pending_(kPendingRotationInterval),
-        metrics_(environment.getMetrics(), environment.getLogger(),
-                 connectorConfig(environment, endpointId).name,
-                 endpointName_) {}
-
- public:
-
-  ~Endpoint() override {
+  ~EndpointState() {
     if (started_.load(std::memory_order_acquire)) std::abort();
   }
 
-  [[nodiscard]] int id() const noexcept override { return endpointId_; }
+  [[nodiscard]] int id() const noexcept { return endpointId_; }
 
-  void start(Context context) override {
+  void start(Context context) {
     bool expected = false;
     if (!started_.compare_exchange_strong(expected, true,
                                           std::memory_order_acq_rel)) {
@@ -178,7 +75,7 @@ class Endpoint final : public IEndpoint {
     }
     if (hasResult_) pending_.start(context);
     try {
-      // DataProducer::start is explicitly allowed to block for the producer
+      // ConsumerClient::start is explicitly allowed to block for the producer
       // lifetime. Give that boundary its own endpoint-owned thread so neither
       // a reactor worker nor the bounded shared blocking executor is occupied
       // permanently.
@@ -212,7 +109,7 @@ class Endpoint final : public IEndpoint {
     }
   }
 
-  void stop(Context context) override {
+  void stop(Context context) {
     if (!started_.exchange(false, std::memory_order_acq_rel)) return;
     {
       std::lock_guard lock(concurrencyMutex_);
@@ -288,29 +185,12 @@ class Endpoint final : public IEndpoint {
  private:
   void submit(MessageContext context, Payload<Input> payload) {
     if (!acquire()) return;
-    if (processInline_) {
-      struct Release final {
-        Endpoint* endpoint;
-        ~Release() { endpoint->release(); }
-      } release{this};
-      process(std::move(context), std::move(payload));
-      return;
-    }
-    try {
-      tasks_.CriticalAsyncDetach(
-          "servicelib-custom-datasource-message",
-          [this, context = std::move(context),
-           payload = std::move(payload)]() mutable {
-            struct Release final {
-              Endpoint* endpoint;
-              ~Release() { endpoint->release(); }
-            } release{this};
-            process(std::move(context), std::move(payload));
-          });
-    } catch (...) {
-      release();
-      throw;
-    }
+    // Finish this message before returning to the Kafka partition consumer.
+    struct Release final {
+      EndpointState* endpoint;
+      ~Release() { endpoint->release(); }
+    } release{this};
+    process(std::move(context), std::move(payload));
   }
 
   bool acquire() {
@@ -344,7 +224,7 @@ class Endpoint final : public IEndpoint {
     tracing::ActiveSpan startedSpan;
     if (tracer) {
       startedSpan = tracing::StartSpanInPlace(
-          context, tracer.get(), traceOperation_,
+          context, tracer.get(), "kafka.input",
           {tracing::Attribute::String("stream", streamName_),
            tracing::Attribute::String("endpoint", endpointName_)});
     }
@@ -465,30 +345,6 @@ class Endpoint final : public IEndpoint {
     metrics_.requestEnd(startedAt, error);
   }
 
-  static config::CustomEndpointConfig endpointConfig(
-      const IServiceEnvironment& environment, int endpointId) {
-    const auto runtime = environment.getRuntimeConfigSnapshot();
-    const auto value =
-        runtime ? runtime->GetEndpointConfigByID(endpointId) : std::nullopt;
-    const auto* config =
-        value ? value->As<config::CustomEndpointConfig>() : nullptr;
-    if (!config)
-      throw std::invalid_argument("custom endpoint config not found");
-    return *config;
-  }
-
-  static config::CustomDataConnectorConfig connectorConfig(
-      const IServiceEnvironment& environment, int endpointId) {
-    const auto runtime = environment.getRuntimeConfigSnapshot();
-    const auto endpoint = endpointConfig(environment, endpointId);
-    const auto value = runtime->GetDataConnectorByID(endpoint.idDataConnector);
-    const auto* config =
-        value ? value->As<config::CustomDataConnectorConfig>() : nullptr;
-    if (!config)
-      throw std::invalid_argument("custom connector config not found");
-    return *config;
-  }
-
   static std::string resolveStreamName(
       const IServiceEnvironment& environment, int streamConfigId) {
     const auto runtime = environment.getRuntimeConfigSnapshot();
@@ -501,13 +357,11 @@ class Endpoint final : public IEndpoint {
   int endpointId_;
   std::string streamName_;
   std::string endpointName_;
-  DataProducer<Input>& producer_;
+  Producer& producer_;
   std::optional<Handler> ownedHandler_;
   Handler* handler_;
   StreamContext streamContext_;
   bool hasResult_;
-  bool processInline_;
-  std::string traceOperation_;
   store::RotatingMap<std::string, std::shared_ptr<Result>> pending_;
   DataSourceEndpointMetrics metrics_;
   std::mutex concurrencyMutex_;
@@ -518,7 +372,7 @@ class Endpoint final : public IEndpoint {
   std::stop_source requestStopSource_;
   std::thread producerThread_;
   // Last: all detached work is joined before captured endpoint fields die.
-  detail::TaskStorage tasks_;
+  servicelib::detail::TaskStorage tasks_;
 };
 
-}  // namespace servicelib::datasource::localsource
+}  // namespace servicelib::datasource::kafka::detail

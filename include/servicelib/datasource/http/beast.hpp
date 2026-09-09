@@ -534,6 +534,8 @@ class ResultContext final {
   explicit ResultContext(std::shared_ptr<Pending> result)
       : result_(std::move(result)) {}
 
+  // The registered callable is retained and may be invoked concurrently.
+  // Mutable state must be synchronized by the handler, as must HandlerState.
   void setResultCallback(std::string messageId, Callback callback) {
     result_->setCallback(std::move(messageId),
                          std::make_shared<Callback>(std::move(callback)));
@@ -842,9 +844,7 @@ class BeastEndpoint final : public IBeastEndpoint {
                          {tracing::Attribute::String("message_id", messageId)});
       return;
     }
-    // Keep the public callback's per-invocation capture semantics.
-    auto invocation = *callback;
-    if (invocation(context, streamContext_, result->state, payload.get(),
+    if ((*callback)(context, streamContext_, result->state, payload.get(),
                    result->data)) {
       const bool duplicate = !result->eraseCallback(messageId);
       if (duplicate) {

@@ -276,7 +276,7 @@ struct RetainedCallbackHandler final {
       servicelib::datasource::http::HandlerData&) noexcept {}
 };
 
-TEST(HttpDataSource, RetainedCallbackKeepsCopySemanticsAndTraceOrder) {
+TEST(HttpDataSource, RetainedCallbackKeepsStateAndTraceOrder) {
   boost::asio::io_context io;
   servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
   servicelib::testtracing::TestTracing tracing;
@@ -299,7 +299,7 @@ TEST(HttpDataSource, RetainedCallbackKeepsCopySemanticsAndTraceOrder) {
       boost::asio::use_future);
   while (response.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready)
     ASSERT_GT(io.run_one(), 0U);
-  EXPECT_EQ(response.get().body, "11");
+  EXPECT_EQ(response.get().body, "12");
   const auto spans = tracing.spans();
   ASSERT_EQ(spans.size(), 1U);
   std::vector<std::string> events;
