@@ -99,8 +99,10 @@ class CppBoostServiceLibConan(ConanFile):
             self.requires(f"gtest/{VERSIONS['googletest']}{LOCAL_RECIPE_NAMESPACE}")
 
         if self.options.with_grpc or self.options.with_otel:
+            self.requires(f"abseil/{VERSIONS['abseil']}", override=True)
             self.requires(f"protobuf/{VERSIONS['protobuf']}", override=True)
             self.requires(f"grpc/{VERSIONS['grpc']}{LOCAL_RECIPE_NAMESPACE}", override=True)
+            self.requires(f"re2/{VERSIONS['re2']}", override=True)
             self.requires(f"asio-grpc/{VERSIONS['asio-grpc']}")
 
         if self.options.with_kafka:

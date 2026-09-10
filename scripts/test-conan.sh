@@ -16,9 +16,7 @@ if [[ -n "${DEPENDENCY_PROXY_DIR:-}" ]]; then
   proxy_host=${DEPENDENCY_PROXY_DOCKER_HOST:-host.docker.internal}
   proxy_port=${DEPENDENCY_PROXY_PORT:-18081}
   proxy_base="http://${proxy_host}:${proxy_port}/repository"
-  conan_home="$DEPENDENCY_PROXY_DIR/conan2"
-  mkdir -p "$conan_home"
-  conan_home_mount="$conan_home:/conan"
+  conan_home_mount="${DEPENDENCY_CONAN_VOLUME:-dependency-conan2}:/conan"
   docker_build_args+=(
     --add-host host.docker.internal:host-gateway
     --build-arg "PIP_INDEX_URL=$proxy_base/pypi-proxy/simple"
@@ -29,7 +27,7 @@ if [[ -n "${DEPENDENCY_PROXY_DIR:-}" ]]; then
   )
   docker_run_args+=(
     --add-host host.docker.internal:host-gateway
-    -e "DEPENDENCY_CONAN_REMOTE_URL=$proxy_base/conan-group"
+    -e "DEPENDENCY_CONAN_REMOTE_URL=$proxy_base/conan-proxy"
     -e "DEPENDENCY_CONAN_UPLOAD_URL=$proxy_base/conan-hosted"
     -e "DEPENDENCY_CONAN_PUBLISH=1"
     -e "DEPENDENCY_CONAN_CREDENTIAL_FILE=/run/secrets/dependency_conan_credential"
