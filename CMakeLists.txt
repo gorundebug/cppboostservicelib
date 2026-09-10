@@ -193,7 +193,14 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
     # Release normally defines NDEBUG, but several standalone tests deliberately
     # use the standard assert contract.  Keep assertions enabled for test
     # targets only so Release verification executes the same checks as Debug.
-    add_compile_options(-UNDEBUG -Werror -Wno-missing-field-initializers)
+    # Keep our tests warning-clean without turning deprecation diagnostics from
+    # FetchContent dependencies (notably gRPC public compatibility headers)
+    # into third-party build failures.
+    add_compile_options(
+        -UNDEBUG
+        -Werror
+        -Wno-error=deprecated-declarations
+        -Wno-missing-field-initializers)
   endif()
 
   add_test(NAME cppboostservicelib_structure_test
