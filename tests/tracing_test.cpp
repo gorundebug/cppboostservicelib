@@ -20,7 +20,7 @@ class RecordingSpan final : public servicelib::tracing::Span {
   void end() override { ++endCount; }
 
   void setAttributes(
-      std::initializer_list<servicelib::tracing::Attribute> attrs) override {
+      servicelib::tracing::AttributeView attrs) override {
     attributes.insert(attributes.end(), attrs.begin(), attrs.end());
   }
 
@@ -36,7 +36,7 @@ class RecordingSpan final : public servicelib::tracing::Span {
 
   void addEvent(
       std::string_view name,
-      std::initializer_list<servicelib::tracing::Attribute> attrs) override {
+      servicelib::tracing::AttributeView attrs) override {
     eventName = std::string(name);
     eventAttributes.assign(attrs.begin(), attrs.end());
   }
@@ -62,7 +62,7 @@ class RecordingTracer final : public servicelib::tracing::Tracer {
  public:
   std::shared_ptr<servicelib::tracing::Span> start(
       std::string_view spanName,
-      std::initializer_list<servicelib::tracing::Attribute> attrs) const override {
+      servicelib::tracing::AttributeView attrs) const override {
     ++rootStarts;
     name = std::string(spanName);
     startedAttributes.assign(attrs.begin(), attrs.end());
@@ -78,7 +78,7 @@ class RecordingTracer final : public servicelib::tracing::Tracer {
 
   std::shared_ptr<servicelib::tracing::Span> startChildOf(
       std::string_view spanName, const servicelib::tracing::SpanContext& parent,
-      std::initializer_list<servicelib::tracing::Attribute> attrs) const override {
+      servicelib::tracing::AttributeView attrs) const override {
     ++childStarts;
     parentContext = parent;
     name = std::string(spanName);
@@ -91,7 +91,7 @@ class RecordingTracer final : public servicelib::tracing::Tracer {
 
   std::shared_ptr<servicelib::tracing::Span> startDetachedChildOf(
       std::string_view spanName, const servicelib::tracing::SpanContext& parent,
-      std::initializer_list<servicelib::tracing::Attribute> attrs) const override {
+      servicelib::tracing::AttributeView attrs) const override {
     ++detachedStarts;
     parentContext = parent;
     name = std::string(spanName);
@@ -284,4 +284,102 @@ TEST(Tracing, DetachedChildPreservesExplicitParentAndCanEndLater) {
   span->end();
   ASSERT_TRUE(tracer.lastSpan);
   EXPECT_EQ(tracer.lastSpan->endCount, 1);
+}
+
+#include <array>
+#include <type_traits>
+#include <servicelib/runtime/caller.hpp>
+
+namespace {
+class CachedAttributeTracer final : public servicelib::tracing::Tracer {
+ public:
+  std::shared_ptr<servicelib::tracing::Span> start(
+      std::string_view, servicelib::tracing::AttributeView attrs) const override {
+    ++starts;
+    stable = stable && attrs.data() == expected.data() && attrs.size() == expected.size();
+    return span_;
+  }
+  servicelib::tracing::SpanContext currentSpanContext() const override { return {}; }
+  std::shared_ptr<servicelib::tracing::Span> startChildOf(
+      std::string_view name, const servicelib::tracing::SpanContext&,
+      servicelib::tracing::AttributeView attrs) const override { return start(name, attrs); }
+  std::shared_ptr<servicelib::tracing::Span> startDetachedChildOf(
+      std::string_view name, const servicelib::tracing::SpanContext&,
+      servicelib::tracing::AttributeView attrs) const override { return start(name, attrs); }
+  std::span<const servicelib::tracing::Attribute> expected;
+  mutable std::size_t starts{};
+  mutable bool stable{true};
+ private:
+  std::shared_ptr<servicelib::tracing::Span> span_ = std::make_shared<servicelib::tracing::NoopSpan>();
+};
+class CachedAttributeCaller final : public servicelib::CallerBase {
+ public:
+  CachedAttributeCaller(Params params, std::string_view type = {}, std::string_view pool = {})
+      : CallerBase(std::move(params)) { configureCallAttributes(type, pool); }
+  bool isAsync() const noexcept override { return false; }
+  void fire(servicelib::MessageContext& context) {
+    recordMessage();
+    if (samplingEnabled(context)) {
+      [[maybe_unused]] auto span = startCallSpan(context);
+    }
+  }
+  std::span<const servicelib::tracing::Attribute> cached() const { return callAttributes_; }
+};
+}
+
+TEST(Tracing, CachedCallAttributesReuseOwnedStorageAndKeepSamplingLive) {
+  static_assert(std::is_trivially_copyable_v<servicelib::tracing::AttributeView>);
+  const std::array<std::pair<std::string_view, std::string_view>, 4> variants{{
+      {"", ""}, {"parallel", ""}, {"taskpool", "Inventory Workers"},
+      {"prioritytaskpool", "Inventory Priority Workers"}}};
+  for (const auto& [type, pool] : variants) {
+    auto tracer = std::make_shared<CachedAttributeTracer>();
+    servicelib::CallerBase::Params params;
+    params.sourceName = "Request source with a long non-SSO name";
+    params.consumerName = "Receiving stage with a long non-SSO name";
+    params.pipeline = "customerPricingPipeline";
+    params.component = "Customer Pricing Component";
+    params.tracer = tracer;
+    params.metricsEnabled = false;
+    CachedAttributeCaller caller(std::move(params), type, pool);
+    tracer->expected = caller.cached();
+    ASSERT_EQ(caller.cached().size(), 4 + !type.empty() + !pool.empty());
+    EXPECT_EQ(std::get<std::string>(caller.cached()[1].value()), "customerPricingPipeline");
+    EXPECT_EQ(std::get<std::string>(caller.cached()[2].value()), "Customer Pricing Component");
+    servicelib::MessageContext unsampled;
+    caller.fire(unsampled);
+    EXPECT_EQ(tracer->starts, 0);
+    auto sampled = servicelib::tracing::EnableSampling(servicelib::MessageContext{});
+    for (int i = 0; i < 100; ++i) caller.fire(sampled);
+    EXPECT_EQ(tracer->starts, 100);
+    EXPECT_TRUE(tracer->stable);
+    caller.fire(unsampled);
+    EXPECT_EQ(tracer->starts, 100);
+    EXPECT_EQ(caller.statistics().count(), 102);
+  }
+}
+
+TEST(Tracing, DisabledCallerDoesNotAllocateAnAttributeCache) {
+  servicelib::CallerBase::Params params;
+  params.metricsEnabled = false;
+  CachedAttributeCaller caller(std::move(params), "taskpool", "Workers");
+  EXPECT_TRUE(caller.cached().empty());
+  auto context = servicelib::tracing::EnableSampling(servicelib::MessageContext{});
+  for (int i = 0; i < 100; ++i) caller.fire(context);
+  EXPECT_EQ(caller.statistics().count(), 100);
+  EXPECT_TRUE(caller.cached().empty());
+}
+
+TEST(Tracing, BorrowedAttributeViewKeepsRecorderOwnershipAndBracedCalls) {
+  using servicelib::tracing::Attribute;
+  std::array<Attribute, 2> attributes{{Attribute::String("pipeline", "owned pipeline value"), Attribute::Bool("enabled", true)}};
+  const servicelib::tracing::AttributeView view{std::span<const Attribute>{attributes}};
+  RecordingTracer tracer;
+  auto span = tracer.start("cached", view);
+  EXPECT_EQ(view.data(), attributes.data());
+  attributes[0] = Attribute::String("pipeline", "changed after synchronous start");
+  ASSERT_EQ(tracer.startedAttributes.size(), 2);
+  EXPECT_EQ(std::get<std::string>(tracer.startedAttributes[0].value()), "owned pipeline value");
+  span->setAttributes({Attribute::Int64("count", 2)});
+  span->end();
 }

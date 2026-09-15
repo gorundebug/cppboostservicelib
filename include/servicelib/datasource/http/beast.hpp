@@ -1,5 +1,6 @@
 #pragma once
 
+#include <servicelib/runtime/stream_tracing.hpp>
 #include <utility>
 
 #include <boost/asio/any_io_executor.hpp>
@@ -589,7 +590,7 @@ class BeastEndpoint final : public IBeastEndpoint {
                 bool hasResult, ErrorOutput errorOutput = {})
       : environment_(environment),
         endpointId_(endpointId),
-        streamName_(resolveStreamName(environment, streamConfigId)),
+        streamIdentity_(resolveStreamIdentity(environment, streamConfigId)),
         endpointName_(endpointConfig(environment, endpointId).name),
         method_(endpointConfig(environment, endpointId).httpMethodType),
         path_(endpointConfig(environment, endpointId).path),
@@ -661,7 +662,9 @@ class BeastEndpoint final : public IBeastEndpoint {
     if (tracer) {
       startedSpan = tracing::StartSpanInPlace(
           requestContext, tracer.get(), "http.input",
-          {tracing::Attribute::String("stream", streamName_),
+          {tracing::Attribute::String("stream", streamIdentity_.name),
+            tracing::Attribute::String("pipeline", streamIdentity_.pipeline),
+            tracing::Attribute::String("component", streamIdentity_.component),
            tracing::Attribute::String("endpoint", endpointName_),
            tracing::Attribute::String("method", request.method),
            tracing::Attribute::String("path", path_)});
@@ -907,13 +910,14 @@ class BeastEndpoint final : public IBeastEndpoint {
     }
     return *http;
   }
-  static std::string resolveStreamName(
+  static StreamTraceIdentity resolveStreamIdentity(
       const IServiceEnvironment& environment, int streamConfigId) {
     const auto runtime = environment.getRuntimeConfigSnapshot();
     const auto stream = runtime && streamConfigId != 0
                             ? runtime->GetStreamConfigByID(streamConfigId)
                             : std::nullopt;
-    return stream ? stream->GetName() : std::string{};
+    return stream ? StreamTraceIdentity{stream->GetName(), stream->GetPipeline(), stream->GetComponent()}
+                  : StreamTraceIdentity{};
   }
   static void traceError(tracing::Span* span, std::exception_ptr error,
                          std::string_view event) {
@@ -933,7 +937,7 @@ class BeastEndpoint final : public IBeastEndpoint {
 
   IServiceEnvironment& environment_;
   int endpointId_;
-  std::string streamName_;
+  StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   api::HTTPMethodType method_;
   std::string path_;

@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <exception>
 #include <initializer_list>
+#include <span>
 #include <memory>
 #include <optional>
 #include <string>
@@ -107,6 +108,26 @@ class Attribute {
   Value value_;
 };
 
+// Borrowed, read-only attributes. Backing storage must outlive the call.
+// Braced lists are for immediate calls only; cached views reference caller-owned
+// arrays/vectors. Backends copy values when they need to retain span data.
+class AttributeView final {
+ public:
+  AttributeView() noexcept = default;
+  AttributeView(std::initializer_list<Attribute> values) noexcept
+      : values_(values.begin(), values.size()) {}
+  AttributeView(std::span<const Attribute> values) noexcept : values_(values) {}
+
+  [[nodiscard]] auto begin() const noexcept { return values_.begin(); }
+  [[nodiscard]] auto end() const noexcept { return values_.end(); }
+  [[nodiscard]] const Attribute* data() const noexcept { return values_.data(); }
+  [[nodiscard]] std::size_t size() const noexcept { return values_.size(); }
+  [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
+
+ private:
+  std::span<const Attribute> values_;
+};
+
 struct SpanContext {
   std::string traceId;
   std::string spanId;
@@ -148,11 +169,11 @@ class Span {
   virtual ~Span() = default;
 
   virtual void end() = 0;
-  virtual void setAttributes(std::initializer_list<Attribute> attrs) = 0;
+  virtual void setAttributes(AttributeView attrs) = 0;
   virtual void recordError(std::string_view message) = 0;
   virtual void setStatus(StatusCode code, std::string_view description) = 0;
   virtual void addEvent(std::string_view name,
-                        std::initializer_list<Attribute> attrs = {}) = 0;
+                        AttributeView attrs = {}) = 0;
   [[nodiscard]] virtual SpanContext spanContext() const = 0;
 };
 
@@ -161,10 +182,10 @@ class Span {
 class NoopSpan final : public Span {
  public:
   void end() override {}
-  void setAttributes(std::initializer_list<Attribute>) override {}
+  void setAttributes(AttributeView) override {}
   void recordError(std::string_view) override {}
   void setStatus(StatusCode, std::string_view) override {}
-  void addEvent(std::string_view, std::initializer_list<Attribute>) override {}
+  void addEvent(std::string_view, AttributeView) override {}
   [[nodiscard]] SpanContext spanContext() const override { return {}; }
 };
 
@@ -182,7 +203,7 @@ class Tracer {
   // owns the "normal" End() call.
   virtual std::shared_ptr<Span> start(
       std::string_view spanName,
-      std::initializer_list<Attribute> attrs = {}) const = 0;
+      AttributeView attrs = {}) const = 0;
 
   // Returns the ambient current span's context, or an invalid
   // SpanContext if there is none / tracing is disabled. Used to bridge
@@ -195,7 +216,7 @@ class Tracer {
   // the parent context. Same lifetime rules as start().
   virtual std::shared_ptr<Span> startChildOf(
       std::string_view spanName, const SpanContext& parent,
-      std::initializer_list<Attribute> attrs = {}) const = 0;
+      AttributeView attrs = {}) const = 0;
 
   // Starts a span with an explicit parent without attaching it to the current
   // coroutine stack. The returned span may be ended on a different coroutine.
@@ -204,7 +225,7 @@ class Tracer {
   // propagate spanContext() explicitly instead.
   virtual std::shared_ptr<Span> startDetachedChildOf(
       std::string_view spanName, const SpanContext& parent,
-      std::initializer_list<Attribute> attrs = {}) const = 0;
+      AttributeView attrs = {}) const = 0;
 };
 
 // Go analog: tracing.Tracing — factory for named tracers (e.g. one per
@@ -218,7 +239,7 @@ class Tracing {
 };
 
 inline void SpanEvent(Span* span, std::string_view name,
-                      std::initializer_list<Attribute> attrs = {}) {
+                      AttributeView attrs = {}) {
   if (span) span->addEvent(name, attrs);
 }
 
@@ -239,7 +260,7 @@ inline std::string ExceptionMessage(const std::exception_ptr& error) {
   }
 }
 
-inline void SpanAttrs(Span* span, std::initializer_list<Attribute> attrs) {
+inline void SpanAttrs(Span* span, AttributeView attrs) {
   if (span) span->setAttributes(attrs);
 }
 
@@ -325,7 +346,7 @@ template <typename TContext>
 template <typename TContext>
 [[nodiscard]] ActiveSpan StartSpanInPlace(
     TContext& context, Tracer* tracer, std::string_view operation,
-    std::initializer_list<Attribute> attrs = {}) {
+    AttributeView attrs = {}) {
   if (!tracer || !SamplingEnabled(context)) return {};
 
   std::shared_ptr<Span> span;
@@ -353,7 +374,7 @@ template <typename TContext>
 template <typename TContext>
 [[nodiscard]] StartedSpan<TContext> StartSpan(
     TContext context, Tracer* tracer, std::string_view operation,
-    std::initializer_list<Attribute> attrs = {}) {
+    AttributeView attrs = {}) {
   if (!tracer || !SamplingEnabled(context)) {
     return StartedSpan<TContext>(std::move(context), {});
   }

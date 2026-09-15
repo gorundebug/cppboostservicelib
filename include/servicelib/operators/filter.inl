@@ -78,7 +78,7 @@
         : Filter<_CCp>(), f_(std::move(f), *this) {
       this->setConfigIdentity(cfg);
       this->serde_     = serde;
-      this->env_       = env;
+      this->setEnv(env);
     }
 
     template <typename T, typename Ctx = FilterImpl>
@@ -90,7 +90,7 @@
         : Filter<T>(std::move(consumer)), f_(std::move(f), *this) {
       this->setConfigIdentity(cfg);
       this->serde_     = serde;
-      this->env_       = env;
+      this->setEnv(env);
     }
 
     // --- make() — internal (codegen build path) ---

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <servicelib/runtime/detail/traits.hpp>
+#include <servicelib/runtime/environment/environment.hpp>
 
 namespace servicelib {
 #define STREAM_ENABLE_COMPILE
@@ -104,12 +105,15 @@ class StreamBase : public NotCopyableOrMovable {
   struct CommonSettings {
     size_t configId{0};
     std::string name;
+    std::string pipeline;
+    std::string component;
   };
 
  private:
   size_t id_{0};
   CommonSettings settings_;
   IRuntimeEnvironment* env_{nullptr};
+  std::shared_ptr<tracing::Tracer> streamTracer_;
 
  protected:
   StreamBase() {}
@@ -134,15 +138,27 @@ class StreamBase : public NotCopyableOrMovable {
   void setConfigIdentity(const Config& config) {
     settings_.configId = static_cast<size_t>(config.id);
     settings_.name = config.name;
+    if constexpr (requires { config.pipeline; }) settings_.pipeline = config.pipeline;
+    if constexpr (requires { config.component; }) settings_.component = config.component;
   }
 
   // Copies name + env to another stream node (used in build() codegen path)
   void copySettings(const StreamBase& other) {
     settings_ = other.settings_;
     env_ = other.env_;
+    streamTracer_ = other.streamTracer_;
   }
 
-  void setEnv(IRuntimeEnvironment* env) noexcept { env_ = env; }
+  void setEnv(IRuntimeEnvironment* env) {
+    env_ = env;
+    streamTracer_.reset();
+    // Resolve ownership during topology construction, never per message.
+    if (env_) {
+      if (auto* engine = env_->getTracing()) {
+        streamTracer_ = engine->tracer(env_->getServiceName());
+      }
+    }
+  }
 
  public:
   virtual size_t getId() const noexcept { return id_; }
@@ -152,7 +168,12 @@ class StreamBase : public NotCopyableOrMovable {
 
   virtual const std::string& getName() const noexcept { return settings_.name; }
 
+  const std::string& getPipeline() const noexcept { return settings_.pipeline; }
+  const std::string& getComponent() const noexcept { return settings_.component; }
+
   IRuntimeEnvironment* getEnv() const noexcept { return env_; }
+
+  tracing::Tracer* getStreamTracer() const noexcept { return streamTracer_.get(); }
 
  private:
   template <class _Tp>

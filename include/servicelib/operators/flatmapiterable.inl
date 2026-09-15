@@ -78,7 +78,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       FlatMapIterable<_CCp>::resolveDefaultSerde();
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     template <typename T>
@@ -90,7 +90,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       FlatMapIterable<_CCp>::resolveDefaultSerde();
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     static unique_ptr<FlatMapIterableImpl> make() { return unique_ptr<FlatMapIterableImpl>(new FlatMapIterableImpl()); }

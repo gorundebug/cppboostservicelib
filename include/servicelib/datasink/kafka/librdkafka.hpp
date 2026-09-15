@@ -1,5 +1,7 @@
 #pragma once
 
+#include <servicelib/runtime/stream_tracing.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -399,7 +401,7 @@ class Endpoint final {
         partitionCount_(static_cast<std::uint32_t>(std::max(
             endpointConfig(environment_, stream.endpointId()).partitions, 1))),
         endpointName_(endpointConfig(environment_, stream.endpointId()).name),
-        streamName_(resolveStreamName(environment_, stream.streamConfigId())),
+        streamIdentity_(resolveStreamIdentity(environment_, stream.streamConfigId())),
         serviceName_(resolveServiceName(environment_)),
         producer_(producer),
         handler_(std::move(handler)),
@@ -514,17 +516,21 @@ class Endpoint final {
     if (!tracer) return {};
     return tracing::StartSpanInPlace(
         context, tracer.get(), "kafka.output",
-        {tracing::Attribute::String("stream", streamName_),
+        {tracing::Attribute::String("stream", streamIdentity_.name),
+            tracing::Attribute::String("pipeline", streamIdentity_.pipeline),
+            tracing::Attribute::String("component", streamIdentity_.component),
          tracing::Attribute::String("endpoint", endpointName_)});
   }
 
-  [[nodiscard]] static std::string resolveStreamName(
+  [[nodiscard]] static StreamTraceIdentity resolveStreamIdentity(
       const IServiceEnvironment& environment, std::size_t streamConfigId) {
     const auto runtime = environment.getRuntimeConfigSnapshot();
     if (!runtime || streamConfigId == 0) return {};
     const auto stream = runtime->GetStreamConfigByID(
         static_cast<int>(streamConfigId));
-    return stream ? stream->GetName() : std::string{};
+    return stream ? StreamTraceIdentity{stream->GetName(), stream->GetPipeline(),
+                                        stream->GetComponent()}
+                  : StreamTraceIdentity{};
   }
 
   [[nodiscard]] static std::string resolveServiceName(
@@ -576,7 +582,7 @@ class Endpoint final {
   std::string topic_;
   std::uint32_t partitionCount_;
   std::string endpointName_;
-  std::string streamName_;
+  StreamTraceIdentity streamIdentity_;
   std::string serviceName_;
   ProducerClient& producer_;
   Handler handler_;

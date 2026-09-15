@@ -173,7 +173,7 @@
         : Merge<NLinks, _CCp>() {
       this->setConfigIdentity(cfg);
       this->serde_     = serde;
-      this->env_       = env;
+      this->setEnv(env);
     }
 
     template <typename T>
@@ -184,7 +184,7 @@
         : Merge<NLinks, T>(std::move(consumer)) {
       this->setConfigIdentity(cfg);
       this->serde_     = serde;
-      this->env_       = env;
+      this->setEnv(env);
     }
 
     static unique_ptr<MergeImpl> make() { return unique_ptr<MergeImpl>(new MergeImpl()); }

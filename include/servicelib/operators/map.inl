@@ -92,7 +92,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       Map<_TTp, _CCp>::resolveDefaultSerde();
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     template <typename T, typename Ctx = MapImpl>
@@ -105,7 +105,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       Map<_TTp, _CCp>::resolveDefaultSerde();
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     template <typename F = MapFunction, typename Ctx = MapImpl>

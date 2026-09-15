@@ -49,13 +49,13 @@ class TestTracing;
 class TestSpan final : public tracing::Span {
  public:
   TestSpan(const TestTracing& engine, std::string name,
-           std::initializer_list<tracing::Attribute> attrs)
-      : engine_(engine), name_(std::move(name)), attrs_(attrs) {}
+           tracing::AttributeView attrs)
+      : engine_(engine), name_(std::move(name)), attrs_(attrs.begin(), attrs.end()) {}
 
   // Defined below, once TestTracing is a complete type.
   void end() override;
 
-  void setAttributes(std::initializer_list<tracing::Attribute> attrs) override {
+  void setAttributes(tracing::AttributeView attrs) override {
     attrs_.insert(attrs_.end(), attrs.begin(), attrs.end());
   }
 
@@ -70,9 +70,9 @@ class TestSpan final : public tracing::Span {
   }
 
   void addEvent(std::string_view name,
-                std::initializer_list<tracing::Attribute> attrs) override {
+                tracing::AttributeView attrs) override {
     events_.push_back(RecordedEvent{std::string(name),
-                                    std::vector<tracing::Attribute>(attrs)});
+                                    std::vector<tracing::Attribute>(attrs.begin(), attrs.end())});
   }
 
   [[nodiscard]] tracing::SpanContext spanContext() const override { return {}; }
@@ -94,7 +94,7 @@ class TestTracer final : public tracing::Tracer {
 
   std::shared_ptr<tracing::Span> start(
       std::string_view spanName,
-      std::initializer_list<tracing::Attribute> attrs) const override {
+      tracing::AttributeView attrs) const override {
     return std::make_shared<TestSpan>(engine_, std::string(spanName), attrs);
   }
 
@@ -105,13 +105,13 @@ class TestTracer final : public tracing::Tracer {
 
   std::shared_ptr<tracing::Span> startChildOf(
       std::string_view spanName, const tracing::SpanContext& /*parent*/,
-      std::initializer_list<tracing::Attribute> attrs) const override {
+      tracing::AttributeView attrs) const override {
     return start(spanName, attrs);
   }
 
   std::shared_ptr<tracing::Span> startDetachedChildOf(
       std::string_view spanName, const tracing::SpanContext& parent,
-      std::initializer_list<tracing::Attribute> attrs) const override {
+      tracing::AttributeView attrs) const override {
     return startChildOf(spanName, parent, attrs);
   }
 

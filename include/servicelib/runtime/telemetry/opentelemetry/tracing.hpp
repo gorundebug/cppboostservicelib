@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <opentelemetry/common/attribute_value.h>
+#include <opentelemetry/common/key_value_iterable.h>
 #include <opentelemetry/nostd/shared_ptr.h>
 #include <opentelemetry/nostd/span.h>
 #include <opentelemetry/nostd/string_view.h>
@@ -58,18 +59,23 @@ inline otel::common::AttributeValue AttributeValue(
       attribute.value());
 }
 
-using Attributes = std::vector<
-    std::pair<otel::nostd::string_view, otel::common::AttributeValue>>;
-
-inline Attributes ConvertAttributes(
-    std::initializer_list<tracing::Attribute> attributes) {
-  Attributes converted;
-  converted.reserve(attributes.size());
-  for (const auto& attribute : attributes) {
-    converted.emplace_back(StringView(attribute.key()),
-                           AttributeValue(attribute));
+class Attributes final : public otel::common::KeyValueIterable {
+ public:
+  explicit Attributes(tracing::AttributeView values) noexcept : values_(values) {}
+  bool ForEachKeyValue(otel::nostd::function_ref<bool(
+      otel::nostd::string_view, otel::common::AttributeValue)> callback) const noexcept override {
+    for (const auto& attribute : values_) {
+      if (!callback(StringView(attribute.key()), AttributeValue(attribute))) return false;
+    }
+    return true;
   }
-  return converted;
+  std::size_t size() const noexcept override { return values_.size(); }
+ private:
+  tracing::AttributeView values_;
+};
+
+inline Attributes ConvertAttributes(tracing::AttributeView attributes) noexcept {
+  return Attributes(attributes);
 }
 
 inline int HexDigit(char value) noexcept {
@@ -154,7 +160,7 @@ class OpenTelemetrySpan final : public tracing::Span {
     span_ = nullptr;
   }
 
-  void setAttributes(std::initializer_list<tracing::Attribute> attrs) override {
+  void setAttributes(tracing::AttributeView attrs) override {
     std::lock_guard lock(mutex_);
     if (!span_) return;
     for (const auto& attribute : attrs) {
@@ -195,7 +201,7 @@ class OpenTelemetrySpan final : public tracing::Span {
   }
 
   void addEvent(std::string_view name,
-                std::initializer_list<tracing::Attribute> attrs) override {
+                tracing::AttributeView attrs) override {
     std::lock_guard lock(mutex_);
     if (!span_) return;
     if (attrs.size() == 0) {
@@ -225,7 +231,7 @@ class OpenTelemetryTracer final : public tracing::Tracer {
 
   std::shared_ptr<tracing::Span> start(
       std::string_view spanName,
-      std::initializer_list<tracing::Attribute> attrs) const override {
+      tracing::AttributeView attrs) const override {
     const auto attributes = detail::ConvertAttributes(attrs);
     return std::make_shared<OpenTelemetrySpan>(tracer_->StartSpan(
         detail::StringView(spanName), attributes));
@@ -239,7 +245,7 @@ class OpenTelemetryTracer final : public tracing::Tracer {
 
   std::shared_ptr<tracing::Span> startChildOf(
       std::string_view spanName, const tracing::SpanContext& parent,
-      std::initializer_list<tracing::Attribute> attrs) const override {
+      tracing::AttributeView attrs) const override {
     const auto parent_context = detail::ParentContext(parent);
     if (!parent_context.IsValid()) return start(spanName, attrs);
 
@@ -252,7 +258,7 @@ class OpenTelemetryTracer final : public tracing::Tracer {
 
   std::shared_ptr<tracing::Span> startDetachedChildOf(
       std::string_view spanName, const tracing::SpanContext& parent,
-      std::initializer_list<tracing::Attribute> attrs) const override {
+      tracing::AttributeView attrs) const override {
     // OTel parentage is explicit and a Span is not attached to the runtime
     // context unless Tracer::WithActiveSpan is called.  Therefore this is the
     // same safe cross-coroutine lifecycle as startChildOf, without an ambient

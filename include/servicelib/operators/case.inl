@@ -24,7 +24,7 @@ class WhenLink : public Stream<_Tp, _CCp, _Ctx> {
                  IRuntimeEnvironment* environment) {
     this->setConfigIdentity(cfg);
     this->serde_ = serde;
-    this->env_ = environment;
+    this->setEnv(environment);
   }
 
  protected:
@@ -307,7 +307,7 @@ class CaseImpl final : public Case<T> {
       : Case<T>(), f_(std::move(f), *this) {
     this->setConfigIdentity(cfg);
     this->serde_ = serde;
-    this->env_ = env;
+    this->setEnv(env);
   }
 
   template <typename... C>

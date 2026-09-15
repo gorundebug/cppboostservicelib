@@ -91,7 +91,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       FlatMap<_TTp, _CCp>::resolveDefaultSerde();
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     template <typename T, typename Ctx = FlatMapImpl>
@@ -104,7 +104,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       FlatMap<_TTp, _CCp>::resolveDefaultSerde();
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     template <typename T, typename F = FlatMapFunction, typename Ctx = FlatMapImpl>

@@ -154,3 +154,27 @@ TEST(OpenTelemetry, ExportsStructuredLogsThroughRealOtlpGrpcCollector) {
 }
 
 }  // namespace
+
+TEST(OpenTelemetry, AttributeIterationBorrowsCachedKeysAndHonorsEarlyStop) {
+  using servicelib::tracing::Attribute;
+  const std::array<Attribute, 2> attributes{{Attribute::String("pipeline", "customerPricing"), Attribute::Int64("priority", 10)}};
+  const auto iterable = servicelib::telemetry::opentelemetry_adapter::detail::ConvertAttributes(
+      std::span<const Attribute>{attributes});
+  EXPECT_EQ(iterable.size(), 2);
+  std::size_t visited = 0;
+  const bool completed = iterable.ForEachKeyValue(
+      [&](opentelemetry::nostd::string_view key, opentelemetry::common::AttributeValue) {
+        EXPECT_EQ(key.data(), attributes[visited].key().data());
+        ++visited;
+        return true;
+      });
+  EXPECT_TRUE(completed);
+  EXPECT_EQ(visited, 2);
+  visited = 0;
+  EXPECT_FALSE(iterable.ForEachKeyValue(
+      [&](opentelemetry::nostd::string_view, opentelemetry::common::AttributeValue) {
+        ++visited;
+        return false;
+      }));
+  EXPECT_EQ(visited, 1);
+}

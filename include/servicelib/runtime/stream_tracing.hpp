@@ -20,6 +20,17 @@
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/environment/tracing/tracing.hpp>
 
+namespace servicelib {
+
+// Immutable definition metadata resolved once by a concrete endpoint consumer.
+struct StreamTraceIdentity {
+  std::string name;
+  std::string pipeline;
+  std::string component;
+};
+
+}  // namespace servicelib
+
 namespace servicelib::tracing {
 
 // Go analog: runtime.ServiceStream.StartSpan. Graph identity is fixed while
@@ -28,23 +39,15 @@ namespace servicelib::tracing {
 [[nodiscard]] inline ActiveSpan StartStreamSpan(
     MessageContext& context, const StreamBase& stream,
     std::string_view operation) {
-  Tracer* tracer = nullptr;
-  std::shared_ptr<Tracer> tracerOwner;
-  auto* const environment = stream.getEnv();
-  if (!environment || !SamplingEnabled(context)) {
+  auto* const tracer = stream.getStreamTracer();
+  if (!tracer || !SamplingEnabled(context)) {
     return {};
   }
-  if (auto* tracingEngine = environment->getTracing()) {
-    tracerOwner = tracingEngine->tracer(environment->getServiceName());
-    tracer = tracerOwner.get();
-  }
-  if (!tracer) {
-    return {};
-  }
-
   return StartSpanInPlace(
       context, tracer, operation,
-      {Attribute::String("stream", stream.getName())});
+      {Attribute::String("stream", stream.getName()),
+       Attribute::String("pipeline", stream.getPipeline()),
+       Attribute::String("component", stream.getComponent())});
 }
 
 }  // namespace servicelib::tracing

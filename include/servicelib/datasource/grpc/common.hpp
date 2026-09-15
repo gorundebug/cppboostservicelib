@@ -1,5 +1,6 @@
 #pragma once
 
+#include <servicelib/runtime/stream_tracing.hpp>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -241,7 +242,7 @@ class Endpoint : public IEndpoint {
            bool hasResult, ErrorOutput errorOutput = {})
       : environment_(environment),
         endpointId_(endpointId),
-        streamName_(resolveStreamName(environment, streamConfigId)),
+        streamIdentity_(resolveStreamIdentity(environment, streamConfigId)),
         endpointName_(endpointConfig().name),
         handler_(std::move(handler)),
         streamContext_(std::move(output), std::move(errorOutput)),
@@ -304,7 +305,9 @@ class Endpoint : public IEndpoint {
     return tracing::StartSpanInPlace(
         context, tracer.get(), "grpc.input",
         {
-            tracing::Attribute::String("stream", streamName_),
+            tracing::Attribute::String("stream", streamIdentity_.name),
+            tracing::Attribute::String("pipeline", streamIdentity_.pipeline),
+            tracing::Attribute::String("component", streamIdentity_.component),
             tracing::Attribute::String("endpoint", endpointName_),
         });
   }
@@ -488,17 +491,18 @@ class Endpoint : public IEndpoint {
   }
 
  private:
-  static std::string resolveStreamName(
+  static StreamTraceIdentity resolveStreamIdentity(
       const IServiceEnvironment& environment, int streamConfigId) {
     const auto runtime = environment.getRuntimeConfigSnapshot();
     if (!runtime || streamConfigId == 0) return {};
     const auto stream = runtime->GetStreamConfigByID(streamConfigId);
-    return stream ? stream->GetName() : std::string{};
+    return stream ? StreamTraceIdentity{stream->GetName(), stream->GetPipeline(), stream->GetComponent()}
+                  : StreamTraceIdentity{};
   }
 
   IServiceEnvironment& environment_;
   int endpointId_;
-  std::string streamName_;
+  StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
 
  protected:

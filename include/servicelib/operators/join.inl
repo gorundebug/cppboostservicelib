@@ -171,7 +171,7 @@ class JoinImpl final : public Join<_TTp, _JTp, _JoinType, _JoinStrategy, _CCp>,
     this->setConfigIdentity(cfg);
     StreamConsumer<_Tp>::serde_ = serde;
     Join<_TTp, _JTp, _JoinType, _JoinStrategy, _CCp>::resolveDefaultSerde();
-    this->env_ = env;
+    this->setEnv(env);
     initializeStorage(cfg, env);
   }
 
@@ -184,7 +184,7 @@ class JoinImpl final : public Join<_TTp, _JTp, _JoinType, _JoinStrategy, _CCp>,
     this->setConfigIdentity(cfg);
     StreamConsumer<_Tp>::serde_ = serde;
     Join<_TTp, _JTp, _JoinType, _JoinStrategy, _CCp>::resolveDefaultSerde();
-    this->env_ = env;
+    this->setEnv(env);
     initializeStorage(cfg, env);
   }
 

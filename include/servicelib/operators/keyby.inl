@@ -101,7 +101,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       (KeyBy<_Kp, _VTp, _CCp>::template resolveDefaultKeyValueSerde<_Kp, _VTp>());
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     template <typename T, typename Ctx = KeyByImpl>
@@ -114,7 +114,7 @@
       this->setConfigIdentity(cfg);
       StreamConsumer<_Tp>::serde_     = serde;
       (KeyBy<_Kp, _VTp, _CCp>::template resolveDefaultKeyValueSerde<_Kp, _VTp>());
-      this->env_                      = env;
+      this->setEnv(env);
     }
 
     template <typename F = KeyByFunction, typename Ctx = KeyByImpl>

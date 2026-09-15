@@ -183,7 +183,7 @@ class DelayImpl final : public Delay<_CCp> {
       : Delay<_CCp>(), f_(std::move(f), *this) {
     this->setConfigIdentity(cfg);
     this->serde_ = serde;
-    this->env_ = env;
+    this->setEnv(env);
   }
 
   template <typename T, typename Ctx = DelayImpl>
@@ -193,7 +193,7 @@ class DelayImpl final : public Delay<_CCp> {
       : Delay<T>(std::move(consumer)), f_(std::move(f), *this) {
     this->setConfigIdentity(cfg);
     this->serde_ = serde;
-    this->env_ = env;
+    this->setEnv(env);
   }
 
   template <typename F = DelayFunction, typename Ctx = DelayImpl>

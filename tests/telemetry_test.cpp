@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <servicelib/runtime/base.hpp>
 #include <servicelib/runtime/caller.hpp>
 #include <servicelib/runtime/datasink.hpp>
 #include <servicelib/runtime/datasource.hpp>
@@ -253,4 +254,113 @@ TEST(TestTelemetry, SinkEndpointRecordsLateResults) {
             1);
   ASSERT_EQ(log.entries().size(), 1);
   EXPECT_EQ(log.entries()[0].level, servicelib::log::Level::kWarn);
+}
+
+// Component grouping is bounded definition metadata, not an execution wrapper.
+namespace {
+class GroupedCaller final : public servicelib::CallerBase {
+ public:
+  using CallerBase::CallerBase;
+  bool isAsync() const noexcept override { return false; }
+  void call(servicelib::MessageContext context, std::string_view type = {}, std::string_view pool = {}) {
+    recordMessage();
+    [[maybe_unused]] auto span = startCallSpan(context, type, pool);
+  }
+};
+class GroupedStream final : public servicelib::StreamBase {
+ public:
+  template<typename Config> explicit GroupedStream(const Config& config) { setConfigIdentity(config); }
+  void copy(const GroupedStream& other) { copySettings(other); }
+ private:
+  size_t buildTopology(servicelib::StreamBuilderContext&, size_t, std::vector<size_t>*, bool) override { return 1; }
+  void verifyTopology(servicelib::StreamVerifyContext&) const override {}
+  void printTopology(servicelib::TopologyPrinter&, std::unordered_set<size_t>&) const override {}
+};
+}  // namespace
+
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+
+TEST(ComponentObservability, AllSinkSpanPathsIncludeCachedDefinitionLabels) {
+  const auto root = std::filesystem::path{__FILE__}.parent_path().parent_path();
+  for (const std::string relative : {"http/beast.hpp", "grpc/common.hpp",
+                                    "kafka/librdkafka.hpp", "localsink/custom.hpp"}) {
+    std::ifstream input{root / "include/servicelib/datasink" / relative};
+    ASSERT_TRUE(input.good()) << relative;
+    const std::string source{std::istreambuf_iterator<char>{input},
+                             std::istreambuf_iterator<char>{}};
+    const auto count = [&](std::string_view needle) {
+      std::size_t found = 0;
+      for (auto position = source.find(needle); position != std::string::npos;
+           position = source.find(needle, position + needle.size())) ++found;
+      return found;
+    };
+    const std::size_t expected = relative == "grpc/common.hpp" ? 2 : 1;
+    EXPECT_EQ(count("tracing::Attribute::String(\"pipeline\", streamIdentity_.pipeline)"), expected) << relative;
+    EXPECT_EQ(count("tracing::Attribute::String(\"component\", streamIdentity_.component)"), expected) << relative;
+    EXPECT_EQ(count("tracing::Attribute::String(\"stream\", streamIdentity_.name)"), expected) << relative;
+    EXPECT_NE(source.find("StreamTraceIdentity streamIdentity_;"), std::string::npos) << relative;
+    EXPECT_NE(source.find("streamIdentity_(resolveStreamIdentity("), std::string::npos) << relative;
+    EXPECT_EQ(source.find("component_instance"), std::string::npos) << relative;
+  }
+}
+
+TEST(ComponentObservability, AllStreamConfigsParseOptionalGroupingAsTypedFields) {
+  const auto parse = [](std::string text) {
+    return servicelib::config::YamlValue(YAML::Load(text));
+  };
+  const auto check = [&]<typename Config>() {
+    const auto empty = parse("id: 1\nname: Stage\n").template As<Config>();
+    EXPECT_TRUE(servicelib::config::StreamConfigRef(empty).GetComponent().empty());
+    const auto config = parse("id: 1\nname: Stage\npipeline: pricing\ncomponent: Customer Pricing\ncustomField: preserved\n").template As<Config>();
+    const servicelib::config::StreamConfigRef ref(config);
+    EXPECT_EQ(ref.GetPipeline(), "pricing"); EXPECT_EQ(ref.GetComponent(), "Customer Pricing");
+    EXPECT_EQ(config.GetProperty("component"), nullptr);
+    EXPECT_NE(config.GetProperty("customField"), nullptr);
+    const GroupedStream stream(config);
+    EXPECT_EQ(stream.getPipeline(), "pricing"); EXPECT_EQ(stream.getComponent(), "Customer Pricing");
+    GroupedStream copy(empty); copy.copy(stream);
+    EXPECT_EQ(copy.getPipeline(), "pricing"); EXPECT_EQ(copy.getComponent(), "Customer Pricing");
+  };
+  check.template operator()<servicelib::config::InputStreamConfig>();
+  check.template operator()<servicelib::config::MapStreamConfig>();
+  check.template operator()<servicelib::config::FilterStreamConfig>();
+  check.template operator()<servicelib::config::JoinStreamConfig>();
+  check.template operator()<servicelib::config::MultiJoinStreamConfig>();
+  check.template operator()<servicelib::config::ProcessStreamConfig>();
+  check.template operator()<servicelib::config::FlatMapStreamConfig>();
+  check.template operator()<servicelib::config::FlatMapIterableStreamConfig>();
+  check.template operator()<servicelib::config::KeyByStreamConfig>();
+  check.template operator()<servicelib::config::MergeStreamConfig>();
+  check.template operator()<servicelib::config::SplitStreamConfig>();
+  check.template operator()<servicelib::config::CaseStreamConfig>();
+  check.template operator()<servicelib::config::WhenStreamConfig>();
+  check.template operator()<servicelib::config::SinkStreamConfig>();
+  check.template operator()<servicelib::config::CycleLinkStreamConfig>();
+  check.template operator()<servicelib::config::DelayStreamConfig>();
+}
+
+TEST(ComponentObservability, CallSpansAndExistingCountersKeepDefinitionLabelsAndSampling) {
+  servicelib::testtracing::TestTracing tracing;
+  servicelib::testmetrics::TestMetrics metrics;
+  const servicelib::metrics::Labels labels{{"service", "Booking"}, {"from", "Request"}, {"to", "Price"}, {"pipeline", "pricing"}, {"component", "Customer Pricing"}};
+  auto scope=metrics.scope("stream", labels);
+  GroupedCaller caller({.sourceName="Request", .consumerName="Price", .pipeline="pricing", .component="Customer Pricing",
+      .tracer=tracing.tracer("Booking"), .messagesCounter=scope->counter("messages_total", "Messages")});
+  caller.call({}); EXPECT_TRUE(tracing.spans().empty());
+  const auto sampled=servicelib::tracing::EnableSampling(servicelib::MessageContext{});
+  caller.call(sampled); caller.call(sampled, "parallel"); caller.call(sampled, "taskpool", "Workers"); caller.call(sampled, "prioritytaskpool", "Priority Workers");
+  EXPECT_EQ(caller.statistics().count(),5);
+  EXPECT_EQ(metrics.counter("stream.messages_total",labels).count(),5);
+  const auto spans=tracing.spans(); ASSERT_EQ(spans.size(),4);
+  for(const auto& span:spans) {
+    EXPECT_EQ(span.name,"stream.call");
+    const auto attribute=[&](const std::string& key) {
+      const auto it=std::find_if(span.attributes.begin(),span.attributes.end(),[&](const auto& value){return value.key()==key;});
+      return it==span.attributes.end()?std::string():std::get<std::string>(it->value());
+    };
+    EXPECT_EQ(attribute("pipeline"),"pricing"); EXPECT_EQ(attribute("component"),"Customer Pricing");
+    EXPECT_EQ(attribute("to"),"Price"); EXPECT_TRUE(attribute("component_instance").empty());
+  }
 }

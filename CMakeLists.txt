@@ -167,6 +167,16 @@ if(CPPBOOSTSERVICELIB_ENABLE_KAFKA)
 endif()
 
 if(CPPBOOSTSERVICELIB_ENABLE_OTEL)
+  foreach(dependency_target IN ITEMS
+      opentelemetry_api opentelemetry_sdk
+      opentelemetry-cpp::api opentelemetry-cpp::sdk
+      ${CPPBOOSTSERVICELIB_OTEL_TRACE_TARGET}
+      ${CPPBOOSTSERVICELIB_OTEL_LOGS_TARGET}
+      ${CPPBOOSTSERVICELIB_OTEL_GRPC_TARGET}
+      ${CPPBOOSTSERVICELIB_OTEL_GRPC_LOG_TARGET}
+      ${CPPBOOSTSERVICELIB_OTEL_OSTREAM_TRACE_TARGET})
+    _servicelib_mark_dependency_includes_system("${dependency_target}")
+  endforeach()
   add_library(cppboostservicelib_otel INTERFACE)
   add_library(servicelib::otel ALIAS cppboostservicelib_otel)
   set_target_properties(cppboostservicelib_otel PROPERTIES EXPORT_NAME otel)
@@ -330,6 +340,10 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
       set(_servicelib_otel_ostream_logs_test_target
           opentelemetry-cpp::ostream_log_record_exporter)
     endif()
+    _servicelib_mark_dependency_includes_system(
+        "${_servicelib_otel_memory_test_target}")
+    _servicelib_mark_dependency_includes_system(
+        "${_servicelib_otel_ostream_logs_test_target}")
     add_executable(cppboostservicelib_opentelemetry_test
         tests/opentelemetry_test.cpp)
     target_link_libraries(cppboostservicelib_opentelemetry_test PRIVATE

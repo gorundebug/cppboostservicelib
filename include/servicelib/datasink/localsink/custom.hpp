@@ -1,5 +1,7 @@
 #pragma once
 
+#include <servicelib/runtime/stream_tracing.hpp>
+
 #include <exception>
 #include <functional>
 #include <optional>
@@ -37,7 +39,7 @@ class Endpoint final : public IEndpoint {
   Endpoint(SinkEndpointStream<T, R, E>& stream, Handler handler)
       : environment_(stream.environment()),
         endpointId_(stream.endpointId()),
-        streamName_(resolveStreamName(
+        streamIdentity_(resolveStreamIdentity(
             environment_, static_cast<int>(stream.streamConfigId()))),
         endpointName_(endpointConfig().name),
         handler_(std::move(handler)),
@@ -100,12 +102,14 @@ class Endpoint final : public IEndpoint {
   }
 
  private:
-  static std::string resolveStreamName(const IServiceEnvironment& environment,
+  static StreamTraceIdentity resolveStreamIdentity(const IServiceEnvironment& environment,
                                        int streamConfigId) {
     const auto runtime = environment.getRuntimeConfigSnapshot();
     if (!runtime || streamConfigId == 0) return {};
     const auto stream = runtime->GetStreamConfigByID(streamConfigId);
-    return stream ? stream->GetName() : std::string{};
+    return stream ? StreamTraceIdentity{stream->GetName(), stream->GetPipeline(),
+                                        stream->GetComponent()}
+                  : StreamTraceIdentity{};
   }
 
   [[nodiscard]] tracing::ActiveSpan startTrace(MessageContext& context) {
@@ -117,7 +121,9 @@ class Endpoint final : public IEndpoint {
     return tracing::StartSpanInPlace(
         context, tracer.get(), "local.output",
         {
-            tracing::Attribute::String("stream", streamName_),
+            tracing::Attribute::String("stream", streamIdentity_.name),
+            tracing::Attribute::String("pipeline", streamIdentity_.pipeline),
+            tracing::Attribute::String("component", streamIdentity_.component),
             tracing::Attribute::String("endpoint", endpointName_),
         });
   }
@@ -147,7 +153,7 @@ class Endpoint final : public IEndpoint {
 
   IServiceEnvironment& environment_;
   int endpointId_;
-  std::string streamName_;
+  StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   Handler handler_;
   StreamContext streamContext_;

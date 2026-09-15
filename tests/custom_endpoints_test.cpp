@@ -5,6 +5,7 @@
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/testlog/testlog.hpp>
 #include <servicelib/runtime/testmetrics/testmetrics.hpp>
+#include <servicelib/runtime/testtracing/testtracing.hpp>
 
 #include "test_sink_endpoint_stream.hpp"
 
@@ -28,6 +29,11 @@ class TestConfig final : public servicelib::config::IConfig {
     customEndpoint.idDataConnector = 2;
     customConnector.id = 2;
     customConnector.name = "custom";
+    sinkStream.id = 101;
+    sinkStream.name = "Publish Booking";
+    sinkStream.pipeline = "booking";
+    sinkStream.component = "Reserve Inventory";
+    sinkStream.idEndpoint = 1;
   }
 
   std::vector<const servicelib::config::ServiceConfig*> GetServices()
@@ -35,7 +41,7 @@ class TestConfig final : public servicelib::config::IConfig {
     return {};
   }
   std::vector<servicelib::config::StreamConfigRef> GetStreams() const override {
-    return {};
+    return {sinkStream};
   }
   std::vector<servicelib::config::DataConnectorConfigRef> GetDataConnectors()
       const override {
@@ -60,6 +66,7 @@ class TestConfig final : public servicelib::config::IConfig {
   }
 
   servicelib::config::CustomEndpointConfig customEndpoint;
+  servicelib::config::SinkStreamConfig sinkStream;
   servicelib::config::CustomDataConnectorConfig customConnector;
 };
 
@@ -77,6 +84,9 @@ class TestEnvironment final : public servicelib::IRuntimeEnvironment {
   }
   std::shared_ptr<const servicelib::config::RuntimeConfig>
   getRuntimeConfigSnapshot() const override {
+    if (forbidRuntimeConfigReads) {
+      throw std::logic_error("sink tracing reread runtime configuration");
+    }
     return std::make_shared<const servicelib::config::RuntimeConfig>(
         runtimeConfig_);
   }
@@ -87,7 +97,9 @@ class TestEnvironment final : public servicelib::IRuntimeEnvironment {
   }
   servicelib::log::Logger& getLogger() override { return log_; }
   servicelib::metrics::Metrics& getMetrics() override { return metrics_; }
-  servicelib::tracing::Tracing* getTracing() override { return nullptr; }
+  servicelib::tracing::Tracing* getTracing() override { return tracingEngine; }
+  servicelib::tracing::Tracing* tracingEngine{};
+  bool forbidRuntimeConfigReads{};
   [[nodiscard]] std::size_t serviceConfigReads() const noexcept {
     return serviceConfigReads_.load(std::memory_order_relaxed);
   }
@@ -408,6 +420,46 @@ TEST(CustomDataSink, UnsampledRequestDoesNotResolveTracingConfiguration) {
                    servicelib::Payload<std::string>::make("value"));
   EXPECT_EQ(environment.serviceConfigReads(), before);
   EXPECT_EQ(observed, "sid:value");
+}
+
+TEST(CustomDataSink, SampledSpansUseCachedTypedGrouping) {
+  servicelib::testtracing::TestTracing tracing;
+  TestEnvironment environment;
+  environment.tracingEngine = &tracing;
+  std::string observed;
+  TestSinkEndpointStream<std::string, int> stream{environment, 1, {}, {}, 101};
+  servicelib::datasink::localsink::Endpoint<std::string, int, CustomSinkHandler>
+      endpoint{stream, CustomSinkHandler{&observed}};
+  environment.forbidRuntimeConfigReads = true;
+  endpoint.consume(servicelib::MessageContext{},
+                   servicelib::Payload<std::string>::make("unsampled"));
+  EXPECT_TRUE(tracing.spans().empty());
+  for (int call = 0; call < 2; ++call) {
+    endpoint.consume(servicelib::MessageContext{}.withSampling(true),
+                     servicelib::Payload<std::string>::make("sampled"));
+  }
+  EXPECT_EQ(observed, "sid:sampled");
+  const auto spans = tracing.spans();
+  ASSERT_EQ(spans.size(), 2);
+  for (const auto& span : spans) {
+    EXPECT_EQ(span.name, "local.output");
+    std::size_t grouping = 0;
+    for (const auto& attribute : span.attributes) {
+      if (attribute.key() == "stream") {
+        EXPECT_EQ(std::get<std::string>(attribute.value()), "Publish Booking");
+      }
+      if (attribute.key() == "pipeline") {
+        EXPECT_EQ(std::get<std::string>(attribute.value()), "booking");
+        ++grouping;
+      }
+      if (attribute.key() == "component") {
+        EXPECT_EQ(std::get<std::string>(attribute.value()), "Reserve Inventory");
+        ++grouping;
+      }
+      EXPECT_NE(attribute.key(), "component_instance");
+    }
+    EXPECT_EQ(grouping, 2);
+  }
 }
 
 struct MultiPushSinkHandler final {

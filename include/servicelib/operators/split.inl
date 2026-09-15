@@ -273,7 +273,7 @@
         : Split<T>() {
       this->setConfigIdentity(cfg);
       this->serde_     = serde;
-      this->env_       = env;
+      this->setEnv(env);
       // Go SplitLink.GetRuntimeEnvironment delegates to its parent Split.
       // C++ links are independent StreamBase nodes, so propagate the same
       // environment explicitly. Operators created from a branch then keep

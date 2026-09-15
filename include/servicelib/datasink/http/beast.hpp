@@ -6,6 +6,8 @@
  */
 #pragma once
 
+#include <servicelib/runtime/stream_tracing.hpp>
+
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -197,7 +199,7 @@ class BeastEndpoint final : public IEndpoint {
                 Handler handler)
       : environment_(stream.environment()),
         endpointId_(stream.endpointId()),
-        streamName_(resolveStreamName(environment_, stream.streamConfigId())),
+        streamIdentity_(resolveStreamIdentity(environment_, stream.streamConfigId())),
         endpointName_(endpointConfig(environment_, endpointId_).name),
         serviceName_(resolveServiceName(environment_)),
         executor_(detail::ParallelExecutorRegistry::Get()),
@@ -321,7 +323,9 @@ class BeastEndpoint final : public IEndpoint {
     if (!tracer) return {};
     return tracing::StartSpanInPlace(
         context, tracer.get(), "http.output",
-        {tracing::Attribute::String("stream", streamName_),
+        {tracing::Attribute::String("stream", streamIdentity_.name),
+            tracing::Attribute::String("pipeline", streamIdentity_.pipeline),
+            tracing::Attribute::String("component", streamIdentity_.component),
          tracing::Attribute::String("endpoint", endpointName_)});
   }
 
@@ -333,13 +337,15 @@ class BeastEndpoint final : public IEndpoint {
                        {tracing::Attribute::String("error", message)});
   }
 
-  [[nodiscard]] static std::string resolveStreamName(
+  [[nodiscard]] static StreamTraceIdentity resolveStreamIdentity(
       const IServiceEnvironment& environment, std::size_t streamConfigId) {
     const auto runtime = environment.getRuntimeConfigSnapshot();
     if (!runtime || streamConfigId == 0) return {};
     const auto stream = runtime->GetStreamConfigByID(
         static_cast<int>(streamConfigId));
-    return stream ? stream->GetName() : std::string{};
+    return stream ? StreamTraceIdentity{stream->GetName(), stream->GetPipeline(),
+                                        stream->GetComponent()}
+                  : StreamTraceIdentity{};
   }
 
   [[nodiscard]] static std::string resolveServiceName(
@@ -383,7 +389,7 @@ class BeastEndpoint final : public IEndpoint {
 
   IServiceEnvironment& environment_;
   int endpointId_;
-  std::string streamName_;
+  StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   std::string serviceName_;
   boost::asio::any_io_executor executor_;

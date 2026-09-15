@@ -84,12 +84,16 @@ class TestConfig final : public servicelib::config::IConfig {
     endpoint.idDataConnector = connector.id;
     endpoint.httpMethodType = servicelib::api::HTTPMethodType::kPOST;
     endpoint.path = "/orders";
+    stream.id = 33;
+    stream.name = "Receive Booking";
+    stream.pipeline = "booking";
+    stream.component = "Prepare Reservation";
   }
 
   std::vector<const servicelib::config::ServiceConfig*> GetServices()
       const override { return {}; }
   std::vector<servicelib::config::StreamConfigRef> GetStreams() const override {
-    return {};
+    return {stream};
   }
   std::vector<servicelib::config::DataConnectorConfigRef> GetDataConnectors()
       const override { return {connector}; }
@@ -109,6 +113,7 @@ class TestConfig final : public servicelib::config::IConfig {
 
   servicelib::config::HttpDataConnectorConfig connector;
   servicelib::config::HttpEndpointConfig endpoint;
+  servicelib::config::InputStreamConfig stream;
 };
 
 class TestEnvironment final : public servicelib::IRuntimeEnvironment {
@@ -189,7 +194,7 @@ TEST(HttpDataSource, PreservesCanonicalHandlerAndCorrelationContract) {
       std::string, std::string, Handler>;
   Endpoint* endpointPointer{};
   Endpoint endpoint{
-      environment, 1, Handler{},
+      environment, 1, 33, Handler{},
       [&](servicelib::MessageContext context,
           servicelib::Payload<std::string> value) {
         endpointPointer->consumeResult(
@@ -240,6 +245,16 @@ TEST(HttpDataSource, PreservesCanonicalHandlerAndCorrelationContract) {
   const auto spans = tracing.spans();
   ASSERT_EQ(spans.size(), 1);
   EXPECT_EQ(spans.front().name, "http.input");
+  const auto expectAttribute = [&](const std::string& key, const std::string& value) {
+    const auto& attributes = spans.front().attributes;
+    const auto found = std::find_if(attributes.begin(), attributes.end(),
+        [&](const auto& attribute) { return attribute.key() == key; });
+    ASSERT_NE(found, attributes.end());
+    EXPECT_EQ(std::get<std::string>(found->value()), value);
+  };
+  expectAttribute("stream", "Receive Booking");
+  expectAttribute("pipeline", "booking");
+  expectAttribute("component", "Prepare Reservation");
   EXPECT_EQ(spans.front().statusCode,
             servicelib::tracing::StatusCode::kUnset);
   EXPECT_TRUE(std::any_of(

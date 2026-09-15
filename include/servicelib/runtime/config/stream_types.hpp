@@ -24,6 +24,7 @@ struct InputStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   std::vector<int> idSources;
@@ -45,6 +46,7 @@ struct MapStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -70,6 +72,7 @@ struct FilterStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -94,6 +97,7 @@ struct JoinStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   std::vector<int> idSources;
@@ -124,6 +128,7 @@ struct MultiJoinStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   std::vector<int> idSources;
@@ -153,6 +158,7 @@ struct ProcessStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -178,6 +184,7 @@ struct FlatMapStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -203,6 +210,7 @@ struct FlatMapIterableStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -222,6 +230,7 @@ struct KeyByStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -248,6 +257,7 @@ struct MergeStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   std::vector<int> idSources;
   double xPos{};
@@ -266,6 +276,7 @@ struct SplitStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -284,6 +295,7 @@ struct CaseStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -308,6 +320,7 @@ struct WhenStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -327,6 +340,7 @@ struct SinkStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -347,6 +361,7 @@ struct CycleLinkStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -365,6 +380,7 @@ struct DelayStreamConfig {
   int id{};
   std::string name;
   std::string pipeline;
+  std::string component;
   int idService{};
   int idSource{};
   double xPos{};
@@ -450,6 +466,10 @@ class StreamConfigRef {
         [](const auto& c) -> const std::string& { return c.pipeline; });
   }
 
+  const std::string& GetComponent() const {
+    return Visit([](const auto& c) -> const std::string& { return c.component; });
+  }
+
   servicelib::api::TransformationType GetType() const {
     return Visit([](const auto& c) { return c.GetType(); });
   }
@@ -506,6 +526,7 @@ inline InputStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.idSources =
@@ -516,7 +537,7 @@ inline InputStreamConfig Parse(const YamlValue& value,
   result.idEndpoint = value["idEndpoint"].As<int>(0);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "idSources", "xPos", "yPos",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "idSources", "xPos", "yPos",
        "valueType", "idEndpoint"},
       result.properties);
   return result;
@@ -528,6 +549,7 @@ inline MapStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -536,7 +558,7 @@ inline MapStreamConfig Parse(const YamlValue& value,
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "valueType",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "valueType",
        "functionPackage", "functionName", "publicFunction", "functionDescription",
        "functionInitializerGroup", "functionModule"},
       result.properties);
@@ -550,6 +572,7 @@ inline FilterStreamConfig Parse(
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -557,7 +580,7 @@ inline FilterStreamConfig Parse(
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "functionPackage",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "functionPackage",
        "functionName", "publicFunction", "functionDescription", "functionInitializerGroup",
        "functionModule"},
       result.properties);
@@ -570,6 +593,7 @@ inline JoinStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.idSources =
@@ -586,7 +610,7 @@ inline JoinStreamConfig Parse(const YamlValue& value,
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "idSources", "xPos", "yPos",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "idSources", "xPos", "yPos",
        "valueType", "joinType", "joinStorage", "ttl", "renewTTL", "functionPackage",
        "functionName", "publicFunction", "functionDescription", "functionInitializerGroup",
        "functionModule"},
@@ -601,6 +625,7 @@ inline MultiJoinStreamConfig Parse(
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.idSources =
@@ -615,7 +640,7 @@ inline MultiJoinStreamConfig Parse(
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "idSources", "xPos", "yPos",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "idSources", "xPos", "yPos",
        "valueType", "joinStorage", "ttl", "renewTTL", "functionPackage", "functionName",
        "publicFunction", "functionDescription", "functionInitializerGroup", "functionModule"},
       result.properties);
@@ -629,6 +654,7 @@ inline ProcessStreamConfig Parse(
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -638,7 +664,7 @@ inline ProcessStreamConfig Parse(
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "pattern",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "pattern",
        "functionPackage", "functionName", "publicFunction", "functionDescription",
        "functionInitializerGroup", "functionModule"},
       result.properties);
@@ -652,6 +678,7 @@ inline FlatMapStreamConfig Parse(
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -660,7 +687,7 @@ inline FlatMapStreamConfig Parse(
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "valueType",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "valueType",
        "functionPackage", "functionName", "publicFunction", "functionDescription",
        "functionInitializerGroup", "functionModule"},
       result.properties);
@@ -674,13 +701,14 @@ inline FlatMapIterableStreamConfig Parse(
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
   result.yPos = value["yPos"].As<double>(0.0);
   result.valueType = value["valueType"].As<std::string>("");
   detail::ParseRemainingProperties(
-      value, {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "valueType"},
+      value, {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "valueType"},
       result.properties);
   return result;
 }
@@ -691,6 +719,7 @@ inline KeyByStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -700,7 +729,7 @@ inline KeyByStreamConfig Parse(const YamlValue& value,
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "keyType",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "keyType",
        "valueType", "functionPackage", "functionName", "publicFunction",
        "functionDescription", "functionInitializerGroup", "functionModule"},
       result.properties);
@@ -713,13 +742,14 @@ inline MergeStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSources =
       value["idSources"].As<std::vector<int>>(std::vector<int>{});
   result.xPos = value["xPos"].As<double>(0.0);
   result.yPos = value["yPos"].As<double>(0.0);
   detail::ParseRemainingProperties(
-      value, {"id", "name", "pipeline", "idService", "idSources", "xPos", "yPos"},
+      value, {"id", "name", "pipeline", "component", "idService", "idSources", "xPos", "yPos"},
       result.properties);
   return result;
 }
@@ -730,12 +760,13 @@ inline SplitStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
   result.yPos = value["yPos"].As<double>(0.0);
   detail::ParseRemainingProperties(
-      value, {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos"},
+      value, {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos"},
       result.properties);
   return result;
 }
@@ -746,6 +777,7 @@ inline CaseStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -753,7 +785,7 @@ inline CaseStreamConfig Parse(const YamlValue& value,
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "functionPackage",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "functionPackage",
        "functionName", "publicFunction", "functionDescription", "functionInitializerGroup",
        "functionModule"},
       result.properties);
@@ -766,13 +798,14 @@ inline WhenStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
   result.yPos = value["yPos"].As<double>(0.0);
   result.valueType = value["valueType"].As<std::string>("");
   detail::ParseRemainingProperties(
-      value, {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "valueType"},
+      value, {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "valueType"},
       result.properties);
   return result;
 }
@@ -783,6 +816,7 @@ inline SinkStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -791,7 +825,7 @@ inline SinkStreamConfig Parse(const YamlValue& value,
   result.valueType = value["valueType"].As<std::string>("");
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "idEndpoint",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "idEndpoint",
        "valueType"},
       result.properties);
   return result;
@@ -804,12 +838,13 @@ inline CycleLinkStreamConfig Parse(
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
   result.yPos = value["yPos"].As<double>(0.0);
   detail::ParseRemainingProperties(
-      value, {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos"},
+      value, {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos"},
       result.properties);
   return result;
 }
@@ -820,6 +855,7 @@ inline DelayStreamConfig Parse(const YamlValue& value,
   result.id = value["id"].As<int>(0);
   result.name = value["name"].As<std::string>("");
   result.pipeline = value["pipeline"].As<std::string>("");
+  result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
   result.xPos = value["xPos"].As<double>(0.0);
@@ -828,7 +864,7 @@ inline DelayStreamConfig Parse(const YamlValue& value,
   detail::ParseFunctionFields(value, result);
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "idService", "idSource", "xPos", "yPos", "duration",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos", "duration",
        "functionPackage", "functionName", "publicFunction", "functionDescription",
        "functionInitializerGroup", "functionModule"},
       result.properties);

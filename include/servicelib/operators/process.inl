@@ -153,7 +153,7 @@ class ProcessImpl final : public Process<_TTp, _ETp, _CCp>,
     this->setConfigIdentity(cfg);
     StreamConsumer<_Tp>::serde_ = serde;
     Process<_TTp, _ETp, _CCp>::resolveDefaultSerde();
-    this->env_ = env;
+    this->setEnv(env);
     errorStream_.configure(static_cast<size_t>(cfg.id), cfg.name + "Error", env);
   }
 
@@ -165,7 +165,7 @@ class ProcessImpl final : public Process<_TTp, _ETp, _CCp>,
     this->setConfigIdentity(cfg);
     StreamConsumer<_Tp>::serde_ = serde;
     Process<_TTp, _ETp, _CCp>::resolveDefaultSerde();
-    this->env_ = env;
+    this->setEnv(env);
     errorStream_.configure(static_cast<size_t>(cfg.id), cfg.name + "Error", env);
   }
 
