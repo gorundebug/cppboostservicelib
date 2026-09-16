@@ -283,7 +283,7 @@ class GroupedStream final : public servicelib::StreamBase {
 #include <iterator>
 
 TEST(ComponentObservability, AllSinkSpanPathsIncludeCachedDefinitionLabels) {
-  const auto root = std::filesystem::path{__FILE__}.parent_path().parent_path();
+  const auto root = std::filesystem::path{SERVICELIB_TEST_SOURCE_DIR};
   for (const std::string relative : {"http/beast.hpp", "grpc/common.hpp",
                                     "kafka/librdkafka.hpp", "localsink/custom.hpp"}) {
     std::ifstream input{root / "include/servicelib/datasink" / relative};

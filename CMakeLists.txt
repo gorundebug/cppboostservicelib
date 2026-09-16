@@ -310,6 +310,8 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
   add_executable(cppboostservicelib_telemetry_test tests/telemetry_test.cpp)
   target_link_libraries(cppboostservicelib_telemetry_test PRIVATE
       servicelib::servicelib GTest::gtest_main)
+  target_compile_definitions(cppboostservicelib_telemetry_test PRIVATE
+      SERVICELIB_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME cppboostservicelib_telemetry_test
       COMMAND cppboostservicelib_telemetry_test)
 
