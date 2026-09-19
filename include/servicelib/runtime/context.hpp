@@ -26,7 +26,32 @@
 
 namespace servicelib {
 
+namespace detail {
+struct ContextKeyIdentity final {};
+struct LocalContextValue {
+  std::shared_ptr<const ContextKeyIdentity> key;
+  std::shared_ptr<const LocalContextValue> parent;
+  virtual ~LocalContextValue() = default;
+};
+template <typename T>
+struct TypedLocalContextValue final : LocalContextValue {
+  std::shared_ptr<T> value;
+};
+}  // namespace detail
+
+// Identity and value type travel together; values never enter wire metadata.
+template <typename T>
+class ContextKey final {
+  friend class MessageContext;
+  std::shared_ptr<const detail::ContextKeyIdentity> identity_{
+      std::make_shared<const detail::ContextKeyIdentity>()};
+};
+
 class AsyncCompletionState;
+
+// A service-local invocation owns an independent synchronous dispatch queue.
+// This identity is never a message/transport ID and is not serialized.
+struct LocalExecutionScope {};
 
 // A retained logical call-frame. Asynchronous transport adapters keep one
 // token until their operation has really completed; synchronous consumers do
@@ -245,11 +270,45 @@ struct ContextState final : ContextStateBase {
   bool hasPriority{};
   tracing::SpanContext trace;
   std::shared_ptr<AsyncCompletionState> completion;
+  std::shared_ptr<const detail::LocalContextValue> localValues;
+  std::shared_ptr<const LocalExecutionScope> executionScope;
 };
 
 class MessageContext final : public Context {
  public:
   MessageContext() : Context(std::make_shared<ContextState>()) {}
+
+  [[nodiscard]] const std::shared_ptr<const LocalExecutionScope>& executionScope() const noexcept {
+    return derived()->executionScope;
+  }
+  [[nodiscard]] MessageContext withExecutionScope(
+      std::shared_ptr<const LocalExecutionScope> scope) && {
+    auto state = takeOrCloneDerived();
+    state->executionScope = std::move(scope);
+    return MessageContext(std::move(state));
+  }
+
+  template <typename T>
+  [[nodiscard]] MessageContext withLocalValue(
+      const ContextKey<T>& key, std::shared_ptr<T> value) const {
+    auto binding = std::make_shared<detail::TypedLocalContextValue<T>>();
+    binding->key = key.identity_;
+    binding->parent = derived()->localValues;
+    binding->value = std::move(value);
+    auto state = cloneDerived();
+    state->localValues = std::move(binding);
+    return MessageContext(std::move(state));
+  }
+
+  template <typename T>
+  [[nodiscard]] std::shared_ptr<T> localValue(const ContextKey<T>& key) const {
+    for (auto binding = derived()->localValues; binding; binding = binding->parent) {
+      if (binding->key == key.identity_) {
+        return static_cast<const detail::TypedLocalContextValue<T>&>(*binding).value;
+      }
+    }
+    return {};
+  }
 
   [[nodiscard]] std::string_view streamId() const noexcept {
     return derived()->streamId;

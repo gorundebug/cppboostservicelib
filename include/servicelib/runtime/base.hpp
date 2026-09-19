@@ -98,6 +98,8 @@ class StreamBase : public NotCopyableOrMovable {
   friend class Stream;
   template <typename, typename, typename, typename>
   friend class InputStream;
+  template <typename, typename, typename>
+  friend class SubStream;
   template <typename, typename>
   friend class CycleLinkStream;
 
@@ -205,6 +207,8 @@ class StreamVerifyContext final : public NotCopyableOrMovable {
   friend class Stream;
   template <typename, typename, typename, typename>
   friend class InputStream;
+  template <typename, typename, typename>
+  friend class SubStream;
   template <typename, typename>
   friend class CycleLinkStream;
 
@@ -252,6 +256,8 @@ class StreamBuilderContext final : public NotCopyableOrMovable {
   friend class Stream;
   template <typename, typename, typename, typename>
   friend class InputStream;
+  template <typename, typename, typename>
+  friend class SubStream;
   template <typename, typename>
   friend class CycleLinkStream;
 

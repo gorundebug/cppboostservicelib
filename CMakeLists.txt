@@ -270,6 +270,11 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
 
   add_executable(cppboostservicelib_operators_test
       tests/operators_compile_test.cpp)
+  add_executable(cppboostservicelib_substream_test tests/substream_test.cpp)
+  target_link_libraries(cppboostservicelib_substream_test PRIVATE
+      servicelib::servicelib GTest::gtest_main)
+  add_test(NAME cppboostservicelib_substream_test
+      COMMAND cppboostservicelib_substream_test)
   target_link_libraries(cppboostservicelib_operators_test PRIVATE
       servicelib::servicelib GTest::gtest_main)
   add_test(NAME cppboostservicelib_operators_test

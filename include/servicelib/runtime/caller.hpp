@@ -178,6 +178,17 @@ class Caller : public CallerBase {
 // ──────────────────────────────────────────────────────────────
 template <typename T>
 class DirectCaller final : public Caller<T> {
+  struct OrderingKey {
+    std::string streamId;
+    std::shared_ptr<const LocalExecutionScope> scope;
+    bool operator==(const OrderingKey&) const = default;
+  };
+  struct OrderingHash {
+    std::size_t operator()(const OrderingKey& key) const noexcept {
+      return std::hash<std::string>{}(key.streamId) ^
+             std::hash<const LocalExecutionScope*>{}(key.scope.get());
+    }
+  };
  public:
   DirectCaller(StreamConsumer<T>& consumer, CallerBase::Params params,
                bool async = false)
@@ -185,7 +196,7 @@ class DirectCaller final : public Caller<T> {
 
   void consume(MessageContext ctx, Payload<T> payload) override {
     this->recordMessage();
-    const std::string streamId{ctx.streamId()};
+    const OrderingKey streamId{std::string{ctx.streamId()}, ctx.executionScope()};
     auto job = std::make_shared<Job>(
         Job{std::move(ctx), std::move(payload)});
     bool start = false;
@@ -206,7 +217,7 @@ class DirectCaller final : public Caller<T> {
     Payload<T> payload;
   };
 
-  void dispatch(const std::string& streamId, std::shared_ptr<Job> job) {
+  void dispatch(const OrderingKey& streamId, std::shared_ptr<Job> job) {
     std::shared_ptr<tracing::ActiveSpan> activeSpan;
     if (this->samplingEnabled(job->context)) {
       activeSpan = std::make_shared<tracing::ActiveSpan>(
@@ -243,7 +254,7 @@ class DirectCaller final : public Caller<T> {
   StreamConsumer<T>& consumer_;
   bool async_{};
   std::mutex mutex_;
-  std::unordered_map<std::string, std::deque<std::shared_ptr<Job>>> pending_;
+  std::unordered_map<OrderingKey, std::deque<std::shared_ptr<Job>>, OrderingHash> pending_;
 };
 
 // ──────────────────────────────────────────────────────────────

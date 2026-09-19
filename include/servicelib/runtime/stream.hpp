@@ -33,6 +33,8 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
   friend class Stream;
   template <typename, typename, typename, typename>
   friend class InputStream;
+  template <typename, typename, typename>
+  friend class SubStream;
   template <typename, typename>
   friend class CycleLinkStream;
   template <typename>

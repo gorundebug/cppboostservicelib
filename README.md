@@ -66,3 +66,40 @@ runtime. The defaults can be overridden explicitly:
   --values ./config/overrides.yaml \
   --workers 2
 ```
+## Service-local SubStream
+
+`servicelib::ISubStream<T, R>` makes an existing service-local graph callable
+from business code. Generated typed accessors such as `getLookupSubStream()`
+can be injected through custom makers. Generated weak handles avoid ownership
+cycles; keep the service alive and do not invoke a handle before graph binding.
+
+```cpp
+auto collector = std::make_shared<servicelib::SubStreamCollectorFunc<std::string>>(
+    [](servicelib::MessageContext caller, const std::string& result) {
+      // Store or process result for this invocation.
+      return true;  // false continues collecting
+    });
+lookup->consume(context, payload, collector);
+```
+
+`lookup` is an injected `ISubStream<T, std::string>` handle and `payload` is
+`servicelib::Payload<T>`. Interfaces and the function adapter are declared in
+`servicelib/runtime/common.hpp`. Use the runtime's context and cancellation
+conventions; never block all execution capacity needed by the substream.
+
+The graph is constructed once. Per-call context state isolates concurrent and
+nested invocations, and the collector receives the original caller context.
+Callbacks within one call are serialized. Preserve context through business
+emissions; no extra message ID parameter is necessary.
+
+The entry `valueType` is its argument type. The existing `source` names its
+reachable result producer and supplies R. There must be one body consumer;
+ordinary Split can branch inside it. No separate ResultStream, error port or
+transport endpoint is introduced.
+
+True completes collection; late results are ignored, not all graph work stopped.
+Use a deadline/cancellation when no completing result is guaranteed. An active
+collector is drained on cancellation and must cooperate. Business failures remain
+result values or graph error paths; runtime failures use exception conventions.
+Shared Join state, keys and pools keep their existing behavior. Temporal is not
+supported by C++/Boost.

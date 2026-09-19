@@ -60,6 +60,8 @@ inline std::string_view TransformationName(
   switch (type) {
     case api::TransformationType::kInput:
       return "INPUT";
+    case api::TransformationType::kSubStream:
+      return "SUBSTREAM";
     case api::TransformationType::kMap:
       return "MAP";
     case api::TransformationType::kFilter:
@@ -253,6 +255,7 @@ inline std::string_view IconPath(api::TransformationType type) noexcept {
     case api::TransformationType::kMultiJoin:
       return kCallMerge;
     case api::TransformationType::kProcess:
+    case api::TransformationType::kSubStream:
       return kFunction;
     case api::TransformationType::kFlatMap:
     case api::TransformationType::kFlatMapIterable:

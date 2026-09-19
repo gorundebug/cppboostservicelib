@@ -57,6 +57,7 @@ struct equal_to<std::vector<std::byte>> {
 #include <servicelib/runtime/environment.hpp>
 #include <servicelib/runtime/app.hpp>
 #include <servicelib/operators/input.inl>
+#include <servicelib/operators/substream.inl>
 #include <servicelib/operators/cyclelink.inl>
 
 #endif /* STREAMS_STREAMS_H */

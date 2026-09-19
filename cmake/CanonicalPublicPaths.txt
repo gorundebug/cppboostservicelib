@@ -42,6 +42,7 @@ operators/process.inl
 operators/sink.inl
 operators/split.inl
 operators/streamlink.inl
+operators/substream.inl
 runtime/app.hpp
 runtime/base.hpp
 runtime/caller.hpp

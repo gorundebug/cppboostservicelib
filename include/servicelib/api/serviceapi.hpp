@@ -45,6 +45,7 @@ enum class TransformationType {
   kError = 15,  // Error
   kDelay = 16,  // Delay
   kWhen = 17,  // When
+  kSubStream = 18,  // SubStream
 };
 
 enum class JoinType {

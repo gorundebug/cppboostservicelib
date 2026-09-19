@@ -71,7 +71,8 @@ inline constexpr std::array kTransformationTypeMap{
     std::pair{"CycleLink"sv, TransformationType::kCycleLink},
     std::pair{"Error"sv, TransformationType::kError},
     std::pair{"Delay"sv, TransformationType::kDelay},
-    std::pair{"When"sv, TransformationType::kWhen}};
+    std::pair{"When"sv, TransformationType::kWhen},
+    std::pair{"SubStream"sv, TransformationType::kSubStream}};
 
 inline TransformationType Parse(const config::YamlValue& value,
                          config::TypeTag<TransformationType>) {
