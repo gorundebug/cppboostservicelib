@@ -117,15 +117,15 @@ class ConfigLoader final {
 
   std::shared_ptr<const ConcreteConfig> GetConfig() const {
     const auto loaded = CurrentLoaded();
-    return std::shared_ptr<const ConcreteConfig>(loaded, &loaded->config);
+    return std::shared_ptr<const ConcreteConfig>(loaded, loaded->config.get());
   }
 
  private:
   struct LoadedConfig final {
-    explicit LoadedConfig(ConcreteConfig value)
-        : config(std::move(value)), runtimeConfig(config) {}
+    explicit LoadedConfig(std::unique_ptr<ConcreteConfig> value)
+        : config(std::move(value)), runtimeConfig(*config) {}
 
-    ConcreteConfig config;
+    std::unique_ptr<ConcreteConfig> config;
     RuntimeConfig runtimeConfig;
   };
 
@@ -163,7 +163,10 @@ class ConfigLoader final {
 
   Candidate BuildCandidate() const {
     auto fingerprint = ReadFingerprint();
-    auto config = ConfigAdapter::Make();
+    // Direct initialization keeps the factory result off the caller's stack;
+    // make_unique would first materialize it as a large temporary argument.
+    auto config = std::unique_ptr<ConcreteConfig>(
+        new ConcreteConfig(ConfigAdapter::Make()));
     auto merged = ParseYaml(fingerprint.config, paths_.configPath);
     if (paths_.overridePath && !paths_.overridePath->empty()) {
       merged = DeepMerge(
@@ -174,8 +177,8 @@ class ConfigLoader final {
         {.variables = {},
          .baseDirectory = std::filesystem::path(paths_.configPath).parent_path(),
          .environment = {}});
-    ConfigAdapter::Apply(YamlValue(std::move(merged)), config);
-    ConfigAdapter::Finalize(config);
+    ConfigAdapter::Apply(YamlValue(std::move(merged)), *config);
+    ConfigAdapter::Finalize(*config);
     return {std::make_shared<const LoadedConfig>(std::move(config)),
             std::move(fingerprint)};
   }

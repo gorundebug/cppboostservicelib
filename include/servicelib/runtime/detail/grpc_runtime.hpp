@@ -4,10 +4,10 @@
 
 #include <agrpc/grpc_context.hpp>
 #include <agrpc/grpc_executor.hpp>
-#include <agrpc/run.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
@@ -31,27 +31,6 @@
 namespace servicelib::async {
 
 namespace runtime_detail {
-
-struct CooperativeGrpcRunTraits final {
-  static constexpr std::chrono::microseconds MAX_LATENCY{50};
-
-  static bool poll(boost::asio::io_context& context) {
-    constexpr std::size_t kBatchSize = 8;
-    std::size_t processed{};
-    while (processed < kBatchSize && context.poll_one() != 0) ++processed;
-    return processed != 0;
-  }
-
-  template <typename Rep, typename Period>
-  static bool run_for(boost::asio::io_context& context,
-                      std::chrono::duration<Rep, Period> duration) {
-    return context.run_one_for(duration) != 0;
-  }
-
-  static bool is_stopped(boost::asio::io_context& context) {
-    return context.stopped();
-  }
-};
 
 class RuntimeIoContext : public boost::asio::io_context {
  public:
@@ -81,11 +60,12 @@ inline void ConfigureGrpcRuntimeDefaults() noexcept {
 #endif
 }
 
-// Runs Asio continuations and raw gRPC CompletionQueue events on one fixed-width
-// worker set. Bounded Asio batches prevent a continuously-ready graph from
-// starving the CompletionQueue while allowing every worker to execute either
-// kind of work. All gRPC coroutine completion tokens are associated with the
-// shared Asio executor; no request-path wait may block a worker.
+// Business continuations run on the fixed-width Asio worker set. One transport
+// thread blocks on the gRPC CompletionQueue and dispatches completions to their
+// associated executors. Each event loop can therefore sleep until work arrives,
+// without polling the other queue or adding latency to Asio timers and posts.
+// All generated gRPC handlers use the shared Asio executor, not the transport
+// thread; the configured business-worker concurrency remains unchanged.
 class GrpcRuntime final {
  public:
   enum class State { kCreated, kRunning, kStopping, kStopped };
@@ -103,8 +83,8 @@ class GrpcRuntime final {
       : options_(Validate(std::move(options))),
         grpcContext_(serverQueue
                          ? std::make_unique<agrpc::GrpcContext>(
-                               std::move(serverQueue), options_.workers)
-                         : std::make_unique<agrpc::GrpcContext>(options_.workers)),
+                               std::move(serverQueue), 1)
+                         : std::make_unique<agrpc::GrpcContext>(1)),
         ioContext_(static_cast<int>(options_.workers)),
         grpcWork_(boost::asio::make_work_guard(*grpcContext_)),
         ioWork_(boost::asio::make_work_guard(ioContext_)),
@@ -133,6 +113,7 @@ class GrpcRuntime final {
       blockingPool_ = std::make_unique<boost::asio::thread_pool>(
           BlockingWorkers(options_.workers));
       detail::BlockingExecutorRegistry::Set(blockingPool_->get_executor());
+      grpcWorker_ = std::thread([this] { RunGrpc(); });
       workers_.reserve(options_.workers);
       for (std::size_t index = 0; index < options_.workers; ++index)
         workers_.emplace_back([this, index] { RunWorker(index); });
@@ -165,12 +146,11 @@ class GrpcRuntime final {
             signalSet_->cancel(ignored);
           }
         }
-        // run_completion_queue observes state_ as its stop predicate. Do not
-        // stop GrpcContext while its worker thread contexts are unwinding:
-        // asio-grpc may wake the shared grpc::Alarm from every worker exit,
-        // which races with a concurrent GrpcContext::stop(). The workers poll
-        // with a bounded latency, so joining them first is both prompt and the
-        // native asio-grpc shutdown order.
+        // Queue the stop on the transport executor. GrpcContext::run() resets
+        // its stopped flag on entry, so a direct stop before that entry could
+        // be lost. A queued stop also wakes an idle CQ without periodic polls.
+        boost::asio::post(grpcContext_->get_executor(),
+                          [this] { grpcContext_->stop(); });
         ioContext_.stop();
         return;
       }
@@ -185,8 +165,8 @@ class GrpcRuntime final {
     for (auto& worker : workers_)
       if (worker.joinable()) worker.join();
     workers_.clear();
-    // With every GrpcContext worker gone, releasing the final work guard may
-    // stop and wake the completion queue without a competing Alarm::Set.
+    if (grpcWorker_.joinable()) grpcWorker_.join();
+    // No completion-queue runner remains when releasing its work guard.
     grpcWork_.reset();
     if (state_.load() == State::kStopping) state_.store(State::kStopped);
     if (blockingPool_) {
@@ -290,11 +270,15 @@ class GrpcRuntime final {
   }
   void RunWorker(std::size_t) noexcept {
     try {
-      const auto stopCondition = [this] {
-        return state_.load(std::memory_order_acquire) != State::kRunning;
-      };
-      agrpc::run_completion_queue<runtime_detail::CooperativeGrpcRunTraits>(
-          *grpcContext_, ioContext_, stopCondition);
+      ioContext_.run();
+    } catch (...) {
+      Report(std::current_exception());
+      Stop();
+    }
+  }
+  void RunGrpc() noexcept {
+    try {
+      grpcContext_->run();
     } catch (...) {
       Report(std::current_exception());
       Stop();
@@ -340,6 +324,7 @@ class GrpcRuntime final {
   std::mutex signalMutex_;
   std::unique_ptr<boost::asio::signal_set> signalSet_;
   std::vector<std::thread> workers_;
+  std::thread grpcWorker_;
   std::unique_ptr<boost::asio::thread_pool> blockingPool_;
 };
 

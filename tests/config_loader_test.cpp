@@ -3,6 +3,7 @@
 #include <servicelib/runtime/testmetrics/testmetrics.hpp>
 
 #include <cassert>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -12,7 +13,7 @@
 
 namespace {
 
-struct TestConfig final : servicelib::config::IConfig {
+struct TestConfig : servicelib::config::IConfig {
   std::string serviceName{"default"};
   int port{8080};
   int executors{2};
@@ -91,6 +92,39 @@ void ApplyEnvironment(TestConfig& config) {
   if (config.executors <= 0) {
     throw std::invalid_argument("executorsCount must be positive");
   }
+}
+
+struct LargeConfig final : TestConfig {
+  LargeConfig() {
+    pool.name = "large-pool";
+    pool.executorsCount = executors;
+  }
+
+  LargeConfig(LargeConfig&& other)
+      : TestConfig(std::move(other)), pool(std::move(other.pool)),
+        payload(std::move(other.payload)) {
+    moves.fetch_add(1);
+  }
+
+  std::vector<const servicelib::config::PoolConfig*> GetPools()
+      const override { return {&pool}; }
+
+  inline static std::atomic<int> moves{0};
+  servicelib::config::PoolConfig pool;
+  std::array<char, 2 * 1024 * 1024> payload{};
+};
+
+LargeConfig MakeConfig(servicelib::config::TypeTag<LargeConfig>) {
+  return LargeConfig{};
+}
+
+void ApplyConfig(const YAML::Node& value, LargeConfig& config) {
+  ApplyConfig(value, static_cast<TestConfig&>(config));
+}
+
+void ApplyEnvironment(LargeConfig& config) {
+  ApplyEnvironment(static_cast<TestConfig&>(config));
+  config.pool.executorsCount = config.executors;
 }
 
 class TemporaryDirectory final {
@@ -408,4 +442,35 @@ pool:
              .counter("service.config_reloads_total",
                       {{"service", "orders"}, {"event", "success"}})
              .count() == 3);
+
+  const auto largeBase = directory.Write(
+      "large-base.yaml", "pool:\n  executorsCount: 4\n");
+  const auto largeOverride = directory.Write(
+      "large-override.yaml", "pool:\n  executorsCount: 4\n");
+  std::shared_ptr<const LargeConfig> largeTyped;
+  std::shared_ptr<const servicelib::config::RuntimeConfig> largeInitial;
+  std::shared_ptr<const servicelib::config::RuntimeConfig> largeReloaded;
+  std::atomic<int> largeCallbacks{0};
+  {
+    servicelib::config::ConfigLoader<LargeConfig> largeLoader(
+        {.configPath = largeBase.string(),
+         .overridePath = largeOverride.string()}, {},
+        servicelib::log::NoopLogger::instance(), metrics, "large-config");
+    largeInitial = largeLoader.Load();
+    largeTyped = largeLoader.GetConfig();
+    assert(largeInitial->GetPoolByName("large-pool") == &largeTyped->pool);
+    assert(largeTyped->payload.front() == 0);
+    assert(largeTyped->payload.back() == 0);
+    largeLoader.Start(std::chrono::milliseconds{5}, [&](const auto&) {
+      largeCallbacks.fetch_add(1);
+    });
+    directory.Write("large-override.yaml", "pool:\n  executorsCount: 9\n");
+    WaitFor([&] { return largeCallbacks.load() == 1; });
+    largeLoader.Stop();
+    largeReloaded = largeLoader.GetRuntimeConfig();
+  }
+  assert(LargeConfig::moves.load() == 0);
+  assert(largeTyped->pool.executorsCount == 4);
+  assert(largeInitial->GetPoolByName("large-pool")->executorsCount == 4);
+  assert(largeReloaded->GetPoolByName("large-pool")->executorsCount == 9);
 }

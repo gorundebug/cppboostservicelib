@@ -37,6 +37,7 @@ docker run --rm \
   -e CCACHE_BASEDIR=/workspace \
   -e CCACHE_COMPILERCHECK=content \
   -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-20G}" \
+  -e CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
   -e DEPENDENCY_GITHUB_RAW_URL="${DEPENDENCY_GITHUB_RAW_URL:-}" \
   -e DEPENDENCY_CONAN_REMOTE_URL="${DEPENDENCY_CONAN_REMOTE_URL:-}" \
   -v cppboostservicelib-ccache:/ccache \
@@ -58,11 +59,11 @@ docker run --rm \
       -DCMAKE_INSTALL_PREFIX=/workspace/build/docker-install \
       -DCPPBOOSTSERVICELIB_BUILD_TESTS=ON \
       -DCPPBOOSTSERVICELIB_ENABLE_KAFKA=ON \
-    && cmake --build build/docker --parallel \
+    && cmake --build build/docker --parallel ${CMAKE_BUILD_PARALLEL_LEVEL:+"$CMAKE_BUILD_PARALLEL_LEVEL"} \
     && ctest --test-dir build/docker --output-on-failure \
     && cmake --install build/docker \
     && cmake --fresh -S tests/consumer -B build/consumer -G Ninja \
       -DCMAKE_PREFIX_PATH=/workspace/build/docker-install \
-    && cmake --build build/consumer --parallel \
+    && cmake --build build/consumer --parallel ${CMAKE_BUILD_PARALLEL_LEVEL:+"$CMAKE_BUILD_PARALLEL_LEVEL"} \
     && ./build/consumer/cppboostservicelib_consumer
   '

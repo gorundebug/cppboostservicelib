@@ -11,6 +11,7 @@ docker run --rm \
   -e CCACHE_BASEDIR=/workspace \
   -e CCACHE_COMPILERCHECK=content \
   -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-20G}" \
+  -e CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
   -v cppboostservicelib-ccache:/ccache \
   -v "$ROOT:/workspace" -w /workspace \
   cppboostservicelib-build \
@@ -19,7 +20,7 @@ docker run --rm \
     -DCPPBOOSTSERVICELIB_DEPENDENCY_MODE=FETCH \
     -DCPPBOOSTSERVICELIB_ENABLE_GRPC=ON \
     -DCPPBOOSTSERVICELIB_BUILD_TESTS=ON \
-    && cmake --build build/grpc-docker --parallel \
+    && cmake --build build/grpc-docker --parallel ${CMAKE_BUILD_PARALLEL_LEVEL:+"$CMAKE_BUILD_PARALLEL_LEVEL"} \
       --target cppboostservicelib_grpc_runtime_test \
                cppboostservicelib_grpc_unary_test \
                cppboostservicelib_grpc_streaming_test \

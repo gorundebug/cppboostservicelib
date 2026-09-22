@@ -157,7 +157,10 @@ class StreamBase : public NotCopyableOrMovable {
     // Resolve ownership during topology construction, never per message.
     if (env_) {
       if (auto* engine = env_->getTracing()) {
-        streamTracer_ = engine->tracer(env_->getServiceName());
+        // The graph is built before startExecutionRuntime caches its identity.
+        const auto service = env_->getServiceConfigSnapshot();
+        streamTracer_ = engine->tracer(service ? service->name
+                                               : env_->getServiceName());
       }
     }
   }

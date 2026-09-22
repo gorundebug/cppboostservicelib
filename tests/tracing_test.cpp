@@ -124,7 +124,6 @@ TEST(Tracing, SamplingIsExplicitAndPreservedByMessageContextClones) {
   EXPECT_EQ(sampled.priority(), 7);
   EXPECT_FALSE(servicelib::tracing::SamplingEnabled(original));
 }
-
 TEST(Tracing, RvalueContextUpdatesPreserveSharedCopies) {
   auto context = servicelib::MessageContext{}.withStreamId("shared-stream");
   const auto shared = context;
@@ -382,4 +381,72 @@ TEST(Tracing, BorrowedAttributeViewKeepsRecorderOwnershipAndBracedCalls) {
   EXPECT_EQ(std::get<std::string>(tracer.startedAttributes[0].value()), "owned pipeline value");
   span->setAttributes({Attribute::Int64("count", 2)});
   span->end();
+}
+
+#include <servicelib/transformation/streams.hpp>
+
+namespace {
+class ScopeRecordingTracing final : public servicelib::tracing::Tracing {
+ public:
+  std::shared_ptr<servicelib::tracing::Tracer> tracer(
+      std::string_view name) const override {
+    scopes.emplace_back(name);
+    return std::make_shared<RecordingTracer>();
+  }
+  mutable std::vector<std::string> scopes;
+};
+
+struct ScopeTestTypes {
+  template <typename> struct DataType {};
+};
+
+class ScopeTestEnvironment final
+    : public servicelib::StreamExecutionEnvironment<ScopeTestEnvironment,
+                                                    ScopeTestTypes> {
+ public:
+  explicit ScopeTestEnvironment(std::string name) {
+    service_->name = std::move(name);
+  }
+  std::shared_ptr<const servicelib::config::ServiceConfig>
+  getServiceConfigSnapshot() const override {
+    ++configReads;
+    return service_;
+  }
+  servicelib::tracing::Tracing* getTracing() override { return tracingEngine; }
+  auto makeEntry() {
+    servicelib::config::SubStreamConfig config;
+    config.id = 1;
+    config.name = "lookup";
+    return servicelib::makeSubStream<int, int, ScopeTestEnvironment>(config,
+                                                                   *this);
+  }
+  servicelib::tracing::Tracing* tracingEngine{};
+  mutable std::size_t configReads{};
+
+ private:
+  std::shared_ptr<servicelib::config::ServiceConfig> service_ =
+      std::make_shared<servicelib::config::ServiceConfig>();
+};
+}  // namespace
+
+TEST(Tracing, GraphConstructionUsesConfiguredScopeBeforeRuntimeStart) {
+  for (const auto* name : {"Order Service", "Inventory Service"}) {
+    ScopeRecordingTracing tracing;
+    ScopeTestEnvironment environment(name);
+    environment.tracingEngine = &tracing;
+    ASSERT_TRUE(environment.getServiceName().empty());
+    auto entry = environment.makeEntry();
+    ASSERT_FALSE(tracing.scopes.empty());
+    for (const auto& scope : tracing.scopes) {
+      EXPECT_EQ(scope, name);
+    }
+    EXPECT_GT(environment.configReads, 0);
+    EXPECT_TRUE(environment.getServiceName().empty());
+  }
+}
+
+TEST(Tracing, GraphWithoutTracingDoesNotReadScopeConfiguration) {
+  ScopeTestEnvironment environment("Order Service");
+  auto entry = environment.makeEntry();
+  EXPECT_EQ(environment.configReads, 0);
 }

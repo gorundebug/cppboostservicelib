@@ -94,7 +94,14 @@ inline JoinType Parse(const config::YamlValue& value,
 inline constexpr std::array kHTTPMethodTypeMap{
     std::pair{""sv, HTTPMethodType::kUndefined},
     std::pair{"GET"sv, HTTPMethodType::kGET},
-    std::pair{"POST"sv, HTTPMethodType::kPOST}};
+    std::pair{"POST"sv, HTTPMethodType::kPOST},
+    std::pair{"PUT"sv, HTTPMethodType::kPUT},
+    std::pair{"PATCH"sv, HTTPMethodType::kPATCH},
+    std::pair{"DELETE"sv, HTTPMethodType::kDELETE},
+    std::pair{"HEAD"sv, HTTPMethodType::kHEAD},
+    std::pair{"OPTIONS"sv, HTTPMethodType::kOPTIONS},
+    std::pair{"TRACE"sv, HTTPMethodType::kTRACE},
+    std::pair{"CONNECT"sv, HTTPMethodType::kCONNECT}};
 
 inline HTTPMethodType Parse(const config::YamlValue& value,
                          config::TypeTag<HTTPMethodType>) {
@@ -301,7 +308,6 @@ inline constexpr std::array kDataTypeMap{
     std::pair{"uint64"sv, DataType::kUint64},
     std::pair{"any"sv, DataType::kAny},
     std::pair{"error"sv, DataType::kError},
-    std::pair{"schedule trigger"sv, DataType::kScheduleTrigger},
     std::pair{"array"sv, DataType::kArray},
     std::pair{"map"sv, DataType::kMap},
     std::pair{"struct"sv, DataType::kStruct},
