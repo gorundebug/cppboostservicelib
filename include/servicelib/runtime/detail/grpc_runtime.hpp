@@ -95,8 +95,7 @@ class GrpcIoExecutor final {
 
   template <typename Function>
   void execute(Function&& function) const {
-    boost::asio::execution::execute(executor_,
-                                    std::forward<Function>(function));
+    executor_.execute(std::forward<Function>(function));
   }
 
   friend bool operator==(const GrpcIoExecutor& left,
