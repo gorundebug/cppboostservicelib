@@ -49,7 +49,6 @@ struct SubStreamConfig {
   std::string component;
   int idService{};
   int idSource{};
-  std::vector<int> idSources;
   double xPos{};
   double yPos{};
   std::string valueType;
@@ -575,14 +574,12 @@ inline SubStreamConfig Parse(const YamlValue& value,
   result.component = value["component"].As<std::string>("");
   result.idService = value["idService"].As<int>(0);
   result.idSource = value["idSource"].As<int>(0);
-  result.idSources =
-      value["idSources"].As<std::vector<int>>(std::vector<int>{});
   result.xPos = value["xPos"].As<double>(0.0);
   result.yPos = value["yPos"].As<double>(0.0);
   result.valueType = value["valueType"].As<std::string>("");
   detail::ParseRemainingProperties(
       value,
-      {"id", "name", "pipeline", "component", "idService", "idSource", "idSources", "xPos", "yPos",
+      {"id", "name", "pipeline", "component", "idService", "idSource", "xPos", "yPos",
        "valueType"},
       result.properties);
   return result;
