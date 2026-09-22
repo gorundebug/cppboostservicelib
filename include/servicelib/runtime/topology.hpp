@@ -85,15 +85,27 @@ struct StatusTopologyPrinter final : TopologyPrinter {
   }
 
  private:
+  static std::int64_t LogicalId(const TopologyNode& node) {
+    return static_cast<std::int64_t>(node.id) < 0
+               ? -static_cast<std::int64_t>(node.configId)
+               : static_cast<std::int64_t>(node.configId);
+  }
+
   TopologyNode ResolveNode(const TopologyNode& node) const {
-    const auto existing =
-        std::ranges::find(nodes, node.id, &TopologyNode::id);
+    const auto logicalId = LogicalId(node);
+    const auto existing = std::ranges::find_if(
+        nodes, [logicalId](const TopologyNode& candidate) {
+          return LogicalId(candidate) == logicalId;
+        });
     return existing == nodes.end() ? node : *existing;
   }
 
   void AddNode(const TopologyNode& node) {
-    const auto existing =
-        std::ranges::find(nodes, node.id, &TopologyNode::id);
+    const auto logicalId = LogicalId(node);
+    const auto existing = std::ranges::find_if(
+        nodes, [logicalId](const TopologyNode& candidate) {
+          return LogicalId(candidate) == logicalId;
+        });
     if (existing == nodes.end()) {
       nodes.push_back(node);
     } else {

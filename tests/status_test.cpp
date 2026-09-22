@@ -127,3 +127,16 @@ TEST(Status, BeastRoutesMatchCanonicalStatusAndMetricsHandlers) {
             "public, max-age=31536000, immutable");
   EXPECT_EQ(script.body, servicelib::status::web::kVisJavaScript);
 }
+
+TEST(Status, KeepsDistinctConfigNodesThatShareAnExecutionTopologyId) {
+  servicelib::StatusTopologyPrinter topology;
+  const servicelib::TopologyNode source{42, 73, "source", "Input"};
+  const servicelib::TopologyNode target{42, 75, "target", "Output"};
+
+  topology.printLink(source, target);
+
+  ASSERT_EQ(topology.nodes.size(), 2);
+  ASSERT_EQ(topology.edges.size(), 1);
+  EXPECT_EQ(topology.edges.front().from.configId, 73);
+  EXPECT_EQ(topology.edges.front().to.configId, 75);
+}
