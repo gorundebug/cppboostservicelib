@@ -1,4 +1,4 @@
-#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -55,7 +55,7 @@ class Consumer final : public servicelib::StreamConsumer<int> {
                      std::unordered_set<size_t>&) const override {}
 
  private:
-  const std::string name_{"queue-test"};
+  const std::string name_{"direct-call-test"};
   const std::string_view type_{"int"};
 };
 
@@ -65,7 +65,29 @@ servicelib::CallerBase::Params Params() {
   return params;
 }
 
-void OrderedCompletionAndIndependentRequests() {
+void DirectDeliveryWithoutCompletionFrame() {
+  Consumer consumer;
+  servicelib::DirectCaller<int> caller{consumer, Params()};
+  bool called = false;
+  const auto thread = std::this_thread::get_id();
+  consumer.receive = [&](MessageContext context, int value) {
+    Require(std::this_thread::get_id() == thread, "direct call changed threads");
+    Require(!context.retainCompletionToken() && !context.retainCompletion(),
+            "direct call created an unnecessary completion frame");
+    Require(value == 42, "direct call changed the payload");
+    called = true;
+  };
+  caller.consume(MessageContext{}, Payload<int>::make(42));
+  Require(called, "direct call returned before invoking the consumer");
+  Require(!caller.isAsync(), "default direct call became async");
+  servicelib::DirectCaller<int> asyncCaller{consumer, Params(), true};
+  called = false;
+  asyncCaller.consume(MessageContext{}, Payload<int>::make(42));
+  Require(called && asyncCaller.isAsync(),
+          "async metadata must not detach direct delivery");
+}
+
+void PendingCompletionDoesNotBlockDelivery() {
   Consumer consumer;
   servicelib::DirectCaller<int> caller{consumer, Params()};
   std::vector<int> received;
@@ -76,34 +98,40 @@ void OrderedCompletionAndIndependentRequests() {
       retained = [lease = context.retainCompletion()] { (void)lease; };
     }
   };
-  const auto a = MessageContext{}.withStreamId("request-a");
+  int completed = 0;
+  auto parent = servicelib::AsyncCompletionState::make([&] { ++completed; });
+  const auto a = MessageContext{}.withStreamId("request-a").withCompletion(parent);
   const auto b = MessageContext{}.withStreamId("request-b");
   for (int value = 0; value != 4; ++value) {
     caller.consume(a, Payload<int>::make(value));
   }
   caller.consume(b, Payload<int>::make(10));
-  Require(received == std::vector<int>({0, 10}),
-          "pending completion must block only its own request");
+  Require(received == std::vector<int>({0, 1, 2, 3, 10}),
+          "pending completion must not block direct delivery");
+  parent->release();
+  Require(completed == 0, "retained operation completed early");
   retained = {};
-  Require(received == std::vector<int>({0, 10, 1, 2, 3}),
-          "queued messages must retain FIFO order");
+  Require(completed == 1 && received == std::vector<int>({0, 1, 2, 3, 10}),
+          "completion must not trigger deferred direct calls");
   caller.consume(a, Payload<int>::make(4));
-  Require(received.back() == 4, "drained request key must be reusable");
+  Require(received.back() == 4, "completed context prevented direct delivery");
   Require(caller.statistics().count() == 6, "message counter changed");
 }
 
-void ConcurrentEnqueueAndDrain() {
+void ConcurrentCallsDoNotWaitForCompletion() {
   Consumer consumer;
   servicelib::DirectCaller<int> caller{consumer, Params()};
-  std::vector<int> received;
+  std::array<std::atomic<int>, 33> received{};
   std::function<void()> retained;
   consumer.receive = [&](MessageContext context, int value) {
-    received.push_back(value);
+    ++received.at(static_cast<size_t>(value));
     if (value == 0) {
       retained = [lease = context.retainCompletion()] { (void)lease; };
     }
   };
-  const auto context = MessageContext{}.withStreamId("shared-request");
+  std::atomic<int> completed{0};
+  auto parent = servicelib::AsyncCompletionState::make([&] { ++completed; });
+  const auto context = MessageContext{}.withStreamId("shared-request").withCompletion(parent);
   caller.consume(context, Payload<int>::make(0));
   std::vector<std::thread> threads;
   for (int value = 1; value <= 32; ++value) {
@@ -112,18 +140,18 @@ void ConcurrentEnqueueAndDrain() {
     });
   }
   for (auto& thread : threads) thread.join();
-  Require(received == std::vector<int>({0}),
-          "concurrent enqueues must wait for the first completion");
-  retained = {};
-  std::sort(received.begin(), received.end());
-  Require(received.size() == 33, "queued messages lost or duplicated");
   for (int value = 0; value <= 32; ++value) {
-    Require(received[static_cast<size_t>(value)] == value,
-            "concurrent queue delivered wrong payload");
+    Require(received[static_cast<size_t>(value)].load() == 1,
+            "concurrent direct call was deferred, lost or duplicated");
   }
+  parent->release();
+  Require(completed.load() == 0, "concurrent calls released retained operation");
+  retained = {};
+  Require(completed.load() == 1, "retained operation did not complete");
+  Require(caller.statistics().count() == 33, "concurrent message count changed");
 }
 
-void FailureAndReentrantEnqueue() {
+void FailureAndReentrantDelivery() {
   Consumer consumer;
   servicelib::DirectCaller<int> caller{consumer, Params()};
   const auto context = MessageContext{}.withStreamId("reentrant-request");
@@ -131,7 +159,10 @@ void FailureAndReentrantEnqueue() {
   consumer.receive = [&](MessageContext, int value) {
     received.push_back(value);
     if (value < 0) throw std::runtime_error("expected consumer failure");
-    if (value == 0) caller.consume(context, Payload<int>::make(1));
+    if (value == 0) {
+      caller.consume(context, Payload<int>::make(1));
+      received.push_back(2);
+    }
   };
   bool threw = false;
   try {
@@ -141,8 +172,8 @@ void FailureAndReentrantEnqueue() {
   }
   Require(threw, "consumer exception must propagate");
   caller.consume(context, Payload<int>::make(0));
-  Require(received == std::vector<int>({-1, 0, 1}),
-          "failed or reentrant delivery left the queue stuck");
+  Require(received == std::vector<int>({-1, 0, 1, 2}),
+          "reentrant delivery must complete before the outer call resumes");
 }
 
 void InlineAndSharedTokensPreserveCompletion() {
@@ -197,7 +228,7 @@ void ConcurrentInlineTokenRelease() {
   Require(!state->retainToken(), "concurrent completion left the frame active");
 }
 
-void TimerRetainsCoallocatedFrame() {
+void TimerRetainsParentWithoutBlockingDelivery() {
   Consumer consumer;
   servicelib::DirectCaller<int> caller{consumer, Params()};
   boost::asio::io_context io;
@@ -214,8 +245,8 @@ void TimerRetainsCoallocatedFrame() {
       timer.async_wait([&, lease = current.retainCompletionToken()](
                            const boost::system::error_code& error) mutable {
         Require(!error, "timer failed");
-        Require(received == std::vector<int>({0}) && parentCompleted == 0,
-                "timer's frame or parent completed early");
+        Require(received == std::vector<int>({0, 1}) && parentCompleted == 0,
+                "timer blocked direct delivery or its parent completed early");
         lease.reset();
       });
     }
@@ -226,9 +257,9 @@ void TimerRetainsCoallocatedFrame() {
   Require(parentCompleted == 0, "parent did not wait for the timer");
   io.run();
   Require(received == std::vector<int>({0, 1}) && parentCompleted == 1,
-          "timer completion failed to drain the queue and its parent");
+          "timer completion changed deliveries or failed to complete its parent");
   Require(!lateContext.retainCompletionToken() && !lateContext.retainCompletion(),
-          "a late context revived a finished coallocated job");
+          "a late context revived a finished parent");
   caller.consume(context, Payload<int>::make(2));
   Require(received == std::vector<int>({0, 1, 2}) && parentCompleted == 1,
           "a saved completed context prevented reuse of the request key");
@@ -238,13 +269,14 @@ void TimerRetainsCoallocatedFrame() {
 
 int main() {
   try {
-    OrderedCompletionAndIndependentRequests();
-    ConcurrentEnqueueAndDrain();
-    FailureAndReentrantEnqueue();
+    DirectDeliveryWithoutCompletionFrame();
+    PendingCompletionDoesNotBlockDelivery();
+    ConcurrentCallsDoNotWaitForCompletion();
+    FailureAndReentrantDelivery();
     InlineAndSharedTokensPreserveCompletion();
     ConcurrentInlineTokenRelease();
-    TimerRetainsCoallocatedFrame();
-    std::cout << "DirectCaller queue regressions passed\n";
+    TimerRetainsParentWithoutBlockingDelivery();
+    std::cout << "DirectCaller delivery and completion regressions passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

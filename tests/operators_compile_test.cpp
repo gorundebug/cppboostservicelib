@@ -575,7 +575,7 @@ TEST(Operators, CallerSemanticsDispatchPreserveContextPriorityAndStatistics) {
                 {6, "parallel"}}));
 }
 
-TEST(Operators, DirectCallerWaitsForLogicalAsyncCompletionPerStream) {
+TEST(Operators, DirectCallerDoesNotQueueWhileCompletionIsPending) {
   auto& app = operatorApp();
   auto inputOwner = inputStream<int>(app, 160, "completion-input");
   std::vector<int> observed;
@@ -591,16 +591,27 @@ TEST(Operators, DirectCallerWaitsForLogicalAsyncCompletionPerStream) {
           "deferred-completion"));
 
   servicelib::DirectCaller<int> direct{sink, callerParams(), false};
-  direct.consume(servicelib::MessageContext{}.withStreamId("request-a"),
-                 servicelib::Payload<int>::make(1));
-  direct.consume(servicelib::MessageContext{}.withStreamId("request-a"),
-                 servicelib::Payload<int>::make(2));
+  int completed = 0;
+  auto parent = servicelib::AsyncCompletionState::make([&completed] { ++completed; });
+  const auto context = servicelib::MessageContext{}
+                           .withStreamId("request-a")
+                           .withCompletion(parent);
+  direct.consume(context, servicelib::Payload<int>::make(1));
+  direct.consume(context, servicelib::Payload<int>::make(2));
   direct.consume(servicelib::MessageContext{}.withStreamId("request-b"),
                  servicelib::Payload<int>::make(3));
 
-  EXPECT_EQ(observed, (std::vector<int>{1, 3}));
-  ASSERT_EQ(completions.size(), 2U);
+  EXPECT_EQ(observed, (std::vector<int>{1, 2, 3}));
+  ASSERT_EQ(completions.size(), 3U);
+  EXPECT_TRUE(completions[0]);
+  EXPECT_TRUE(completions[1]);
+  EXPECT_FALSE(completions[2]);
+  parent->release();
+  EXPECT_EQ(completed, 0);
   completions.front().reset();
-  EXPECT_EQ(observed, (std::vector<int>{1, 3, 2}));
+  EXPECT_EQ(completed, 0);
+  EXPECT_EQ(observed, (std::vector<int>{1, 2, 3}));
   completions.clear();
+  EXPECT_EQ(completed, 1);
+  EXPECT_EQ(observed, (std::vector<int>{1, 2, 3}));
 }
