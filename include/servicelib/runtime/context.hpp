@@ -15,6 +15,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -58,19 +59,25 @@ struct LocalExecutionScope {};
 // not need to know that the mechanism exists.
 class AsyncCompletionToken final {
  public:
+  AsyncCompletionToken() noexcept = default;
   explicit AsyncCompletionToken(
       std::shared_ptr<AsyncCompletionState> state) noexcept;
   AsyncCompletionToken(const AsyncCompletionToken&) = delete;
   AsyncCompletionToken& operator=(const AsyncCompletionToken&) = delete;
   AsyncCompletionToken(AsyncCompletionToken&&) noexcept = default;
-  AsyncCompletionToken& operator=(AsyncCompletionToken&&) noexcept = default;
+  AsyncCompletionToken& operator=(AsyncCompletionToken&& other) noexcept;
   ~AsyncCompletionToken();
+
+  void reset() noexcept;
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return static_cast<bool>(state_);
+  }
 
  private:
   std::shared_ptr<AsyncCompletionState> state_;
 };
 
-class AsyncCompletionState final
+class AsyncCompletionState
     : public std::enable_shared_from_this<AsyncCompletionState> {
  public:
   explicit AsyncCompletionState(
@@ -79,21 +86,30 @@ class AsyncCompletionState final
       : completion_(std::move(completion)), parent_(std::move(parent)) {}
 
   [[nodiscard]] std::shared_ptr<AsyncCompletionToken> retain() {
-    auto pending = pending_.load(std::memory_order_acquire);
-    while (pending != 0) {
-      if (pending_.compare_exchange_weak(
-              pending, pending + 1, std::memory_order_acq_rel,
-              std::memory_order_acquire)) {
-        return std::make_shared<AsyncCompletionToken>(shared_from_this());
-      }
+    auto token = retainToken();
+    if (!token) return nullptr;
+    return std::make_shared<AsyncCompletionToken>(std::move(token));
+  }
+
+  // Unique operation owners can keep their lease inline. The shared-token
+  // API above remains available for callbacks that share one logical lease.
+  [[nodiscard]] AsyncCompletionToken retainToken() {
+    auto owner = shared_from_this();
+    std::lock_guard lock(pendingMutex_);
+    if (pending_ != 0) {
+      ++pending_;
+      return AsyncCompletionToken(std::move(owner));
     }
     // An asynchronous boundary may still carry a copied MessageContext after
     // the logical call frame has completed. Never revive that frame.
-    return nullptr;
+    return {};
   }
 
   void release() noexcept {
-    if (pending_.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    {
+      std::lock_guard lock(pendingMutex_);
+      if (--pending_ != 0) return;
+    }
     auto completion = std::move(completion_);
     try {
       completion();
@@ -101,6 +117,7 @@ class AsyncCompletionState final
       // Completion bookkeeping must never replace business semantics.
     }
     parent_.reset();
+    parentToken_.reset();
   }
 
   [[nodiscard]] static std::shared_ptr<AsyncCompletionState> make(
@@ -110,10 +127,21 @@ class AsyncCompletionState final
                                                    std::move(parent));
   }
 
+ protected:
+  // A coallocated call frame installs its completion before exposing the
+  // state to consumers. Never reinitialize an active or completed frame.
+  void initializeCompletion(std::function<void()> completion,
+                            AsyncCompletionToken parent) {
+    completion_ = std::move(completion);
+    parentToken_ = std::move(parent);
+  }
+
  private:
-  std::atomic<std::size_t> pending_{1};
+  std::mutex pendingMutex_;
+  std::size_t pending_{1};
   std::function<void()> completion_;
   std::shared_ptr<AsyncCompletionToken> parent_;
+  AsyncCompletionToken parentToken_;
 };
 
 inline AsyncCompletionToken::AsyncCompletionToken(
@@ -121,7 +149,22 @@ inline AsyncCompletionToken::AsyncCompletionToken(
     : state_(std::move(state)) {}
 
 inline AsyncCompletionToken::~AsyncCompletionToken() {
-  if (state_) state_->release();
+  reset();
+}
+
+inline AsyncCompletionToken& AsyncCompletionToken::operator=(
+    AsyncCompletionToken&& other) noexcept {
+  if (this != &other) {
+    auto previous = std::move(state_);
+    state_ = std::move(other.state_);
+    if (previous) previous->release();
+  }
+  return *this;
+}
+
+inline void AsyncCompletionToken::reset() noexcept {
+  auto state = std::move(state_);
+  if (state) state->release();
 }
 
 using Deadline = std::optional<std::chrono::steady_clock::time_point>;
@@ -328,6 +371,11 @@ class MessageContext final : public Context {
       const {
     const auto& completion = derived()->completion;
     return completion ? completion->retain() : nullptr;
+  }
+
+  [[nodiscard]] AsyncCompletionToken retainCompletionToken() const {
+    const auto& completion = derived()->completion;
+    return completion ? completion->retainToken() : AsyncCompletionToken{};
   }
 
   [[nodiscard]] MessageContext withCompletion(

@@ -144,12 +144,22 @@ class ClientCancellation final {
   }
 
  private:
-  using Callback = std::stop_callback<std::function<void()>>;
+  struct Cancel final {
+    grpc::ClientContext* rpc;
+    void operator()() const noexcept { rpc->TryCancel(); }
+  };
+  using Callback = std::stop_callback<Cancel>;
   void Add(std::stop_token token, grpc::ClientContext& rpc) {
     if (!token.stop_possible()) return;
-    callbacks_.push_back(std::make_unique<Callback>(
-        token, [&rpc] { rpc.TryCancel(); }));
+    if (!firstCallback_) {
+      firstCallback_.emplace(token, Cancel{&rpc});
+    } else {
+      callbacks_.push_back(std::make_unique<Callback>(token, Cancel{&rpc}));
+    }
   }
+  // stop_callback cannot move once registered. Keep the first registration
+  // in place and use stable heap addresses only for additional stop sources.
+  std::optional<Callback> firstCallback_;
   std::vector<std::unique_ptr<Callback>> callbacks_;
 };
 

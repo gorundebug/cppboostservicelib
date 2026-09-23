@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -231,8 +232,62 @@ struct KafkaSinkHandler final {
   }
 };
 
+class KafkaPropagationSpan final : public servicelib::tracing::Span {
+ public:
+  explicit KafkaPropagationSpan(servicelib::tracing::SpanContext context)
+      : context_(std::move(context)) {}
+  void end() override { ended = true; }
+  void setAttributes(servicelib::tracing::AttributeView) override {}
+  void recordError(std::string_view) override {}
+  void setStatus(servicelib::tracing::StatusCode, std::string_view) override {}
+  void addEvent(std::string_view, servicelib::tracing::AttributeView) override {}
+  servicelib::tracing::SpanContext spanContext() const override { return context_; }
+  bool ended{};
+
+ private:
+  servicelib::tracing::SpanContext context_;
+};
+
+class KafkaPropagationTracer final : public servicelib::tracing::Tracer {
+ public:
+  std::shared_ptr<servicelib::tracing::Span> start(
+      std::string_view, servicelib::tracing::AttributeView) const override {
+    return {};
+  }
+  servicelib::tracing::SpanContext currentSpanContext() const override { return {}; }
+  std::shared_ptr<servicelib::tracing::Span> startChildOf(
+      std::string_view name, const servicelib::tracing::SpanContext& parent,
+      servicelib::tracing::AttributeView) const override {
+    parentContext = parent;
+    operation = name;
+    // Leave baggage/tracestate empty to exercise inheritance from the parent.
+    span = std::make_shared<KafkaPropagationSpan>(servicelib::tracing::SpanContext{
+        parent.traceId, "fedcba9876543210", parent.isValid(), {}, {}});
+    return span;
+  }
+  std::shared_ptr<servicelib::tracing::Span> startDetachedChildOf(
+      std::string_view name, const servicelib::tracing::SpanContext& parent,
+      servicelib::tracing::AttributeView attributes) const override {
+    return startChildOf(name, parent, attributes);
+  }
+  mutable servicelib::tracing::SpanContext parentContext;
+  mutable std::string operation;
+  mutable std::shared_ptr<KafkaPropagationSpan> span;
+};
+
+class KafkaPropagationTracing final : public servicelib::tracing::Tracing {
+ public:
+  std::shared_ptr<servicelib::tracing::Tracer> tracer(std::string_view) const override {
+    return recorder;
+  }
+  std::shared_ptr<KafkaPropagationTracer> recorder =
+      std::make_shared<KafkaPropagationTracer>();
+};
+
 TEST(KafkaDataSink, SendsThroughAdapterAndCollectsDeliveryResult) {
+  KafkaPropagationTracing tracing;
   TestEnvironment environment;
+  environment.tracingEngine = &tracing;
   FakeKafkaProducer producer;
   producer.actualPartitionCount = 6;
   int result = 0;
@@ -253,9 +308,19 @@ TEST(KafkaDataSink, SendsThroughAdapterAndCollectsDeliveryResult) {
                        .withTrace(std::move(trace)),
                    servicelib::Payload<std::string>::make("payload"));
   EXPECT_EQ(producer.observed, "events:key:payload");
+  ASSERT_TRUE(tracing.recorder->span);
+  EXPECT_TRUE(tracing.recorder->span->ended);
+  EXPECT_EQ(tracing.recorder->operation, "kafka.output");
+  EXPECT_EQ(tracing.recorder->parentContext.traceId,
+            "0123456789abcdef0123456789abcdef");
+  EXPECT_EQ(tracing.recorder->parentContext.spanId, "0123456789abcdef");
+  ASSERT_EQ(producer.observedHeaders.size(), 5U);
+  for (const auto* name : {"x-stream-id", "traceparent", "tracestate", "baggage", "x-trace"}) {
+    ASSERT_TRUE(producer.observedHeaders.contains(name)) << name;
+  }
   EXPECT_EQ(producer.observedHeaders.at("x-stream-id"), "kafka-sid");
   EXPECT_EQ(producer.observedHeaders.at("traceparent"),
-            "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01");
+            "00-0123456789abcdef0123456789abcdef-fedcba9876543210-01");
   EXPECT_EQ(producer.observedHeaders.at("tracestate"), "vendor=value");
   EXPECT_EQ(producer.observedHeaders.at("baggage"), "tenant=test");
   EXPECT_EQ(producer.observedHeaders.at("x-trace"), "1");
@@ -263,6 +328,33 @@ TEST(KafkaDataSink, SendsThroughAdapterAndCollectsDeliveryResult) {
   endpoint.stop(servicelib::Context{});
   EXPECT_EQ(producer.startCount, 1);
   EXPECT_EQ(producer.stopCount, 1);
+}
+
+TEST(KafkaDataSink, OmitsTracingHeadersWhenTracingIsDisabled) {
+  TestEnvironment environment;
+  FakeKafkaProducer producer;
+  producer.actualPartitionCount = 6;
+  int result = 0;
+  TestSinkEndpointStream<std::string, int> stream{
+      environment, 3,
+      [&](servicelib::MessageContext, servicelib::Payload<int> value) {
+        result = value.get();
+      }};
+  servicelib::datasink::kafka::Endpoint<std::string, int, KafkaSinkHandler>
+      endpoint{stream, producer, KafkaSinkHandler{6}};
+  endpoint.start(servicelib::Context{});
+  endpoint.consume(servicelib::MessageContext{}
+                       .withStreamId("incoming-stream")
+                       .withSampling(true)
+                       .withTrace({"0123456789abcdef0123456789abcdef",
+                                   "0123456789abcdef", true,
+                                   "vendor=value", "tenant=test"}),
+                   servicelib::Payload<std::string>::make("payload"));
+  const servicelib::detail::KafkaHeaders expected{{"x-stream-id", "kafka-sid"}};
+  EXPECT_EQ(producer.observedHeaders, expected);
+  EXPECT_EQ(producer.observed, "events:key:payload");
+  EXPECT_EQ(result, 17);
+  endpoint.stop(servicelib::Context{});
 }
 
 TEST(KafkaContext, RestoresCanonicalPropagationHeaders) {

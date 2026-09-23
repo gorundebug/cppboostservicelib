@@ -16,6 +16,7 @@
 #include <boost/asio/use_awaitable.hpp>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -355,6 +356,8 @@ int main() {
     servicelib::test::EchoRequest cancelledPooledRequest;
     cancelledPooledRequest.set_value("cancel-pooled");
     std::stop_source pooledCancellation;
+    std::stop_source extraCancellation;
+    std::stop_source lastCancellation;
     std::promise<std::exception_ptr> cancelledPooledCompletion;
     auto cancelledPooledFuture = cancelledPooledCompletion.get_future();
     pool.asyncUnary<
@@ -364,6 +367,8 @@ int main() {
         servicelib::datasink::grpc::callOptions(
             servicelib::MessageContext{}
                 .withStopToken(pooledCancellation.get_token())
+                .withExternalCancellation(extraCancellation.get_token())
+                .withExternalCancellation(lastCancellation.get_token())
                 .withDeadline(std::chrono::steady_clock::now() + 3s)),
         [&cancelledPooledCompletion](
             std::exception_ptr error,
@@ -373,7 +378,7 @@ int main() {
     Require(receivedPooledCancelledFuture.wait_for(3s) ==
                 std::future_status::ready,
             "cancellable pooled unary call was not accepted");
-    pooledCancellation.request_stop();
+    lastCancellation.request_stop();
     releasePooledCancelledRequest.Send();
     Require(cancelledPooledFuture.wait_for(3s) == std::future_status::ready,
             "cancelled pooled unary call did not complete");
@@ -385,6 +390,42 @@ int main() {
     } catch (const servicelib::grpc_transport::StatusError& error) {
       Require(error.code() == grpc::StatusCode::CANCELLED,
               "cancelled pooled unary status differs");
+    }
+
+    // Every registered source must cancel, including the inline registration
+    // and additional stable registrations, even when stopped before creation.
+    for (std::size_t stopped = 0; stopped < 4; ++stopped) {
+      std::array<std::stop_source, 4> sources;
+      auto cancelledContext = servicelib::MessageContext{}
+          .withStopToken(sources[0].get_token())
+          .withExternalCancellation(sources[1].get_token())
+          .withExternalCancellation(sources[2].get_token())
+          .withExternalCancellation(sources[3].get_token())
+          .withDeadline(std::chrono::steady_clock::now() + 3s);
+      sources[stopped].request_stop();
+      servicelib::test::EchoRequest cancelledRequest;
+      cancelledRequest.set_value("already-cancelled");
+      std::promise<std::exception_ptr> completion;
+      auto future = completion.get_future();
+      pool.asyncUnary<
+          &servicelib::test::ConnectorTest::Stub::PrepareAsyncUnary,
+          servicelib::test::EchoRequest, servicelib::test::EchoResponse>(
+          std::move(cancelledRequest),
+          servicelib::datasink::grpc::callOptions(cancelledContext),
+          [&completion](std::exception_ptr error,
+                        std::optional<servicelib::test::EchoResponse>) {
+            completion.set_value(std::move(error));
+          });
+      Require(future.wait_for(3s) == std::future_status::ready,
+              "an already-stopped cancellation source was ignored");
+      auto error = future.get();
+      Require(static_cast<bool>(error), "already-cancelled call succeeded");
+      try {
+        std::rethrow_exception(error);
+      } catch (const servicelib::grpc_transport::StatusError& status) {
+        Require(status.code() == grpc::StatusCode::CANCELLED,
+                "already-cancelled unary status differs");
+      }
     }
   }
 

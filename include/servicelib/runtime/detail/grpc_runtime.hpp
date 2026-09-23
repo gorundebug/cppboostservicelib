@@ -104,9 +104,12 @@ class GrpcRuntime final {
   }
 
   void Start() {
-    State expected = State::kCreated;
-    if (!state_.compare_exchange_strong(expected, State::kRunning))
-      throw std::logic_error("gRPC runtime can only be started once");
+    {
+      std::lock_guard lock(stateMutex_);
+      State expected = State::kCreated;
+      if (!state_.compare_exchange_strong(expected, State::kRunning))
+        throw std::logic_error("gRPC runtime can only be started once");
+    }
     detail::ParallelExecutorRegistry::Set(executor_);
     try {
       blockingPool_ = std::make_unique<boost::asio::thread_pool>(
@@ -130,32 +133,32 @@ class GrpcRuntime final {
   void start() { Start(); }
 
   void Stop() noexcept {
-    auto state = state_.load(std::memory_order_acquire);
-    while (state == State::kCreated || state == State::kRunning) {
-      if (state_.compare_exchange_weak(state, State::kStopping)) {
-        ioWork_.reset();
-        if (metricsTimer_) {
-          try {
-            metricsTimer_->cancel();
-          } catch (...) {
-          }
-        }
-        {
-          std::lock_guard lock(signalMutex_);
-          if (signalSet_) {
-            boost::system::error_code ignored;
-            signalSet_->cancel(ignored);
-          }
-        }
-        // Wake the CQ through its native executor, without polling. Workers
-        // also test state_ on entering run_while, so a worker starting after
-        // this stop cannot reset the context and wait indefinitely.
-        boost::asio::post(grpcContext_->get_executor(),
-                          [this] { grpcContext_->stop(); });
-        ioContext_.stop();
-        return;
+    {
+      std::lock_guard lock(stateMutex_);
+      const auto state = state_.load(std::memory_order_acquire);
+      if (state != State::kCreated && state != State::kRunning) return;
+      state_.store(State::kStopping, std::memory_order_release);
+    }
+    ioWork_.reset();
+    if (metricsTimer_) {
+      try {
+        metricsTimer_->cancel();
+      } catch (...) {
       }
     }
+    {
+      std::lock_guard lock(signalMutex_);
+      if (signalSet_) {
+        boost::system::error_code ignored;
+        signalSet_->cancel(ignored);
+      }
+    }
+    // Wake the CQ through its native executor, without polling. Workers
+    // also test state_ on entering run_while, so a worker starting after
+    // this stop cannot reset the context and wait indefinitely.
+    boost::asio::post(grpcContext_->get_executor(),
+                      [this] { grpcContext_->stop(); });
+    ioContext_.stop();
   }
 
   void stop() noexcept { Stop(); }
@@ -171,7 +174,10 @@ class GrpcRuntime final {
     grpcWorkers_.clear();
     // No completion-queue runner remains when releasing its work guard.
     grpcWork_.reset();
-    if (state_.load() == State::kStopping) state_.store(State::kStopped);
+    {
+      std::lock_guard stateLock(stateMutex_);
+      if (state_.load() == State::kStopping) state_.store(State::kStopped);
+    }
     if (blockingPool_) {
       blockingPool_->stop();
       blockingPool_->join();
@@ -325,6 +331,7 @@ class GrpcRuntime final {
   boost::asio::any_io_executor grpcExecutor_;
   std::unique_ptr<boost::asio::steady_timer> metricsTimer_;
   std::atomic<State> state_{State::kCreated};
+  std::mutex stateMutex_;
   std::mutex joinMutex_;
   bool joined_{};
   std::mutex signalMutex_;

@@ -3,18 +3,29 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <servicelib/runtime/detail/sync.hpp>
 
 namespace servicelib::datasink::grpc::detail {
 
-// Admission and draining are one atomic state, so close cannot miss a reader.
+// Admission and draining share one mutex, so close cannot miss a reader.
 // Only the explicitly synchronous shutdown boundary calls Wait().
 class StreamingActivity final {
-  static constexpr std::uint64_t kClosed = std::uint64_t{1} << 63;
   struct State final {
-    std::atomic<std::uint64_t> count{0};
+    std::mutex mutex;
+    std::uint64_t count{};
+    bool closed{};
     servicelib::detail::SingleUseEvent drained;
+    void release() {
+      bool notify;
+      {
+        std::lock_guard lock(mutex);
+        --count;
+        notify = closed && count == 0;
+      }
+      if (notify) drained.Send();
+    }
   };
  public:
   class Token final {
@@ -22,31 +33,32 @@ class StreamingActivity final {
     explicit Token(std::shared_ptr<State> state) : state_(std::move(state)) {}
     Token(const Token&) = delete;
     ~Token() {
-      if (state_->count.fetch_sub(1, std::memory_order_acq_rel) == kClosed + 1)
-        state_->drained.Send();
+      state_->release();
     }
    private:
     std::shared_ptr<State> state_;
   };
   std::shared_ptr<Token> acquire() {
-    auto before = state_->count.load(std::memory_order_acquire);
-    while (!(before & kClosed)) {
-      if (state_->count.compare_exchange_weak(before, before + 1,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        try { return std::make_shared<Token>(state_); }
-        catch (...) {
-          if (state_->count.fetch_sub(1, std::memory_order_acq_rel) == kClosed + 1)
-            state_->drained.Send();
-          throw;
-        }
-      }
+    {
+      std::lock_guard lock(state_->mutex);
+      if (state_->closed) return {};
+      ++state_->count;
     }
-    return {};
+    try { return std::make_shared<Token>(state_); }
+    catch (...) {
+      state_->release();
+      throw;
+    }
   }
   bool close() {
-    const auto before = state_->count.fetch_or(kClosed, std::memory_order_acq_rel);
-    if (before & kClosed) return false;
-    if (before == 0) state_->drained.Send();
+    bool notify;
+    {
+      std::lock_guard lock(state_->mutex);
+      if (state_->closed) return false;
+      state_->closed = true;
+      notify = state_->count == 0;
+    }
+    if (notify) state_->drained.Send();
     return true;
   }
   void wait() { state_->drained.Wait(); }
@@ -80,8 +92,9 @@ struct StreamingCell final {
   }
 };
 
-// Publish before starting RPC. Closing atomically detaches every accepted
-// registration; a racing publisher observes the closed sentinel and cancels
+// Publish before starting RPC. Closing detaches every accepted registration
+// under the mutex; cancellation runs outside it. A racing publisher observes
+// the closed sentinel and cancels
 // its own cell. Weak registrations retain no finished sessions. Nodes, like
 // the previous registration vector, are reclaimed at endpoint shutdown.
 template <typename Cell>
@@ -95,19 +108,22 @@ class StreamingRegistry final {
   void add(const std::shared_ptr<Cell>& cell) {
     auto node = std::make_unique<Node>();
     node->cell = cell;
-    auto* before = head_.load(std::memory_order_acquire);
-    while (before != &closed_) {
-      node->next = before;
-      if (head_.compare_exchange_weak(before, node.get(),
-            std::memory_order_release, std::memory_order_acquire)) {
-        static_cast<void>(node.release());
+    {
+      std::lock_guard lock(mutex_);
+      if (head_ != &closed_) {
+        node->next = head_;
+        head_ = node.release();
         return;
       }
     }
     cell->cancel();
   }
   void close() {
-    auto* node = head_.exchange(&closed_, std::memory_order_acq_rel);
+    Node* node;
+    {
+      std::lock_guard lock(mutex_);
+      node = std::exchange(head_, &closed_);
+    }
     while (node && node != &closed_) {
       auto* next = node->next;
       if (auto cell = node->cell.lock()) cell->cancel();
@@ -117,6 +133,7 @@ class StreamingRegistry final {
   }
  private:
   Node closed_;
-  std::atomic<Node*> head_{nullptr};
+  std::mutex mutex_;
+  Node* head_{};
 };
 }  // namespace servicelib::datasink::grpc::detail

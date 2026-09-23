@@ -92,11 +92,11 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     DataSinkEndpointMetrics::Clock::time_point startedAt;
     std::shared_ptr<tracing::Span> span;
     std::shared_ptr<servicelib::detail::AsyncOperations::Token> operation;
-    std::shared_ptr<servicelib::AsyncCompletionToken> completion;
+    servicelib::AsyncCompletionToken completion;
   };
 
   void consumeAsync(MessageContext context, Payload<T> payload) {
-    auto completion = context.retainCompletion();
+    auto completion = context.retainCompletionToken();
     auto trace = this->startDetachedTrace(std::move(context));
     context = std::move(trace.context);
     std::optional<servicelib::BeginResult<typename Handler::State>> begin;

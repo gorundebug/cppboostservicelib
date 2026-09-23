@@ -226,7 +226,7 @@ class BeastEndpoint final : public IEndpoint {
   void consume(MessageContext context, Payload<T> payload) {
     auto operation = operations_.acquire();
     if (!operation) return;
-    auto completion = context.retainCompletion();
+    auto completion = context.retainCompletionToken();
     boost::asio::co_spawn(
         executor_, run(std::move(context), std::move(payload)),
         [operation = std::move(operation),

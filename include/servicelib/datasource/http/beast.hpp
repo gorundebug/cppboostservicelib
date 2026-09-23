@@ -485,45 +485,69 @@ struct PendingResult final {
   servicelib::detail::SingleUseEvent done;
   std::atomic<bool> doneSent{false};
   using CallbackMap = std::unordered_map<std::string, std::shared_ptr<Callback>>;
-  std::atomic<std::shared_ptr<const CallbackMap>> callbacks;
+  std::mutex callbacksMutex;
+  CallbackMap callbacks;
   static constexpr std::uint64_t kRetired = std::uint64_t{1} << 63;
-  std::atomic<std::uint64_t> readers{};
+  std::mutex readersMutex;
+  std::uint64_t readers{};
   boost::asio::experimental::concurrent_channel<void(boost::system::error_code)>
       retired{servicelib::detail::ParallelExecutorRegistry::Get(), 1};
 
   bool enter() noexcept {
-    auto value = readers.load(std::memory_order_acquire);
-    while (!(value & kRetired)) {
-      if (readers.compare_exchange_weak(value, value + 1,
-                                       std::memory_order_acq_rel)) return true;
-    }
-    return false;
+    std::lock_guard lock(readersMutex);
+    if (readers & kRetired) return false;
+    ++readers;
+    return true;
   }
   void leave() noexcept {
-    if (readers.fetch_sub(1, std::memory_order_acq_rel) == kRetired + 1)
+    bool notify;
+    {
+      std::lock_guard lock(readersMutex);
+      notify = readers-- == kRetired + 1;
+    }
+    if (notify)
       static_cast<void>(retired.try_send(boost::system::error_code{}));
   }
   boost::asio::awaitable<void> retire() {
-    if (readers.fetch_or(kRetired, std::memory_order_acq_rel) != 0)
+    bool wait;
+    {
+      std::lock_guard lock(readersMutex);
+      wait = readers != 0;
+      readers |= kRetired;
+    }
+    if (wait)
       co_await retired.async_receive(boost::asio::use_awaitable);
   }
   void setCallback(std::string id, std::shared_ptr<Callback> callback) {
-    auto before = callbacks.load();
-    for (;;) {
-      auto next = before ? std::make_shared<CallbackMap>(*before)
-                         : std::make_shared<CallbackMap>();
-      (*next)[id] = callback;
-      if (callbacks.compare_exchange_weak(before, std::move(next))) return;
+    {
+      std::lock_guard lock(callbacksMutex);
+      callbacks[std::move(id)].swap(callback);
     }
+    // Replaced callbacks may own user-defined captures. Destroy them only
+    // after unlocking, just as callbacks themselves run outside the lock.
+  }
+  [[nodiscard]] std::shared_ptr<Callback> getCallback(const std::string& id) {
+    std::lock_guard lock(callbacksMutex);
+    const auto it = callbacks.find(id);
+    return it == callbacks.end() ? std::shared_ptr<Callback>{} : it->second;
   }
   bool eraseCallback(const std::string& id) {
-    auto before = callbacks.load();
-    while (before && before->contains(id)) {
-      auto next = std::make_shared<CallbackMap>(*before);
-      next->erase(id);
-      if (callbacks.compare_exchange_weak(before, std::move(next))) return true;
+    std::shared_ptr<Callback> removed;
+    {
+      std::lock_guard lock(callbacksMutex);
+      const auto it = callbacks.find(id);
+      if (it == callbacks.end()) return false;
+      removed = std::move(it->second);
+      callbacks.erase(it);
     }
-    return false;
+    return true;
+  }
+  void clearCallbacks() {
+    CallbackMap removed;
+    {
+      std::lock_guard lock(callbacksMutex);
+      callbacks.swap(removed);
+    }
   }
 };
 
@@ -801,7 +825,7 @@ class BeastEndpoint final : public IBeastEndpoint {
       // correlation, so clear them after all admitted consumeResult calls
       // have left. This breaks PendingResult -> callback ->
       // ResultContext -> PendingResult ownership cycles on every exit path.
-      result->callbacks.store(nullptr);
+      result->clearCallbacks();
       callEndRequest(context, error, *result, data);
     } else {
       callEndRequest(context, error, *result, data);
@@ -843,12 +867,7 @@ class BeastEndpoint final : public IBeastEndpoint {
 
     const std::string messageId = handler_.getMessageId(
         context, streamContext_, result->state, payload.get());
-    std::shared_ptr<typename Result::Callback> callback;
-    const auto callbacks = result->callbacks.load();
-    if (callbacks) {
-      const auto it = callbacks->find(messageId);
-      if (it != callbacks->end()) callback = it->second;
-    }
+    const auto callback = result->getCallback(messageId);
     if (!callback || !*callback) {
       metrics_.unknownMessageId(streamId, messageId);
       if (auto* traceSpan = result->span.get()) traceSpan->addEvent("unknown_message_id",

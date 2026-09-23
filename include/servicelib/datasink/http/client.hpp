@@ -27,6 +27,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 #include <optional>
 #include <stdexcept>
@@ -197,18 +198,24 @@ class Client final {
   class Operation final {
    public:
     explicit Operation(Client& owner) : state_(owner.state_) {
-      auto value = state_->operations.load(std::memory_order_acquire);
-      for (;;) {
-        if (value & kClosed)
-          throw ClientError(ClientErrorCode::kStopped, "HTTP client is stopped");
-        if (state_->operations.compare_exchange_weak(value, value + 1,
-                                                     std::memory_order_acq_rel)) break;
+      bool closed;
+      {
+        std::lock_guard lock(state_->operationsMutex);
+        closed = (state_->operations & kClosed) != 0;
+        if (!closed) ++state_->operations;
       }
+      if (closed)
+        throw ClientError(ClientErrorCode::kStopped, "HTTP client is stopped");
     }
     Operation(const Operation&) = delete;
     Operation& operator=(const Operation&) = delete;
     ~Operation() {
-      if (state_->operations.fetch_sub(1, std::memory_order_acq_rel) == kClosed + 1)
+      bool drained;
+      {
+        std::lock_guard lock(state_->operationsMutex);
+        drained = state_->operations-- == kClosed + 1;
+      }
+      if (drained)
         boost::asio::post(state_->strand, [state = state_] { Finish(state); });
     }
    private:
@@ -240,7 +247,8 @@ class Client final {
           drained(drainPromise.get_future().share()) {}
     boost::asio::strand<boost::asio::any_io_executor> strand;
     Options options;
-    std::atomic<std::uint64_t> operations{};
+    mutable std::mutex operationsMutex;
+    std::uint64_t operations{};
     std::atomic<std::size_t> connectionCount{};
     std::vector<std::shared_ptr<Connection>> connections;
     std::deque<std::shared_ptr<PoolWaiter>> waiters;
@@ -248,7 +256,10 @@ class Client final {
     std::size_t closing{};
     std::promise<void> drainPromise;
     std::shared_future<void> drained;
-    bool stopped() const { return operations.load(std::memory_order_acquire) & kClosed; }
+    bool stopped() const {
+      std::lock_guard lock(operationsMutex);
+      return (operations & kClosed) != 0;
+    }
   };
 
   static void CompleteStop(const std::shared_ptr<PoolState>& state) {
@@ -256,7 +267,11 @@ class Client final {
     state->drainPromise.set_value();
   }
   static void Finish(const std::shared_ptr<PoolState>& state) {
-    if (state->operations.load() != kClosed || state->finishing.exchange(true)) return;
+    {
+      std::lock_guard lock(state->operationsMutex);
+      if (state->operations != kClosed) return;
+    }
+    if (state->finishing.exchange(true)) return;
     state->closing = state->connections.size();
     if (!state->closing) { CompleteStop(state); return; }
     // Closing on the socket executor also orders it after outstanding cancel
@@ -271,7 +286,12 @@ class Client final {
     }
   }
   static void BeginStop(const std::shared_ptr<PoolState>& state) {
-    const auto before = state->operations.fetch_or(kClosed, std::memory_order_acq_rel);
+    std::uint64_t before;
+    {
+      std::lock_guard lock(state->operationsMutex);
+      before = state->operations;
+      state->operations |= kClosed;
+    }
     if (before & kClosed) return;
     if (before == 0 && !state->finishing.exchange(true)) {
       // No operation can still access sockets, including when an external

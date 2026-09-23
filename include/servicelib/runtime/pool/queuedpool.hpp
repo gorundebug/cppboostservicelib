@@ -14,6 +14,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -95,7 +96,8 @@ class QueuedPool {
     boost::asio::any_io_executor executor;
     boost::asio::strand<boost::asio::any_io_executor> strand;
     boost::asio::steady_timer managerTimer, lifecycleDeadline, deadlineTimer;
-    std::atomic<std::uint64_t> activity{0};
+    std::mutex activityMutex;
+    std::uint64_t activity{};
     std::atomic<int> target{0};
     int fallbackExecutors{};
     // All fields below, except immutable metrics/drain future, are
@@ -132,7 +134,11 @@ class QueuedPool {
       : state_(std::make_shared<State>(std::move(name), env)) {}
 
   ~QueuedPool() {
-    const auto activity = state_->activity.load(std::memory_order_acquire);
+    std::uint64_t activity;
+    {
+      std::lock_guard lock(state_->activityMutex);
+      activity = state_->activity;
+    }
     if ((activity & kCount) || ((activity & kStarted) && !(activity & kClosed)))
       std::terminate();
   }
@@ -145,14 +151,14 @@ class QueuedPool {
   void start(Context context) {
     const auto state = state_;
     const auto count = configuredExecutors(*state);
-    auto activity = state->activity.load(std::memory_order_acquire);
-    for (;;) {
-      if (activity & kClosed) throw PoolStoppedError();
-      if (activity & kStarted) throw PoolAlreadyStartedError();
-      if (state->activity.compare_exchange_weak(activity, activity | kStarted,
-                                                std::memory_order_acq_rel))
-        break;
+    std::uint64_t activity;
+    {
+      std::lock_guard lock(state->activityMutex);
+      activity = state->activity;
+      if (!(activity & (kClosed | kStarted))) state->activity |= kStarted;
     }
+    if (activity & kClosed) throw PoolStoppedError();
+    if (activity & kStarted) throw PoolAlreadyStartedError();
     state->target.store(count, std::memory_order_release);
     boost::asio::post(state->strand, [state, context = std::move(context)] {
       if (state->stopping) return;
@@ -166,8 +172,13 @@ class QueuedPool {
   void stop(Context context) {
     const auto state = state_;
     if (currentExecutingPool_ == state.get()) throw PoolSelfStopError();
-    if (!(state->activity.fetch_or(kClosed, std::memory_order_acq_rel) &
-          kClosed)) {
+    bool initiateStop;
+    {
+      std::lock_guard lock(state->activityMutex);
+      initiateStop = !(state->activity & kClosed);
+      state->activity |= kClosed;
+    }
+    if (initiateStop) {
       boost::asio::post(state->strand, [state] {
         state->stopping = true;
         state->started = true;  // drain accepted pre-start work too
@@ -230,18 +241,19 @@ class QueuedPool {
       pending.push_back(task);
     Deadlines pendingDeadline;
     if (task->deadline) pendingDeadline.emplace(*task->deadline, task);
-    auto activity = state->activity.load(std::memory_order_acquire);
-    for (;;) {
-      if (activity & kClosed) {
-        bestEffort([&] { state->taskRejectedCounter->inc(); });
-        throw PoolStoppedError();
-      }
-      if ((activity & kCount) == kCount)
-        throw std::overflow_error("too many queued tasks");
-      if (state->activity.compare_exchange_weak(activity, activity + 1,
-                                                std::memory_order_acq_rel))
-        break;
+    std::uint64_t activity;
+    {
+      std::lock_guard lock(state->activityMutex);
+      activity = state->activity;
+      if (!(activity & kClosed) && (activity & kCount) != kCount)
+        ++state->activity;
     }
+    if (activity & kClosed) {
+      bestEffort([&] { state->taskRejectedCounter->inc(); });
+      throw PoolStoppedError();
+    }
+    if ((activity & kCount) == kCount)
+      throw std::overflow_error("too many queued tasks");
     try {
       boost::asio::post(
           state->strand,
@@ -266,7 +278,10 @@ class QueuedPool {
             dispatch(state);
           });
     } catch (...) {
-      state->activity.fetch_sub(1, std::memory_order_acq_rel);
+      {
+        std::lock_guard lock(state->activityMutex);
+        --state->activity;
+      }
       boost::asio::post(state->strand, [state] { checkDrain(state); });
       throw;
     }
@@ -310,8 +325,13 @@ class QueuedPool {
     });
   }
   static void checkDrain(const std::shared_ptr<State>& state) {
-    if (state->stopping && !state->completed &&
-        (state->activity.load(std::memory_order_acquire) & kCount) == 0) {
+    if (!state->stopping || state->completed) return;
+    bool drained;
+    {
+      std::lock_guard lock(state->activityMutex);
+      drained = (state->activity & kCount) == 0;
+    }
+    if (drained) {
       state->completed = true;
       publish(*state);
       state->drainPromise.set_value();
@@ -466,7 +486,10 @@ class QueuedPool {
           });
         boost::asio::post(state->strand, [state] {
           --state->busy;
-          state->activity.fetch_sub(1, std::memory_order_acq_rel);
+          {
+            std::lock_guard lock(state->activityMutex);
+            --state->activity;
+          }
           dispatch(state);
         });
       });

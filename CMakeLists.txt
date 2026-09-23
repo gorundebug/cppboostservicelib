@@ -270,6 +270,12 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
 
   add_executable(cppboostservicelib_operators_test
       tests/operators_compile_test.cpp)
+  add_executable(cppboostservicelib_direct_caller_queue_test
+      tests/direct_caller_queue_test.cpp)
+  target_link_libraries(cppboostservicelib_direct_caller_queue_test PRIVATE
+      servicelib::servicelib)
+  add_test(NAME cppboostservicelib_direct_caller_queue_test
+      COMMAND cppboostservicelib_direct_caller_queue_test)
   add_executable(cppboostservicelib_substream_test tests/substream_test.cpp)
   target_link_libraries(cppboostservicelib_substream_test PRIVATE
       servicelib::servicelib GTest::gtest_main)
@@ -471,9 +477,3 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/cppboostservicelibConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/cppboostservicelibConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cppboostservicelib)
-
-if(TARGET cppboostservicelib_grpc_client_benchmark)
-  add_executable(cppboostservicelib_direct_caller_queue_test tests/direct_caller_queue_test.cpp)
-  target_link_libraries(cppboostservicelib_direct_caller_queue_test PRIVATE servicelib::grpc)
-  add_test(NAME cppboostservicelib_direct_caller_queue_test COMMAND cppboostservicelib_direct_caller_queue_test)
-endif()

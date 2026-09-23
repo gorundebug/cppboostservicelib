@@ -236,9 +236,12 @@ class Runtime final {
   }
 
   void Start() {
-    State expected = State::kCreated;
-    if (!state_.compare_exchange_strong(expected, State::kRunning)) {
-      throw std::logic_error("Asio runtime can only be started once");
+    {
+      std::lock_guard lock(stateMutex_);
+      State expected = State::kCreated;
+      if (!state_.compare_exchange_strong(expected, State::kRunning)) {
+        throw std::logic_error("Asio runtime can only be started once");
+      }
     }
     detail::ParallelExecutorRegistry::Set(executor_);
     try {
@@ -261,27 +264,27 @@ class Runtime final {
   void start() { Start(); }
 
   void Stop() noexcept {
-    auto state = state_.load(std::memory_order_acquire);
-    while (state == State::kCreated || state == State::kRunning) {
-      if (state_.compare_exchange_weak(state, State::kStopping)) {
-        work_.reset();
-        if (metricsTimer_) {
-          try {
-            metricsTimer_->cancel();
-          } catch (...) {
-          }
-        }
-        {
-          std::lock_guard lock(signalMutex_);
-          if (signalSet_) {
-            boost::system::error_code ignored;
-            signalSet_->cancel(ignored);
-          }
-        }
-        ioContext_.stop();
-        return;
+    {
+      std::lock_guard lock(stateMutex_);
+      const auto state = state_.load(std::memory_order_acquire);
+      if (state != State::kCreated && state != State::kRunning) return;
+      state_.store(State::kStopping, std::memory_order_release);
+    }
+    work_.reset();
+    if (metricsTimer_) {
+      try {
+        metricsTimer_->cancel();
+      } catch (...) {
       }
     }
+    {
+      std::lock_guard lock(signalMutex_);
+      if (signalSet_) {
+        boost::system::error_code ignored;
+        signalSet_->cancel(ignored);
+      }
+    }
+    ioContext_.stop();
   }
 
   void stop() noexcept { Stop(); }
@@ -292,8 +295,11 @@ class Runtime final {
       if (worker.joinable()) worker.join();
     }
     workers_.clear();
-    if (state_.load(std::memory_order_acquire) == State::kStopping) {
-      state_.store(State::kStopped, std::memory_order_release);
+    {
+      std::lock_guard stateLock(stateMutex_);
+      if (state_.load(std::memory_order_acquire) == State::kStopping) {
+        state_.store(State::kStopped, std::memory_order_release);
+      }
     }
     if (blockingPool_) {
       blockingPool_->stop();
@@ -420,6 +426,7 @@ class Runtime final {
   boost::asio::any_io_executor executor_;
   std::unique_ptr<boost::asio::steady_timer> metricsTimer_;
   std::atomic<State> state_{State::kCreated};
+  std::mutex stateMutex_;
   std::mutex joinMutex_;
   std::mutex signalMutex_;
   std::unique_ptr<boost::asio::signal_set> signalSet_;

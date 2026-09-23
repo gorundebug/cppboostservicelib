@@ -24,7 +24,8 @@
 
 namespace servicelib::detail {
 
-// One-shot notification. Registration and publication use an atomic list;
+// One-shot notification. A mutex protects registration and list detachment;
+// waiters are notified only after releasing the mutex.
 // synchronous waiters allocate their blocking future only at the sync boundary.
 class SingleUseEvent final {
   using AsyncSignal = boost::asio::experimental::concurrent_channel<
@@ -56,7 +57,7 @@ class SingleUseEvent final {
   SingleUseEvent(const SingleUseEvent&) = delete;
   SingleUseEvent& operator=(const SingleUseEvent&) = delete;
   ~SingleUseEvent() {
-    auto* waiter = waiters_.load(std::memory_order_relaxed);
+    auto* waiter = waiters_;
     while (waiter && waiter != &readyMarker_) {
       auto* next = waiter->next;
       delete waiter;
@@ -65,7 +66,11 @@ class SingleUseEvent final {
   }
 
   void Send() noexcept {
-    auto* waiter = waiters_.exchange(&readyMarker_, std::memory_order_acq_rel);
+    Waiter* waiter;
+    {
+      std::lock_guard lock(waitersMutex_);
+      waiter = std::exchange(waiters_, &readyMarker_);
+    }
     while (waiter && waiter != &readyMarker_) {
       auto* next = waiter->next;
       waiter->Wake();
@@ -92,7 +97,8 @@ class SingleUseEvent final {
   }
 
   [[nodiscard]] bool IsReady() const noexcept {
-    return waiters_.load(std::memory_order_acquire) == &readyMarker_;
+    std::lock_guard lock(waitersMutex_);
+    return waiters_ == &readyMarker_;
   }
 
   boost::asio::awaitable<void> AsyncWait() { return AsyncWaitImpl(nullptr); }
@@ -102,18 +108,11 @@ class SingleUseEvent final {
 
  private:
   bool Register(std::unique_ptr<Waiter> waiter) noexcept {
-    auto* before = waiters_.load(std::memory_order_acquire);
-    while (before != &readyMarker_) {
-      // Before publication only this thread accesses the node. The list is
-      // removed exactly once, so there is no ABA or dereference of old heads.
-      waiter->next = before;
-      if (waiters_.compare_exchange_weak(before, waiter.get(),
-            std::memory_order_release, std::memory_order_acquire)) {
-        static_cast<void>(waiter.release());
-        return true;
-      }
-    }
-    return false;
+    std::lock_guard lock(waitersMutex_);
+    if (waiters_ == &readyMarker_) return false;
+    waiter->next = waiters_;
+    waiters_ = waiter.release();
+    return true;
   }
 
   boost::asio::awaitable<void> AsyncWaitImpl(const Context* context) {
@@ -146,7 +145,8 @@ class SingleUseEvent final {
   }
 
   inline static Waiter readyMarker_;
-  std::atomic<Waiter*> waiters_{};
+  mutable std::mutex waitersMutex_;
+  Waiter* waiters_{};
 };
 
 class TaskStorage final {

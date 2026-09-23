@@ -17,6 +17,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <utility>
@@ -30,9 +31,7 @@ namespace servicelib::pool {
 
 class DelayPoolImpl final : public IDelayPool {
  private:
-  static constexpr std::uint64_t kClosed = std::uint64_t{1} << 63;
-  static constexpr std::uint64_t kStarted = std::uint64_t{1} << 62;
-  static constexpr std::uint64_t kCountMask = kStarted - 1;
+  static constexpr std::uint64_t kMaxActiveTasks = (std::uint64_t{1} << 62) - 1;
   struct SharedState;
   struct DelayTask;
   using TimerQueue = std::multimap<std::chrono::steady_clock::time_point,
@@ -89,9 +88,13 @@ class DelayPoolImpl final : public IDelayPool {
     TimerQueue timers;
     std::optional<std::chrono::steady_clock::time_point> armedAt;
     std::uint64_t generation{};
-    // Admission and shutdown are linearized without blocking reactor threads.
-    std::atomic<std::uint64_t> activity{0};
-    std::atomic<bool> drainSignalled{false};
+    // Admission, retirement and shutdown share a short critical section.
+    // User code, metrics, notifications and waits run outside this mutex.
+    std::mutex activityMutex;
+    std::uint64_t activeTasks{};
+    bool started{};
+    bool closed{};
+    bool drainSignalled{};
     std::promise<void> drainPromise;
     std::shared_future<void> drained;
     bool metricsEnabled{};
@@ -108,28 +111,40 @@ class DelayPoolImpl final : public IDelayPool {
       : state_(std::make_shared<SharedState>(env)) {}
 
   ~DelayPoolImpl() override {
-    const auto activity = state_->activity.load(std::memory_order_acquire);
-    if ((activity & kCountMask) != 0 ||
-        ((activity & kStarted) && !(activity & kClosed))) std::terminate();
+    bool unfinished;
+    {
+      std::lock_guard lock(state_->activityMutex);
+      unfinished = state_->activeTasks != 0 ||
+                   (state_->started && !state_->closed);
+    }
+    if (unfinished) std::terminate();
   }
 
   void start([[maybe_unused]] Context ctx) override {
-    auto activity = state_->activity.load(std::memory_order_acquire);
-    for (;;) {
-      if (activity & kClosed) throw PoolStoppedError();
-      if (activity & kStarted) throw PoolAlreadyStartedError();
-      if (state_->activity.compare_exchange_weak(activity, activity | kStarted,
-                                                std::memory_order_acq_rel)) return;
+    bool closed;
+    bool started;
+    {
+      std::lock_guard lock(state_->activityMutex);
+      closed = state_->closed;
+      started = state_->started;
+      if (!closed && !started) state_->started = true;
     }
+    if (closed) throw PoolStoppedError();
+    if (started) throw PoolAlreadyStartedError();
   }
 
   void stop(Context ctx) override {
     const auto state = state_;
     if (currentExecutingPool_ == state.get()) throw PoolSelfStopError();
-    const auto activity = state->activity.fetch_or(kClosed, std::memory_order_acq_rel);
-    if ((activity & kCountMask) == 0) signalDrained(state);
+    bool drained;
+    {
+      std::lock_guard lock(state->activityMutex);
+      state->closed = true;
+      drained = state->activeTasks == 0;
+    }
+    if (drained) signalDrained(state);
     // This synchronous lifecycle boundary is called off-reactor by ServiceApp.
-    // Neither scheduling nor executing callbacks waits on a future or OS lock.
+    // Never hold the activity mutex while waiting for accepted work to finish.
     if (ctx.deadline() && state->drained.wait_until(*ctx.deadline()) == std::future_status::timeout) {
       recordStopTimeout(state);
     }
@@ -191,16 +206,19 @@ class DelayPoolImpl final : public IDelayPool {
     // silently discard accepted work. The strand inserts this node allocation-free.
     TimerQueue staging;
     auto node = staging.extract(staging.emplace(runAt, task));
-    auto activity = state->activity.load(std::memory_order_acquire);
-    for (;;) {
-      if (activity & kClosed) {
-        bestEffort([state] { state->taskRejectedCounter->inc(); });
-        throw PoolStoppedError();
-      }
-      if ((activity & kCountMask) == kCountMask) throw std::overflow_error("too many delay tasks");
-      if (state->activity.compare_exchange_weak(activity, activity + 1,
-                                               std::memory_order_acq_rel)) break;
+    bool closed;
+    bool full;
+    {
+      std::lock_guard lock(state->activityMutex);
+      closed = state->closed;
+      full = state->activeTasks == kMaxActiveTasks;
+      if (!closed && !full) ++state->activeTasks;
     }
+    if (closed) {
+      bestEffort([state] { state->taskRejectedCounter->inc(); });
+      throw PoolStoppedError();
+    }
+    if (full) throw std::overflow_error("too many delay tasks");
     if (state->metricsEnabled) bestEffort([state] { state->gaugeWaitQueueLength->inc(); });
     try {
       boost::asio::post(state->strand, [state, task, node = std::move(node)]() mutable {
@@ -219,7 +237,8 @@ class DelayPoolImpl final : public IDelayPool {
   }
 
   [[nodiscard]] std::int64_t activeTasksApprox() const noexcept {
-    return state_->activity.load(std::memory_order_acquire) & kCountMask;
+    std::lock_guard lock(state_->activityMutex);
+    return static_cast<std::int64_t>(state_->activeTasks);
   }
 
  private:
@@ -232,13 +251,23 @@ class DelayPoolImpl final : public IDelayPool {
   }
 
   static void signalDrained(const std::shared_ptr<SharedState>& state) {
-    if (!state->drainSignalled.exchange(true, std::memory_order_acq_rel)) state->drainPromise.set_value();
+    {
+      std::lock_guard lock(state->activityMutex);
+      if (state->drainSignalled) return;
+      state->drainSignalled = true;
+    }
+    state->drainPromise.set_value();
   }
 
   static void retire(const std::shared_ptr<SharedState>& state) {
     if (state->metricsEnabled) bestEffort([state] { state->gaugeWaitQueueLength->dec(); });
-    const auto previous = state->activity.fetch_sub(1, std::memory_order_acq_rel);
-    if ((previous & kClosed) && (previous & kCountMask) == 1) signalDrained(state);
+    bool drained;
+    {
+      std::lock_guard lock(state->activityMutex);
+      --state->activeTasks;
+      drained = state->closed && state->activeTasks == 0;
+    }
+    if (drained) signalDrained(state);
   }
 
   static void dispatch(const std::shared_ptr<DelayTask>& task, bool expedited) {

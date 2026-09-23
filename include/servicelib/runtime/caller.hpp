@@ -220,8 +220,7 @@ class DirectCaller final : public Caller<T> {
 
   void consume(MessageContext ctx, Payload<T> payload) override {
     this->recordMessage();
-    auto job = std::make_shared<Job>(
-        Job{std::move(ctx), std::move(payload)});
+    auto job = std::make_shared<Job>(std::move(ctx), std::move(payload));
     bool start = false;
     const OrderingKey* orderingKey = nullptr;
     {
@@ -250,7 +249,16 @@ class DirectCaller final : public Caller<T> {
   bool isAsync() const noexcept override { return async_; }
 
  private:
-  struct Job final {
+  struct Job final : AsyncCompletionState {
+    Job(MessageContext contextValue, Payload<T> payloadValue)
+        : AsyncCompletionState({}),
+          context(std::move(contextValue)), payload(std::move(payloadValue)) {}
+
+    void startCompletion(std::function<void()> completion,
+                         AsyncCompletionToken parent) {
+      initializeCompletion(std::move(completion), std::move(parent));
+    }
+
     MessageContext context;
     Payload<T> payload;
     std::shared_ptr<Job> next{};
@@ -269,11 +277,11 @@ class DirectCaller final : public Caller<T> {
       activeSpan = std::make_shared<tracing::ActiveSpan>(
           this->startCallSpan(job->context));
     }
-    auto parent = job->context.retainCompletion();
+    auto parent = job->context.retainCompletionToken();
     // unordered_map rehashing preserves key references. The active completion
     // owns the queue's progress and is the only path that erases this key;
     // after erasing it, the callback returns without dereferencing it again.
-    auto completion = AsyncCompletionState::make(
+    job->startCompletion(
         [this, key = &streamId, activeSpan = std::move(activeSpan)] {
           std::shared_ptr<Job> next;
           {
@@ -290,6 +298,9 @@ class DirectCaller final : public Caller<T> {
           dispatch(*key, std::move(next));
         },
         std::move(parent));
+    // The job and its logical completion share one allocation/control block.
+    // Context copies and delayed tokens keep the entire frame alive.
+    auto completion = std::static_pointer_cast<AsyncCompletionState>(job);
     auto context = std::move(job->context).withCompletion(completion);
     try {
       consumer_.consume(std::move(context), std::move(job->payload));
