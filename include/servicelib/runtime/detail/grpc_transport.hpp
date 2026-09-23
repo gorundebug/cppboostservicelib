@@ -5,11 +5,13 @@
 
 #include <agrpc/client_rpc.hpp>
 #include <agrpc/default_server_rpc_traits.hpp>
-#include <agrpc/register_awaitable_rpc_handler.hpp>
+#include <agrpc/register_callback_rpc_handler.hpp>
 #include <agrpc/server_rpc.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/bind_executor.hpp>
+#include <boost/asio/associated_executor.hpp>
+#include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -22,6 +24,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -36,6 +39,29 @@ struct UnaryResult final {
 };
 
 namespace detail {
+
+// Re-arm the next request on the CQ before scheduling business work. Awaitable
+// registration otherwise resumes acceptance on the business executor too,
+// leaving no pending receive while that executor is busy.
+template <typename RPC, typename Service, typename Handler, typename Token>
+auto RegisterRpcHandler(agrpc::GrpcContext& context, Service& service,
+                        Handler handler, Token&& token) {
+  auto executor = boost::asio::get_associated_executor(
+      token, context.get_executor());
+  auto sharedHandler =
+      std::make_shared<std::decay_t<Handler>>(std::move(handler));
+  return agrpc::register_callback_rpc_handler<RPC>(
+      context, service,
+      [sharedHandler, executor](typename RPC::Ptr rpc, auto&... request) {
+        auto operation = std::invoke(*sharedHandler, *rpc, request...);
+        boost::asio::co_spawn(
+            executor, std::move(operation),
+            // Retain both the request and coroutine closure through completion.
+            // RPC::Ptr also cancels an unfinished RPC on exceptional completion.
+            [rpc = std::move(rpc), sharedHandler](std::exception_ptr) {});
+      },
+      std::forward<Token>(token));
+}
 
 struct NotifyWhenDoneTraits : agrpc::DefaultServerRPCTraits {
   static constexpr bool NOTIFY_WHEN_DONE = true;
@@ -153,7 +179,7 @@ void RegisterUnarySource(agrpc::GrpcContext& grpcContext,
                          boost::asio::any_io_executor handlerExecutor = {}) {
   using RPC = detail::ObservableServerRPC<RequestMethod>;
   if (!handlerExecutor) handlerExecutor = grpcContext.get_executor();
-  agrpc::register_awaitable_rpc_handler<RPC>(
+  detail::RegisterRpcHandler<RPC>(
       grpcContext, service,
       [handler = std::move(handler)](
           RPC& rpc, typename RPC::Request& request) mutable

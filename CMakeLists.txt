@@ -427,6 +427,17 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
     add_test(NAME cppboostservicelib_grpc_unary_test
         COMMAND cppboostservicelib_grpc_unary_test)
 
+    # Explicit diagnostic target, not a timing-dependent correctness test.
+    add_executable(cppboostservicelib_grpc_client_benchmark EXCLUDE_FROM_ALL
+        tests/grpc_client_benchmark.cpp)
+    target_link_libraries(cppboostservicelib_grpc_client_benchmark PRIVATE
+        servicelib::grpc cppboostservicelib_test_proto)
+
+    add_executable(cppboostservicelib_http_endpoint_benchmark EXCLUDE_FROM_ALL
+        tests/http_endpoint_benchmark.cpp)
+    target_link_libraries(cppboostservicelib_http_endpoint_benchmark PRIVATE
+        servicelib::grpc cppboostservicelib_test_proto)
+
     add_executable(cppboostservicelib_grpc_streaming_test
         tests/grpc_streaming_test.cpp)
     target_link_libraries(cppboostservicelib_grpc_streaming_test PRIVATE
@@ -460,3 +471,9 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/cppboostservicelibConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/cppboostservicelibConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cppboostservicelib)
+
+if(TARGET cppboostservicelib_grpc_client_benchmark)
+  add_executable(cppboostservicelib_direct_caller_queue_test tests/direct_caller_queue_test.cpp)
+  target_link_libraries(cppboostservicelib_direct_caller_queue_test PRIVATE servicelib::grpc)
+  add_test(NAME cppboostservicelib_direct_caller_queue_test COMMAND cppboostservicelib_direct_caller_queue_test)
+endif()

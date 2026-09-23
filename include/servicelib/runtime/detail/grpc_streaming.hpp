@@ -6,7 +6,6 @@
 #include <servicelib/runtime/detail/grpc_transport.hpp>
 
 #include <agrpc/client_rpc.hpp>
-#include <agrpc/register_awaitable_rpc_handler.hpp>
 #include <agrpc/server_rpc.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/any_io_executor.hpp>
@@ -391,7 +390,7 @@ void RegisterClientStreamingSource(agrpc::GrpcContext& grpcContext,
                                    boost::asio::any_io_executor handlerExecutor = {}) {
   using RPC = detail::ObservableServerRPC<RequestMethod>;
   if (!handlerExecutor) handlerExecutor = grpcContext.get_executor();
-  agrpc::register_awaitable_rpc_handler<RPC>(
+  detail::RegisterRpcHandler<RPC>(
       grpcContext, service,
       [handler = std::move(handler)](RPC& rpc) mutable
           -> boost::asio::awaitable<void> {
@@ -442,7 +441,7 @@ void RegisterServerStreamingSource(agrpc::GrpcContext& grpcContext,
                                    boost::asio::any_io_executor handlerExecutor = {}) {
   using RPC = detail::ObservableServerRPC<RequestMethod>;
   if (!handlerExecutor) handlerExecutor = grpcContext.get_executor();
-  agrpc::register_awaitable_rpc_handler<RPC>(
+  detail::RegisterRpcHandler<RPC>(
       grpcContext, service,
       [handler = std::move(handler)](
           RPC& rpc, typename RPC::Request& request) mutable
@@ -493,7 +492,7 @@ void RegisterBidirectionalStreamingSource(agrpc::GrpcContext& grpcContext,
                                           boost::asio::any_io_executor handlerExecutor = {}) {
   using RPC = detail::ObservableServerRPC<RequestMethod>;
   if (!handlerExecutor) handlerExecutor = grpcContext.get_executor();
-  agrpc::register_awaitable_rpc_handler<RPC>(
+  detail::RegisterRpcHandler<RPC>(
       grpcContext, service,
       [handler = std::move(handler)](RPC& rpc) mutable
           -> boost::asio::awaitable<void> {

@@ -84,7 +84,47 @@ void CheckImmediateAndWorkerStop() {
   }
 }
 
+void CheckSchedulerIsolation() {
+  servicelib::async::GrpcRuntime::Options options;
+  options.workers = 2;
+  servicelib::async::GrpcRuntime runtime(options);
+  runtime.Start();
+
+  std::promise<void> release;
+  auto gate = release.get_future().share();
+  std::promise<void> businessStarted;
+  auto businessReady = businessStarted.get_future();
+  std::atomic<int> businessWorkers{0};
+  for (int index = 0; index < 2; ++index) {
+    boost::asio::post(runtime.executor(), [&] {
+      if (businessWorkers.fetch_add(1) == 1) businessStarted.set_value();
+      gate.wait();
+    });
+  }
+  const bool businessConcurrent =
+      businessReady.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+
+  std::promise<void> completionsStarted;
+  auto completionsReady = completionsStarted.get_future();
+  std::atomic<int> completionWorkers{0};
+  for (int index = 0; index < 2; ++index) {
+    boost::asio::post(runtime.grpcContext().get_executor(), [&] {
+      if (completionWorkers.fetch_add(1) == 1) completionsStarted.set_value();
+      gate.wait();
+    });
+  }
+  const bool completionsConcurrent =
+      completionsReady.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  release.set_value();
+  runtime.Stop();
+  runtime.Join();
+  Require(businessConcurrent, "Asio business workers must run concurrently");
+  Require(completionsConcurrent,
+          "Multiple gRPC workers must progress independently of busy Asio workers");
+}
+
 int main() {
+  CheckSchedulerIsolation();
   CheckIdleAndWakeup(1);
   CheckIdleAndWakeup(18);
   CheckImmediateAndWorkerStop();

@@ -6,13 +6,9 @@
 #include <agrpc/grpc_executor.hpp>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/co_spawn.hpp>
-#include <boost/asio/execution.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/post.hpp>
-#include <boost/asio/prefer.hpp>
-#include <boost/asio/query.hpp>
-#include <boost/asio/require.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
@@ -48,70 +44,6 @@ class RuntimeIoContext : public boost::asio::io_context {
   void ShutdownServices() noexcept { shutdown(); }
 };
 
-// Keep Asio I/O services on their io_context, but execute their associated
-// handlers on the same worker set as gRPC completions. In particular, sockets
-// and timers constructed with runtime.executor() must not create an unpumped
-// Asio reactor inside GrpcContext. Property adaptations retain both contexts.
-class GrpcIoExecutor final {
- public:
-  GrpcIoExecutor() = default;
-  GrpcIoExecutor(boost::asio::execution_context& ioContext,
-                 boost::asio::any_io_executor executor)
-      : ioContext_(&ioContext), executor_(std::move(executor)) {}
-
-  boost::asio::execution_context& query(
-      boost::asio::execution::context_t) const noexcept {
-    return *ioContext_;
-  }
-  boost::asio::execution_context& query(
-      boost::asio::execution::context_as_t<
-          boost::asio::execution_context&>) const noexcept {
-    return *ioContext_;
-  }
-
-  template <typename Property>
-  auto query(const Property& property) const
-      noexcept(noexcept(boost::asio::query(executor_, property)))
-      -> decltype(boost::asio::query(
-          std::declval<const boost::asio::any_io_executor&>(), property)) {
-    return boost::asio::query(executor_, property);
-  }
-
-  template <typename Property,
-            typename = decltype(boost::asio::require(
-                std::declval<const boost::asio::any_io_executor&>(),
-                std::declval<const Property&>()))>
-  GrpcIoExecutor require(const Property& property) const {
-    return {*ioContext_, boost::asio::require(executor_, property)};
-  }
-
-  template <typename Property,
-            typename = decltype(boost::asio::prefer(
-                std::declval<const boost::asio::any_io_executor&>(),
-                std::declval<const Property&>()))>
-  GrpcIoExecutor prefer(const Property& property) const {
-    return {*ioContext_, boost::asio::prefer(executor_, property)};
-  }
-
-  template <typename Function>
-  void execute(Function&& function) const {
-    executor_.execute(std::forward<Function>(function));
-  }
-
-  friend bool operator==(const GrpcIoExecutor& left,
-                         const GrpcIoExecutor& right) noexcept {
-    return left.ioContext_ == right.ioContext_ &&
-           left.executor_ == right.executor_;
-  }
-  friend bool operator!=(const GrpcIoExecutor& left,
-                         const GrpcIoExecutor& right) noexcept {
-    return !(left == right);
-  }
-
- private:
-  boost::asio::execution_context* ioContext_{};
-  boost::asio::any_io_executor executor_;
-};
 
 }  // namespace runtime_detail
 
@@ -130,11 +62,9 @@ inline void ConfigureGrpcRuntimeDefaults() noexcept {
 #endif
 }
 
-// The fixed-width worker set runs both gRPC completions and business handlers.
-// A separate Asio event loop services sockets, timers and signals; their
-// associated handlers return to the worker executor. Both contexts block for
-// events without periodically polling each other. There is no dedicated
-// single-threaded gRPC completion dispatcher or second business-worker pool.
+// Asio workers run I/O and business continuations on their native executor.
+// A separate worker set waits for gRPC completions without polling. Keeping
+// these schedulers separate lets completions progress while business work runs.
 class GrpcRuntime final {
  public:
   enum class State { kCreated, kRunning, kStopping, kStopped };
@@ -161,8 +91,7 @@ class GrpcRuntime final {
                      ? runtime_detail::RuntimeMetrics::Create(
                            *options_.metrics, options_.workers)
                      : nullptr),
-        executor_(runtime_detail::GrpcIoExecutor{
-            ioContext_, grpcContext_->get_executor()}),
+        executor_(ioContext_.get_executor()),
         grpcExecutor_(executor_) {}
 
   GrpcRuntime(const GrpcRuntime&) = delete;
@@ -183,7 +112,9 @@ class GrpcRuntime final {
       blockingPool_ = std::make_unique<boost::asio::thread_pool>(
           BlockingWorkers(options_.workers));
       detail::BlockingExecutorRegistry::Set(blockingPool_->get_executor());
-      ioWorker_ = std::thread([this] { RunIo(); });
+      grpcWorkers_.reserve(options_.workers);
+      for (std::size_t index = 0; index < options_.workers; ++index)
+        grpcWorkers_.emplace_back([this] { RunGrpc(); });
       workers_.reserve(options_.workers);
       for (std::size_t index = 0; index < options_.workers; ++index)
         workers_.emplace_back([this, index] { RunWorker(index); });
@@ -235,7 +166,9 @@ class GrpcRuntime final {
     for (auto& worker : workers_)
       if (worker.joinable()) worker.join();
     workers_.clear();
-    if (ioWorker_.joinable()) ioWorker_.join();
+    for (auto& worker : grpcWorkers_)
+      if (worker.joinable()) worker.join();
+    grpcWorkers_.clear();
     // No completion-queue runner remains when releasing its work guard.
     grpcWork_.reset();
     if (state_.load() == State::kStopping) state_.store(State::kStopped);
@@ -339,7 +272,7 @@ class GrpcRuntime final {
     if (state() != State::kRunning)
       throw std::logic_error("cannot spawn on a stopped gRPC runtime");
   }
-  void RunWorker(std::size_t) noexcept {
+  void RunGrpc() noexcept {
     try {
       grpcContext_->run_while([this] {
         return state_.load(std::memory_order_acquire) == State::kRunning;
@@ -349,7 +282,7 @@ class GrpcRuntime final {
       Stop();
     }
   }
-  void RunIo() noexcept {
+  void RunWorker(std::size_t) noexcept {
     try {
       ioContext_.run();
     } catch (...) {
@@ -397,7 +330,7 @@ class GrpcRuntime final {
   std::mutex signalMutex_;
   std::unique_ptr<boost::asio::signal_set> signalSet_;
   std::vector<std::thread> workers_;
-  std::thread ioWorker_;
+  std::vector<std::thread> grpcWorkers_;
   std::unique_ptr<boost::asio::thread_pool> blockingPool_;
 };
 

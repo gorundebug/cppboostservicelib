@@ -11,7 +11,6 @@
 #pragma once
 
 #include <atomic>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -203,8 +202,13 @@ class DirectCaller final : public Caller<T> {
     {
       std::lock_guard lock{mutex_};
       auto& queue = pending_[streamId];
-      start = queue.empty();
-      queue.push_back(job);
+      start = !queue.first;
+      if (queue.last) {
+        queue.last->next = job;
+      } else {
+        queue.first = job;
+      }
+      queue.last = job;
     }
     if (start) dispatch(streamId, std::move(job));
   }
@@ -215,6 +219,14 @@ class DirectCaller final : public Caller<T> {
   struct Job final {
     MessageContext context;
     Payload<T> payload;
+    std::shared_ptr<Job> next{};
+  };
+
+  // Keep the FIFO in the jobs themselves: a stream with one pending message
+  // needs no separate deque map or element block. All links are mutex-protected.
+  struct PendingQueue final {
+    std::shared_ptr<Job> first;
+    std::shared_ptr<Job> last;
   };
 
   void dispatch(const OrderingKey& streamId, std::shared_ptr<Job> job) {
@@ -231,12 +243,12 @@ class DirectCaller final : public Caller<T> {
             std::lock_guard lock{mutex_};
             auto found = pending_.find(streamId);
             if (found == pending_.end()) return;
-            found->second.pop_front();
-            if (found->second.empty()) {
+            next = std::move(found->second.first->next);
+            if (!next) {
               pending_.erase(found);
               return;
             }
-            next = found->second.front();
+            found->second.first = next;
           }
           dispatch(streamId, std::move(next));
         },
@@ -254,7 +266,7 @@ class DirectCaller final : public Caller<T> {
   StreamConsumer<T>& consumer_;
   bool async_{};
   std::mutex mutex_;
-  std::unordered_map<OrderingKey, std::deque<std::shared_ptr<Job>>, OrderingHash> pending_;
+  std::unordered_map<OrderingKey, PendingQueue, OrderingHash> pending_;
 };
 
 // ──────────────────────────────────────────────────────────────

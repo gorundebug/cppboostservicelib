@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace asio = boost::asio;
 using namespace std::chrono_literals;
@@ -63,15 +64,23 @@ int main() {
       receivedPooledCancelledContext.get_future();
   servicelib::detail::SingleUseEvent releasePooledCancelledRequest;
   std::atomic<bool> firstRequest{true};
+  constexpr int concurrentRequests = 64;
+  std::atomic<int> concurrentStarted{0};
+  std::promise<void> concurrentReady;
+  auto concurrentReadyFuture = concurrentReady.get_future();
+  servicelib::detail::SingleUseEvent releaseConcurrentRequests;
   servicelib::grpc_transport::RegisterUnarySource<
       &servicelib::test::ConnectorTest::AsyncService::RequestUnary>(
       runtime.grpcContext(), service,
       [&receivedContext, &releaseFirstRequest, &receivedCancelledContext,
        &releaseCancelledRequest, &receivedPooledCancelledContext,
-       &releasePooledCancelledRequest, &firstRequest](
+       &releasePooledCancelledRequest, &firstRequest, &runtime,
+       &concurrentStarted, &concurrentReady, &releaseConcurrentRequests](
           servicelib::MessageContext context,
           const servicelib::test::EchoRequest& request)
           -> asio::awaitable<servicelib::test::EchoResponse> {
+        Require(runtime.ioContext().get_executor().running_in_this_thread(),
+                "gRPC business handler left its Asio executor");
         if (firstRequest.exchange(false)) {
           receivedContext.set_value(context);
           co_await releaseFirstRequest.AsyncWait();
@@ -81,6 +90,10 @@ int main() {
         } else if (request.value() == "cancel-pooled") {
           receivedPooledCancelledContext.set_value(context);
           co_await releasePooledCancelledRequest.AsyncWait(context);
+        } else if (request.value().starts_with("concurrent-")) {
+          if (concurrentStarted.fetch_add(1) + 1 == concurrentRequests)
+            concurrentReady.set_value();
+          co_await releaseConcurrentRequests.AsyncWait();
         } else if (request.value() == "fail") {
           throw std::runtime_error("unary handler failed");
         } else if (context.streamId() == "expired") {
@@ -279,6 +292,39 @@ int main() {
     Require(!pooledError, "pooled unary call returned an error");
     Require(pooledResponse && pooledResponse->value() == "echo:pooled",
             "pooled unary response payload differs");
+
+    using Completion = std::pair<std::exception_ptr,
+                                  std::optional<servicelib::test::EchoResponse>>;
+    std::vector<std::future<Completion>> concurrentResults;
+    for (int index = 0; index < concurrentRequests; ++index) {
+      auto completion = std::make_shared<std::promise<Completion>>();
+      concurrentResults.push_back(completion->get_future());
+      servicelib::test::EchoRequest concurrentRequest;
+      concurrentRequest.set_value("concurrent-" + std::to_string(index));
+      pool.asyncUnary<
+          &servicelib::test::ConnectorTest::Stub::PrepareAsyncUnary,
+          servicelib::test::EchoRequest, servicelib::test::EchoResponse>(
+          std::move(concurrentRequest),
+          servicelib::datasink::grpc::callOptions(
+              servicelib::MessageContext{}.withDeadline(
+                  std::chrono::steady_clock::now() + 5s)),
+          [completion](std::exception_ptr error,
+                       std::optional<servicelib::test::EchoResponse> response) {
+            completion->set_value({std::move(error), std::move(response)});
+          });
+    }
+    const bool acceptedAll =
+        concurrentReadyFuture.wait_for(3s) == std::future_status::ready;
+    releaseConcurrentRequests.Send();
+    Require(acceptedAll, "gRPC acceptance waited for a previous business result");
+    for (std::size_t index = 0; index < concurrentResults.size(); ++index) {
+      Require(concurrentResults[index].wait_for(3s) == std::future_status::ready,
+              "concurrent gRPC response did not complete");
+      auto [error, response] = concurrentResults[index].get();
+      Require(!error && response &&
+                  response->value() == "echo:concurrent-" + std::to_string(index),
+              "concurrent gRPC request ownership or response differs");
+    }
 
     servicelib::test::EchoRequest failedPooledRequest;
     failedPooledRequest.set_value("fail");
