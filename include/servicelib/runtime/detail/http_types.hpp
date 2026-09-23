@@ -121,7 +121,8 @@ inline MessageContext ContextFromHeaders(const Headers& headers,
   return context;
 }
 
-inline void InjectContext(const MessageContext& context, Headers& headers) {
+inline void InjectContext(const MessageContext& context, Headers& headers,
+                          bool tracingEnabled = true) {
   if (!context.streamId().empty()) {
     headers["x-stream-id"] = std::string(context.streamId());
   }
@@ -131,14 +132,16 @@ inline void InjectContext(const MessageContext& context, Headers& headers) {
                  std::chrono::steady_clock::duration::zero()));
     headers["x-timeout-ms"] = std::to_string(remaining.count());
   }
-  const auto& trace = context.trace();
-  if (trace.isValid()) {
-    headers["traceparent"] = "00-" + trace.traceId + "-" + trace.spanId +
-                             (context.samplingEnabled() ? "-01" : "-00");
-    if (!trace.traceState.empty()) headers["tracestate"] = trace.traceState;
+  if (tracingEnabled) {
+    const auto& trace = context.trace();
+    if (trace.isValid()) {
+      headers["traceparent"] = "00-" + trace.traceId + "-" + trace.spanId +
+                               (context.samplingEnabled() ? "-01" : "-00");
+      if (!trace.traceState.empty()) headers["tracestate"] = trace.traceState;
+    }
+    if (!trace.baggage.empty()) headers["baggage"] = trace.baggage;
+    if (context.samplingEnabled()) headers["x-trace"] = "1";
   }
-  if (!trace.baggage.empty()) headers["baggage"] = trace.baggage;
-  if (context.samplingEnabled()) headers["x-trace"] = "1";
 }
 
 }  // namespace servicelib::http

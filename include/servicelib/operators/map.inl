@@ -54,8 +54,10 @@
 
     // Go: MapStream.Consume — calls f with collector; f may emit 0, 1, or many _TTp values
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.map");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.map");
+      }
       f_(ctx, *this, payload.get(), Collector<_TTp, MapImpl>(*this));
     }
 

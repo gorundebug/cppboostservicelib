@@ -133,8 +133,10 @@ class JoinImpl final : public Join<_TTp, _JTp, _JoinType, _JoinStrategy, _CCp>,
   using Join<_TTp, _JTp, _JoinType, _JoinStrategy, _CCp>::consume;
 
   void consume(MessageContext ctx, Payload<_Tp> payload) override {
-    [[maybe_unused]] auto activeSpan =
-        tracing::StartStreamSpan(ctx, *this, "stream.join");
+    tracing::ActiveSpan activeSpan;
+    if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+      activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.join");
+    }
     consumeValue(ctx, payload.get().first, 0,
                  payload.get().second);
   }

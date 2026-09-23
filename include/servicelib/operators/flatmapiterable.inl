@@ -37,8 +37,10 @@
     using FlatMapIterable<_CCp>::consume;
 
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.flatmap_iterable");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.flatmap_iterable");
+      }
       if (this->hasConsumer()) {
         auto& values = payload.get();
         auto current = std::begin(values);

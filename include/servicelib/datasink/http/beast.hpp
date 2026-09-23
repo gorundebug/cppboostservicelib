@@ -199,6 +199,7 @@ class BeastEndpoint final : public IEndpoint {
                 Handler handler)
       : environment_(stream.environment()),
         endpointId_(stream.endpointId()),
+        tracingEngineAvailable_(environment_.getTracing() != nullptr),
         streamIdentity_(resolveStreamIdentity(environment_, stream.streamConfigId())),
         endpointName_(endpointConfig(environment_, endpointId_).name),
         serviceName_(resolveServiceName(environment_)),
@@ -257,7 +258,7 @@ class BeastEndpoint final : public IEndpoint {
       metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
       co_return;
     }
-    tracing::SpanEvent(startedSpan.span(), "begin_request");
+    if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     auto begin = std::move(*beginResult);
     context = std::move(begin.context);
     const auto requestContext =
@@ -270,7 +271,7 @@ class BeastEndpoint final : public IEndpoint {
       Requester requester;
       handler_.consumeMessage(context, streamContext_, begin.state,
                               payload.get(), requester);
-      tracing::SpanEvent(startedSpan.span(), "consume_message");
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("consume_message");
       messageConsumed = true;
       request.emplace(requester.takeRequest());
     } catch (...) {
@@ -282,15 +283,16 @@ class BeastEndpoint final : public IEndpoint {
     if (!error) {
       request->headers[std::string{servicelib::kStreamIdHeader}] =
           requestContext.streamId();
-      if (tracing::SamplingEnabled(context)) {
+      if (tracingEngineAvailable_ &&
+          tracing::SamplingEnabled(context)) {
         request->headers[std::string{"X-Trace"}] = "1";
       }
       std::optional<Response> response;
       try {
         response.emplace(
             co_await client_.perform(std::move(*request), requestContext));
-        tracing::SpanEvent(
-            startedSpan.span(), "http_call",
+        if (auto* traceSpan = 
+            startedSpan.span()) traceSpan->addEvent("http_call",
             {tracing::Attribute::Int64("status_code", response->status)});
       } catch (...) {
         error = std::current_exception();
@@ -300,7 +302,7 @@ class BeastEndpoint final : public IEndpoint {
         try {
           handler_.handleResponse(context, streamContext_, begin.state,
                                   *response);
-          tracing::SpanEvent(startedSpan.span(), "handle_response");
+          if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("handle_response");
         } catch (...) {
           error = std::current_exception();
           traceError(startedSpan.span(), error, "handle_response.error");
@@ -316,7 +318,7 @@ class BeastEndpoint final : public IEndpoint {
   }
 
   [[nodiscard]] tracing::ActiveSpan startTrace(MessageContext& context) {
-    if (!tracing::SamplingEnabled(context)) return {};
+    if (!tracingEngineAvailable_ || !tracing::SamplingEnabled(context)) return {};
     auto* engine = environment_.getTracing();
     if (!engine) return {};
     auto tracer = engine->tracer(serviceName_);
@@ -331,10 +333,10 @@ class BeastEndpoint final : public IEndpoint {
 
   static void traceError(tracing::Span* span, std::exception_ptr error,
                          std::string_view event) {
+    if (!span) return;
     const auto message = tracing::ExceptionMessage(error);
     tracing::SpanError(span, message);
-    tracing::SpanEvent(span, event,
-                       {tracing::Attribute::String("error", message)});
+    span->addEvent(event, {tracing::Attribute::String("error", message)});
   }
 
   [[nodiscard]] static StreamTraceIdentity resolveStreamIdentity(
@@ -389,6 +391,7 @@ class BeastEndpoint final : public IEndpoint {
 
   IServiceEnvironment& environment_;
   int endpointId_;
+  bool tracingEngineAvailable_;
   StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   std::string serviceName_;

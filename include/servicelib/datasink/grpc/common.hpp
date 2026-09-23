@@ -38,12 +38,14 @@ class Sender final {
   void send(Req request) {
     try {
       send_(std::move(request));
-      tracing::SpanEvent(span_.get(), "send");
+      if (auto* traceSpan = span_.get()) traceSpan->addEvent("send");
     } catch (...) {
-      const auto message = tracing::ExceptionMessage(std::current_exception());
-      tracing::SpanError(span_.get(), message);
-      tracing::SpanEvent(span_.get(), "send.error",
-                         {tracing::Attribute::String("error", message)});
+      if (auto* traceSpan = span_.get()) {
+        const auto message = tracing::ExceptionMessage(std::current_exception());
+        tracing::SpanError(traceSpan, message);
+        traceSpan->addEvent(
+            "send.error", {tracing::Attribute::String("error", message)});
+      }
       throw;
     }
   }
@@ -157,10 +159,12 @@ class DataSink final {
 
 struct CallOptions final {
   MessageContext context;
+  bool tracingEnabled{true};
 };
 
-inline CallOptions callOptions(const MessageContext& context) {
-  return CallOptions{context};
+inline CallOptions callOptions(const MessageContext& context,
+                               bool tracingEnabled = true) {
+  return CallOptions{context, tracingEnabled};
 }
 
 template <typename T, typename R, typename Handler,
@@ -175,6 +179,7 @@ class Endpoint : public IEndpoint {
            api::GrpcMethodType expectedMethod, Handler handler)
       : environment_(stream.environment()),
         endpointId_(stream.endpointId()),
+        tracingEngineAvailable_(environment_.getTracing() != nullptr),
         streamIdentity_(resolveStreamIdentity(environment_, stream.streamConfigId())),
         endpointName_(endpointConfig().name),
         serviceName_(resolveServiceName(environment_)),
@@ -223,19 +228,23 @@ class Endpoint : public IEndpoint {
  private:
   IServiceEnvironment& environment_;
   int endpointId_;
+  bool tracingEngineAvailable_;
   StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   std::string serviceName_;
 
  protected:
+  [[nodiscard]] bool tracingEnabled() const noexcept {
+    return tracingEngineAvailable_;
+  }
+
   [[nodiscard]] tracing::ActiveSpan startTrace(MessageContext& context) {
-    if (!tracing::SamplingEnabled(context)) {
+    if (!tracingEngineAvailable_ || !tracing::SamplingEnabled(context)) return {};
+    auto* tracingEngine = environment_.getTracing();
+    if (!tracingEngine) {
       return {};
     }
-    std::shared_ptr<tracing::Tracer> tracer;
-    if (auto* tracingEngine = environment_.getTracing()) {
-      tracer = tracingEngine->tracer(serviceName_);
-    }
+    auto tracer = tracingEngine->tracer(serviceName_);
     if (!tracer) {
       return {};
     }
@@ -255,11 +264,13 @@ class Endpoint : public IEndpoint {
   };
 
   [[nodiscard]] DetachedTrace startDetachedTrace(MessageContext context) {
-    if (!tracing::SamplingEnabled(context)) {
+    if (!tracingEngineAvailable_ || !tracing::SamplingEnabled(context))
+      return {std::move(context), {}};
+    auto* tracingEngine = environment_.getTracing();
+    if (!tracingEngine) {
       return {std::move(context), {}};
     }
-    auto* tracingEngine = environment_.getTracing();
-    auto tracer = tracingEngine ? tracingEngine->tracer(serviceName_) : nullptr;
+    auto tracer = tracingEngine->tracer(serviceName_);
     if (!tracer) {
       return {std::move(context), {}};
     }
@@ -279,11 +290,11 @@ class Endpoint : public IEndpoint {
 
   static void traceError(tracing::Span* span, const std::exception_ptr& error,
                          std::string_view event = {}) {
+    if (!span) return;
     const auto message = tracing::ExceptionMessage(error);
     tracing::SpanError(span, message);
     if (!event.empty()) {
-      tracing::SpanEvent(span, event,
-                         {tracing::Attribute::String("error", message)});
+      span->addEvent(event, {tracing::Attribute::String("error", message)});
     }
   }
 

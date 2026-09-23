@@ -81,13 +81,21 @@ class RotatingMap final : public IStorage {
   [[nodiscard]] std::optional<V> get(const K& key) const
     requires std::copy_constructible<V>
   {
-    const auto& shard = ShardFor(*state_, key);
-    std::lock_guard lock(shard.mutex);
-    if (const auto it = shard.current.find(key); it != shard.current.end())
-      return it->second;
-    if (const auto it = shard.previous.find(key); it != shard.previous.end())
-      return it->second;
-    return std::nullopt;
+    return Get(key);
+  }
+
+  template <typename Lookup>
+    requires std::copy_constructible<V> &&
+             requires(const Hash& hash,
+                      const std::unordered_map<K, V, Hash, Equal>& entries,
+                      const Lookup& key) {
+               typename Hash::is_transparent;
+               typename Equal::is_transparent;
+               { hash(key) } -> std::convertible_to<std::size_t>;
+               entries.find(key);
+             }
+  [[nodiscard]] std::optional<V> get(const Lookup& key) const {
+    return Get(key);
   }
 
   [[nodiscard]] std::optional<V> pop(const K& key) {
@@ -141,11 +149,24 @@ class RotatingMap final : public IStorage {
     Hash hash;
   };
 
-  static Shard& ShardFor(State& state, const K& key) {
+  template <typename Lookup>
+  static Shard& ShardFor(State& state, const Lookup& key) {
     return state.shards[state.hash(key) % state.shards.size()];
   }
-  static const Shard& ShardFor(const State& state, const K& key) {
+  template <typename Lookup>
+  static const Shard& ShardFor(const State& state, const Lookup& key) {
     return state.shards[state.hash(key) % state.shards.size()];
+  }
+
+  template <typename Lookup>
+  [[nodiscard]] std::optional<V> Get(const Lookup& key) const {
+    const auto& shard = ShardFor(*state_, key);
+    std::lock_guard lock(shard.mutex);
+    if (const auto it = shard.current.find(key); it != shard.current.end())
+      return it->second;
+    if (const auto it = shard.previous.find(key); it != shard.previous.end())
+      return it->second;
+    return std::nullopt;
   }
 
   static void Arm(const std::shared_ptr<State>& state) {

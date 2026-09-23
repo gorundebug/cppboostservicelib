@@ -22,9 +22,10 @@ inline bool IsMetadataKey(std::string_view key) {
 }
 
 inline void InjectContext(const MessageContext& context,
-                          grpc::ClientContext& client) {
+                          grpc::ClientContext& client,
+                          bool tracingEnabled = true) {
   http::Headers headers;
-  http::InjectContext(context, headers);
+  http::InjectContext(context, headers, tracingEnabled);
   for (const auto& [key, value] : headers) client.AddMetadata(key, value);
 
   if (context.deadline()) {

@@ -182,10 +182,35 @@ class DirectCaller final : public Caller<T> {
     std::shared_ptr<const LocalExecutionScope> scope;
     bool operator==(const OrderingKey&) const = default;
   };
+  struct OrderingKeyView {
+    std::string_view streamId;
+    const LocalExecutionScope* scope;
+  };
   struct OrderingHash {
+    using is_transparent = void;
+
     std::size_t operator()(const OrderingKey& key) const noexcept {
-      return std::hash<std::string>{}(key.streamId) ^
-             std::hash<const LocalExecutionScope*>{}(key.scope.get());
+      return (*this)(OrderingKeyView{key.streamId, key.scope.get()});
+    }
+    std::size_t operator()(const OrderingKeyView& key) const noexcept {
+      return std::hash<std::string_view>{}(key.streamId) ^
+             std::hash<const LocalExecutionScope*>{}(key.scope);
+    }
+  };
+  struct OrderingEqual {
+    using is_transparent = void;
+
+    bool operator()(const OrderingKey& left,
+                    const OrderingKey& right) const noexcept {
+      return left == right;
+    }
+    bool operator()(const OrderingKey& left,
+                    const OrderingKeyView& right) const noexcept {
+      return left.streamId == right.streamId && left.scope.get() == right.scope;
+    }
+    bool operator()(const OrderingKeyView& left,
+                    const OrderingKey& right) const noexcept {
+      return (*this)(right, left);
     }
   };
  public:
@@ -195,13 +220,22 @@ class DirectCaller final : public Caller<T> {
 
   void consume(MessageContext ctx, Payload<T> payload) override {
     this->recordMessage();
-    const OrderingKey streamId{std::string{ctx.streamId()}, ctx.executionScope()};
     auto job = std::make_shared<Job>(
         Job{std::move(ctx), std::move(payload)});
     bool start = false;
+    const OrderingKey* orderingKey = nullptr;
     {
       std::lock_guard lock{mutex_};
-      auto& queue = pending_[streamId];
+      const OrderingKeyView lookup{job->context.streamId(),
+                                   job->context.executionScope().get()};
+      auto found = pending_.find(lookup);
+      if (found == pending_.end()) {
+        found = pending_.try_emplace(
+            OrderingKey{std::string{lookup.streamId},
+                        job->context.executionScope()}).first;
+      }
+      orderingKey = &found->first;
+      auto& queue = found->second;
       start = !queue.first;
       if (queue.last) {
         queue.last->next = job;
@@ -210,7 +244,7 @@ class DirectCaller final : public Caller<T> {
       }
       queue.last = job;
     }
-    if (start) dispatch(streamId, std::move(job));
+    if (start) dispatch(*orderingKey, std::move(job));
   }
 
   bool isAsync() const noexcept override { return async_; }
@@ -236,12 +270,15 @@ class DirectCaller final : public Caller<T> {
           this->startCallSpan(job->context));
     }
     auto parent = job->context.retainCompletion();
+    // unordered_map rehashing preserves key references. The active completion
+    // owns the queue's progress and is the only path that erases this key;
+    // after erasing it, the callback returns without dereferencing it again.
     auto completion = AsyncCompletionState::make(
-        [this, streamId, activeSpan = std::move(activeSpan)] {
+        [this, key = &streamId, activeSpan = std::move(activeSpan)] {
           std::shared_ptr<Job> next;
           {
             std::lock_guard lock{mutex_};
-            auto found = pending_.find(streamId);
+            auto found = pending_.find(*key);
             if (found == pending_.end()) return;
             next = std::move(found->second.first->next);
             if (!next) {
@@ -250,7 +287,7 @@ class DirectCaller final : public Caller<T> {
             }
             found->second.first = next;
           }
-          dispatch(streamId, std::move(next));
+          dispatch(*key, std::move(next));
         },
         std::move(parent));
     auto context = std::move(job->context).withCompletion(completion);
@@ -266,7 +303,7 @@ class DirectCaller final : public Caller<T> {
   StreamConsumer<T>& consumer_;
   bool async_{};
   std::mutex mutex_;
-  std::unordered_map<OrderingKey, PendingQueue, OrderingHash> pending_;
+  std::unordered_map<OrderingKey, PendingQueue, OrderingHash, OrderingEqual> pending_;
 };
 
 // ──────────────────────────────────────────────────────────────

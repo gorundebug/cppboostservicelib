@@ -251,8 +251,10 @@
 
    public:
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.split");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.split");
+      }
       for (std::size_t index = 0; index < this->dispatchers_.size(); ++index) {
         auto& dispatcher = this->dispatchers_[index];
         if (index + 1 == this->dispatchers_.size()) {

@@ -122,8 +122,10 @@ class InputStream final : public Stream<T, StreamConsumer<T>, Context> {
   void consume(MessageContext context, Payload<T> payload) override {
     [[maybe_unused]] auto invocation =
         this->context().beginInputInvocation();
-    [[maybe_unused]] auto activeSpan =
-        tracing::StartStreamSpan(context, *this, "stream.input");
+    tracing::ActiveSpan activeSpan;
+    if (this->getStreamTracer() && tracing::SamplingEnabled(context)) {
+      activeSpan = tracing::StartStreamSpan(context, *this, "stream.input");
+    }
     if (this->hasConsumer()) {
       this->context().template consume<T>(
           std::move(context), *this, *this->consumer(), std::move(payload));

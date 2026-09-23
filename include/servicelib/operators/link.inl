@@ -15,8 +15,10 @@
 
    public:
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.link");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.link");
+      }
       if (this->hasConsumer()) {
         preparedCaller_(ctx, std::move(payload));
       }

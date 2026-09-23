@@ -26,7 +26,8 @@ namespace servicelib {
 
 template <typename TEnvironment>
 [[nodiscard]] MessageContext ApplyDataSourceEndpointTracing(
-    MessageContext context, const TEnvironment& environment, int endpointId) {
+    MessageContext context, TEnvironment& environment, int endpointId) {
+  if (!environment.getTracing()) return context;
   const auto runtime = environment.getRuntimeConfigSnapshot();
   const auto endpoint = runtime ? runtime->GetEndpointConfigByID(endpointId)
                                 : std::nullopt;
@@ -171,7 +172,7 @@ class DataSourceEndpointMetrics final {
                     {log::Field::Str("endpoint", endpoint_),
                      log::Field::Err(error.empty() ? "<unknown>" : error)});
     });
-    bestEffortTelemetry([this] { beginRequestFailed_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { beginRequestFailed_->inc(); });
   }
 
   void missingStreamId() noexcept {
@@ -179,7 +180,7 @@ class DataSourceEndpointMetrics final {
       logger_.error("consumeResult called without streamID",
                     {log::Field::Str("endpoint", endpoint_)});
     });
-    bestEffortTelemetry([this] { missingStreamId_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { missingStreamId_->inc(); });
   }
 
   void lateResult(std::string_view sessionId = {}) noexcept {
@@ -188,7 +189,7 @@ class DataSourceEndpointMetrics final {
                    {log::Field::Str("endpoint", endpoint_),
                     log::Field::Str("session_id", sessionId)});
     });
-    bestEffortTelemetry([this] { lateResult_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { lateResult_->inc(); });
   }
 
   void unknownMessageId(std::string_view sessionId = {},
@@ -200,7 +201,7 @@ class DataSourceEndpointMetrics final {
                     log::Field::Str("message_id", messageId),
                     log::Field::Str("session_id", sessionId)});
     });
-    bestEffortTelemetry([this] { unknownMessageId_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { unknownMessageId_->inc(); });
   }
 
   void duplicateMessageId(std::string_view sessionId = {},
@@ -212,7 +213,7 @@ class DataSourceEndpointMetrics final {
                     log::Field::Str("message_id", messageId),
                     log::Field::Str("session_id", sessionId)});
     });
-    bestEffortTelemetry([this] { duplicateMessageId_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { duplicateMessageId_->inc(); });
   }
 
   void invalidHttpMethod(std::string_view method = {},
@@ -224,15 +225,17 @@ class DataSourceEndpointMetrics final {
                         log::Field::Str("endpoint", endpoint_),
                         log::Field::Str("path", path)});
         });
-    bestEffortTelemetry([this] { invalidHttpMethod_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { invalidHttpMethod_->inc(); });
   }
 
-  void pendingAdd(std::string streamId) noexcept {
+  [[nodiscard]] bool enabled() const noexcept { return enabled_; }
+
+  void pendingAdd(std::string_view streamId) noexcept {
     if (!enabled_) return;
     {
       auto& shard = pendingShard(streamId);
       std::lock_guard lock(shard.mutex);
-      shard.started[std::move(streamId)] = Clock::now();
+      shard.started[std::string{streamId}] = Clock::now();
     }
     bestEffortTelemetry([this] { pendingRequests_->inc(); });
   }

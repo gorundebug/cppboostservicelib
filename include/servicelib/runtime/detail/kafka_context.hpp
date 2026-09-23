@@ -10,12 +10,14 @@ namespace servicelib::detail {
 
 using KafkaHeaders = std::map<std::string, std::string>;
 
-inline MessageContext ContextFromKafkaHeaders(const KafkaHeaders& headers) {
+inline MessageContext ContextFromKafkaHeaders(const KafkaHeaders& headers,
+                                              bool tracingEnabled = true) {
   MessageContext context;
   if (const auto found = headers.find("x-stream-id");
       found != headers.end() && !found->second.empty()) {
     context = std::move(context).withStreamId(found->second);
   }
+  if (!tracingEnabled) return context;
   tracing::SpanContext propagation;
   if (const auto found = headers.find("traceparent");
       found != headers.end()) {
@@ -44,10 +46,12 @@ inline MessageContext ContextFromKafkaHeaders(const KafkaHeaders& headers) {
 }
 
 inline void InjectKafkaContext(const MessageContext& context,
-                               KafkaHeaders& headers) {
+                               KafkaHeaders& headers,
+                               bool tracingEnabled = true) {
   if (!context.streamId().empty()) {
     headers["x-stream-id"] = std::string{context.streamId()};
   }
+  if (!tracingEnabled) return;
   const auto& trace = context.trace();
   if (trace.isValid()) {
     headers["traceparent"] = "00-" + trace.traceId + "-" + trace.spanId +

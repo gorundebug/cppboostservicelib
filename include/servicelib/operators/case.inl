@@ -283,8 +283,10 @@ class CaseImpl final : public Case<T> {
   StreamFunction<SwitchFunction, CaseImpl> f_;
  public:
   void consume(MessageContext ctx, Payload<_Tp> payload) override {
-    [[maybe_unused]] auto activeSpan =
-        tracing::StartStreamSpan(ctx, *this, "stream.case");
+    tracing::ActiveSpan activeSpan;
+    if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+      activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.case");
+    }
     size_t idx = static_cast<size_t>(f_(ctx, *this, payload.get()));
     if (idx < NBranches && this->branchDispatchers_[idx]) {
       this->branchDispatchers_[idx](std::move(ctx), std::move(payload));

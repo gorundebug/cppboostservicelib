@@ -126,6 +126,7 @@ class Endpoint final : public IEndpoint {
            std::string traceOperation = "local.input")
       : environment_(environment),
         endpointId_(endpointId),
+        tracingEngineAvailable_(environment.getTracing() != nullptr),
         streamIdentity_(resolveStreamIdentity(environment, streamConfigId)),
         endpointName_(endpointName),
         producer_(producer),
@@ -145,6 +146,7 @@ class Endpoint final : public IEndpoint {
            bool hasResult, ErrorOutput errorOutput, std::nullptr_t)
       : environment_(environment),
         endpointId_(endpointId),
+        tracingEngineAvailable_(environment.getTracing() != nullptr),
         streamIdentity_(resolveStreamIdentity(environment, streamConfigId)),
         endpointName_(endpointConfig(environment, endpointId).name),
         producer_(producer),
@@ -252,7 +254,7 @@ class Endpoint final : public IEndpoint {
     const auto current = pending_.get(std::string{context.streamId()});
     if (!current || *current != result) {
       metrics_.lateResult(context.streamId());
-      tracing::SpanEvent(result->span.get(), "late_result");
+      if (auto* traceSpan = result->span.get()) traceSpan->addEvent("late_result");
       return;
     }
     const auto messageId = handler_->getMessageId(context, streamContext_,
@@ -265,7 +267,7 @@ class Endpoint final : public IEndpoint {
     }
     if (!callback || !*callback) {
       metrics_.unknownMessageId(context.streamId(), messageId);
-      tracing::SpanEvent(result->span.get(), "unknown_message_id",
+      if (auto* traceSpan = result->span.get()) traceSpan->addEvent("unknown_message_id",
                          {tracing::Attribute::String("message_id", messageId)});
       return;
     }
@@ -277,12 +279,12 @@ class Endpoint final : public IEndpoint {
       }
       if (duplicate) {
         metrics_.duplicateMessageId(context.streamId(), messageId);
-        tracing::SpanEvent(
-            result->span.get(), "duplicate_message_id",
+        if (auto* traceSpan = 
+            result->span.get()) traceSpan->addEvent("duplicate_message_id",
             {tracing::Attribute::String("message_id", messageId)});
       }
     }
-    tracing::SpanEvent(result->span.get(), "result_consumed",
+    if (auto* traceSpan = result->span.get()) traceSpan->addEvent("result_consumed",
                        {tracing::Attribute::String("message_id", messageId)});
   }
 
@@ -334,13 +336,15 @@ class Endpoint final : public IEndpoint {
   }
 
   void process(MessageContext context, Payload<Input> payload) {
-    context = ApplyDataSourceEndpointTracing(
-        std::move(context), environment_, endpointId_);
+    if (tracingEngineAvailable_) {
+      context = ApplyDataSourceEndpointTracing(
+          std::move(context), environment_, endpointId_);
+    }
     std::shared_ptr<tracing::Tracer> tracer;
-    if (tracing::SamplingEnabled(context)) {
-      if (auto* tracingEngine = environment_.getTracing()) {
-        tracer = tracingEngine->tracer(environment_.getServiceName());
-      }
+    if (auto* tracingEngine =
+            tracingEngineAvailable_ ? environment_.getTracing() : nullptr;
+        tracingEngine && tracing::SamplingEnabled(context)) {
+      tracer = tracingEngine->tracer(environment_.getServiceName());
     }
     tracing::ActiveSpan startedSpan;
     if (tracer) {
@@ -356,13 +360,13 @@ class Endpoint final : public IEndpoint {
       begin.emplace(handler_->beginRequest(context, streamContext_));
     } catch (...) {
       const auto message = tracing::ExceptionMessage(std::current_exception());
-      tracing::SpanError(startedSpan.span(), message);
-      tracing::SpanEvent(startedSpan.span(), "begin_request.error",
+      if (auto* traceSpan = startedSpan.span()) tracing::SpanError(traceSpan, message);
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request.error",
                          {tracing::Attribute::String("error", message)});
       metrics_.beginRequestFailed(message);
       return;
     }
-    tracing::SpanEvent(startedSpan.span(), "begin_request");
+    if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     context = std::move(begin->context);
     if (context.streamId().empty()) {
       context = std::move(context).withStreamId(servicelib::http::NewStreamId());
@@ -389,13 +393,15 @@ class Endpoint final : public IEndpoint {
                                 payload.get(),
                                 ResultContext<State, T, R, E>{result});
       } catch (...) {
-        const auto message =
-            tracing::ExceptionMessage(std::current_exception());
-        tracing::SpanEvent(startedSpan.span(), "consume_message.error",
-                           {tracing::Attribute::String("error", message)});
+        if (auto* traceSpan = startedSpan.span()) {
+          traceSpan->addEvent(
+              "consume_message.error",
+              {tracing::Attribute::String(
+                  "error", tracing::ExceptionMessage(std::current_exception()))});
+        }
         throw;
       }
-      tracing::SpanEvent(startedSpan.span(), "consume_message");
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("consume_message");
       if (hasResult_) {
         try {
           std::stop_callback cancellation{
@@ -429,7 +435,7 @@ class Endpoint final : public IEndpoint {
           } else {
             result->done.Wait();
           }
-          tracing::SpanEvent(startedSpan.span(), "done_received");
+          if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("done_received");
           if (context.cancelled() || requestStopSource_.stop_requested()) {
             throw std::runtime_error("custom datasource request cancelled");
           }
@@ -441,20 +447,24 @@ class Endpoint final : public IEndpoint {
     } catch (...) {
       error = std::current_exception();
       if (!resultWaitFailed) {
-        tracing::SpanError(startedSpan.span(),
-                           tracing::ExceptionMessage(error));
+        if (auto* traceSpan = startedSpan.span()) {
+          tracing::SpanError(traceSpan, tracing::ExceptionMessage(error));
+        }
       }
     }
     std::unique_lock lifetimeLock(result->lifetimeMutex);
     if (resultWaitFailed &&
         result->completed.load(std::memory_order_acquire)) {
       error = nullptr;
-      tracing::SpanEvent(startedSpan.span(), "done_received");
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("done_received");
     } else if (resultWaitFailed) {
-      const auto message = tracing::ExceptionMessage(error);
-      tracing::SpanError(startedSpan.span(), message);
-      tracing::SpanEvent(startedSpan.span(), "context_cancelled",
-                         {tracing::Attribute::String("error", message)});
+      if (auto* traceSpan = startedSpan.span()) {
+        const auto message = tracing::ExceptionMessage(error);
+        tracing::SpanError(traceSpan, message);
+        traceSpan->addEvent(
+            "context_cancelled",
+            {tracing::Attribute::String("error", message)});
+      }
     }
     if (hasResult_) {
       static_cast<void>(pending_.pop(streamId));
@@ -503,6 +513,7 @@ class Endpoint final : public IEndpoint {
 
   IServiceEnvironment& environment_;
   int endpointId_;
+  bool tracingEngineAvailable_;
   StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   DataProducer<Input>& producer_;

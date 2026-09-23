@@ -117,7 +117,8 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
                           CopyBytes(message->payload, message->len),
                           rd_kafka_topic_name(message->rkt),
                           static_cast<std::uint32_t>(message->partition),
-                          message->offset, CopyHeaders(message.get())});
+                          message->offset,
+                          CopyHeaders(message.get(), tracingEnabled_)});
       }
     } catch (...) {
       rememberError(std::current_exception());
@@ -159,6 +160,7 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
         endpointId_(endpointId),
         connectorId_(identity.connectorId),
         topic_(std::move(identity.topic)),
+        tracingEnabled_(environment.getTracing() != nullptr),
         statistics_(environment.getMetrics(), "consumer") {}
 
   [[nodiscard]] static EndpointIdentity resolveIdentity(
@@ -383,7 +385,7 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
   }
 
   static servicelib::detail::KafkaHeaders CopyHeaders(
-      const rd_kafka_message_t* message) {
+      const rd_kafka_message_t* message, bool tracingEnabled) {
     servicelib::detail::KafkaHeaders result;
     rd_kafka_headers_t* headers{};
     if (!message || rd_kafka_message_headers(message, &headers) !=
@@ -401,9 +403,10 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
       }
       if (!name) continue;
       const std::string_view key{name};
-      if (key != "x-trace" && key != "traceparent" &&
-          key != "tracestate" && key != "baggage" &&
-          key != "x-stream-id") {
+      if (key != "x-stream-id" &&
+          (!tracingEnabled ||
+           (key != "x-trace" && key != "traceparent" &&
+            key != "tracestate" && key != "baggage"))) {
         continue;
       }
       result[std::string{key}] = CopyBytes(value, size);
@@ -437,6 +440,7 @@ class LibrdkafkaConsumerClient final : public ConsumerClient {
   int endpointId_;
   int connectorId_;
   std::string topic_;
+  bool tracingEnabled_;
   telemetry::LibrdkafkaStatistics statistics_;
   std::unique_ptr<rd_kafka_t, KafkaDeleter> consumer_;
   std::map<std::uint32_t, std::unique_ptr<PartitionLane>> lanes_;
@@ -451,12 +455,13 @@ namespace detail {
 class ProducerAdapter final {
  public:
   using Consumer = std::function<void(MessageContext, Payload<ConsumerMessage>)>;
-  explicit ProducerAdapter(ConsumerClient& client) : client_(client) {}
+  ProducerAdapter(ConsumerClient& client, IServiceEnvironment& environment)
+      : client_(client), tracingEnabled_(environment.getTracing() != nullptr) {}
 
   void start(Context, Consumer consumer) {
-    client_.start([consumer = std::move(consumer)](ConsumerMessage message) {
-      auto context =
-          servicelib::detail::ContextFromKafkaHeaders(message.headers());
+    client_.start([tracingEnabled = tracingEnabled_, consumer = std::move(consumer)](ConsumerMessage message) {
+      auto context = servicelib::detail::ContextFromKafkaHeaders(
+          message.headers(), tracingEnabled);
       consumer(std::move(context),
                Payload<ConsumerMessage>::make(std::move(message)));
     });
@@ -465,6 +470,7 @@ class ProducerAdapter final {
 
  private:
   ConsumerClient& client_;
+  bool tracingEnabled_{};
 };
 
 template <typename Handler, typename T, typename R, typename E>
@@ -544,7 +550,7 @@ class Endpoint final {
   Endpoint(IServiceEnvironment& environment, int endpointId,
            int streamConfigId, ConsumerClient& consumer, Handler handler,
            Output output, bool hasResult, ErrorOutput errorOutput = {})
-      : producer_(consumer),
+      : producer_(consumer, environment),
         environment_(environment),
         endpointId_(endpointId),
         implementation_(

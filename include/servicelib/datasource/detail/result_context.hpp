@@ -54,7 +54,7 @@ class ResultContext final {
     bool expected = false;
     if (result_->wakeSent.compare_exchange_strong(expected, true,
                                                   std::memory_order_acq_rel)) {
-      tracing::SpanEvent(result_->span.get(), "done_called");
+      if (auto* traceSpan = result_->span.get()) traceSpan->addEvent("done_called");
       result_->done.Send();
     }
   }

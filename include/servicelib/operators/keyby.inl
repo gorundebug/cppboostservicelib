@@ -61,8 +61,10 @@
 
     // Go: KeyByStream.Consume — calls f with collector; f emits KeyValue<K,V> pairs
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.keyby");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.keyby");
+      }
       f_(ctx, *this, payload.get(),
          Collector<_KVType, KeyByImpl>(*this));
     }

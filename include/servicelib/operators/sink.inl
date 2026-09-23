@@ -18,8 +18,10 @@ class Sink final : public StreamConsumer<_Tp>,
  public:
   using topology_value_type = E;
   void consume(MessageContext ctx, Payload<_Tp> payload) override {
-    [[maybe_unused]] auto activeSpan =
-        tracing::StartStreamSpan(ctx, *this, "stream.sink");
+    tracing::ActiveSpan activeSpan;
+    if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+      activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.sink");
+    }
     f_(std::move(ctx), payload.get());
   }
 
@@ -144,8 +146,10 @@ class SinkWithResult final : public TransformStream<R, C>,
   using TransformStream<R, C>::consume;
 
   void consume(MessageContext ctx, Payload<_Tp> payload) override {
-    [[maybe_unused]] auto activeSpan =
-        tracing::StartStreamSpan(ctx, *this, "stream.sink");
+    tracing::ActiveSpan activeSpan;
+    if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+      activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.sink");
+    }
     f_(std::move(ctx), payload.get());
   }
 

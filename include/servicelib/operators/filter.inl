@@ -50,8 +50,10 @@
    public:
     // Go: FilterStream.Consume — calls predicate, emits downstream if true
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.filter");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.filter");
+      }
       if (f_(ctx, *this, payload.get())) {
         if (this->hasConsumer())
           this->context().template consume<_Tp>(

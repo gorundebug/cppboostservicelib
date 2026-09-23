@@ -83,8 +83,10 @@ class ProcessImpl final : public Process<_TTp, _ETp, _CCp>,
   // Go: ProcessStream.Consume — call process function with normal + error
   // collectors
   void consume(MessageContext ctx, Payload<_Tp> payload) override {
-    [[maybe_unused]] auto activeSpan =
-        tracing::StartStreamSpan(ctx, *this, "stream.process");
+    tracing::ActiveSpan activeSpan;
+    if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+      activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.process");
+    }
     Output output{*this};
     ErrorOutput errors{*this};
     f_(ctx, *this, payload.get(), Collector<_TTp, Output>(output),

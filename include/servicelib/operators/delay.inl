@@ -63,23 +63,18 @@ class DelayImpl final : public Delay<_CCp> {
     // time spent waiting. The userver adapter therefore creates this span
     // detached from the current coroutine stack: it starts here and is
     // safely ended by the timer coroutine.
-    auto* const environment = &this->context();
     std::shared_ptr<tracing::Span> span;
-    if (tracing::SamplingEnabled(ctx)) {
-      if (auto* tracingEngine = environment->getTracing()) {
-        auto tracer = tracingEngine->tracer(environment->getServiceName());
-        if (tracer) {
-          auto parent = ctx.trace();
-          if (!parent.isValid()) {
-            parent = tracer->currentSpanContext();
-          }
-          span = tracer->startDetachedChildOf(
-              "stream.delay", parent,
-              {tracing::Attribute::String("stream", this->getName())});
-          if (span) {
-            ctx = std::move(ctx).withTrace(span->spanContext());
-          }
-        }
+    if (auto* tracer = this->getStreamTracer();
+        tracer && tracing::SamplingEnabled(ctx)) {
+      auto parent = ctx.trace();
+      if (!parent.isValid()) {
+        parent = tracer->currentSpanContext();
+      }
+      span = tracer->startDetachedChildOf(
+          "stream.delay", parent,
+          {tracing::Attribute::String("stream", this->getName())});
+      if (span) {
+        ctx = std::move(ctx).withTrace(span->spanContext());
       }
     }
 
@@ -87,16 +82,20 @@ class DelayImpl final : public Delay<_CCp> {
     try {
       duration = f_(ctx, *this, payload.get());
     } catch (const std::exception& error) {
-      tracing::SpanError(span.get(), error.what());
-      tracing::SpanEnd(span.get());
+      if (span) {
+        tracing::SpanError(span.get(), error.what());
+        tracing::SpanEnd(span.get());
+      }
       throw;
     } catch (...) {
-      tracing::SpanError(span.get(), "<unknown>");
-      tracing::SpanEnd(span.get());
+      if (span) {
+        tracing::SpanError(span.get(), "<unknown>");
+        tracing::SpanEnd(span.get());
+      }
       throw;
     }
     if (!this->hasConsumer()) {
-      tracing::SpanEnd(span.get());
+      if (span) tracing::SpanEnd(span.get());
       return;
     }
 
@@ -105,15 +104,19 @@ class DelayImpl final : public Delay<_CCp> {
         this->context().template consume<_Tp>(
             std::move(ctx), *this, *this->consumer(), std::move(payload));
       } catch (const std::exception& error) {
-        tracing::SpanError(span.get(), error.what());
-        tracing::SpanEnd(span.get());
+        if (span) {
+          tracing::SpanError(span.get(), error.what());
+          tracing::SpanEnd(span.get());
+        }
         throw;
       } catch (...) {
-        tracing::SpanError(span.get(), "<unknown>");
-        tracing::SpanEnd(span.get());
+        if (span) {
+          tracing::SpanError(span.get(), "<unknown>");
+          tracing::SpanEnd(span.get());
+        }
         throw;
       }
-      tracing::SpanEnd(span.get());
+      if (span) tracing::SpanEnd(span.get());
       return;
     }
 
@@ -128,40 +131,48 @@ class DelayImpl final : public Delay<_CCp> {
     // the caller's logical completion frame.
     ctx = std::move(ctx).withoutCompletion();
     try {
-      environment->delay(
+      this->context().delay(
           ctx, duration,
           [downstream, producer, context = std::move(ctx),
            value = std::move(payload), span]() mutable {
             if (context.cancelled()) {
               if (span) {
-                tracing::SpanEvent(span.get(), "delay.skipped",
+                if (auto* traceSpan = span.get()) traceSpan->addEvent("delay.skipped",
                                    {tracing::Attribute::String(
                                        "reason", "context cancelled")});
               }
-              tracing::SpanEnd(span.get());
+              if (span) tracing::SpanEnd(span.get());
               return;
             }
             try {
               producer->context().template consume<_Tp>(
                   std::move(context), *producer, *downstream, std::move(value));
             } catch (const std::exception& error) {
-              tracing::SpanError(span.get(), error.what());
-              tracing::SpanEnd(span.get());
+              if (span) {
+                tracing::SpanError(span.get(), error.what());
+                tracing::SpanEnd(span.get());
+              }
               throw;
             } catch (...) {
-              tracing::SpanError(span.get(), "<unknown>");
-              tracing::SpanEnd(span.get());
+              if (span) {
+                tracing::SpanError(span.get(), "<unknown>");
+                tracing::SpanEnd(span.get());
+              }
               throw;
             }
-            tracing::SpanEnd(span.get());
+            if (span) tracing::SpanEnd(span.get());
           });
     } catch (const std::exception& error) {
-      tracing::SpanError(span.get(), error.what());
-      tracing::SpanEnd(span.get());
+      if (span) {
+        tracing::SpanError(span.get(), error.what());
+        tracing::SpanEnd(span.get());
+      }
       throw;
     } catch (...) {
-      tracing::SpanError(span.get(), "<unknown>");
-      tracing::SpanEnd(span.get());
+      if (span) {
+        tracing::SpanError(span.get(), "<unknown>");
+        tracing::SpanEnd(span.get());
+      }
       throw;
     }
   }

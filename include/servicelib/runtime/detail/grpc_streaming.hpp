@@ -259,7 +259,7 @@ boost::asio::awaitable<typename RPC::Response> HandleClientStreamingSource(
     endpoint.eof(request, messageCount);
     if (endpoint.hasResult()) {
       co_await request->done.AsyncWait();
-      tracing::SpanEvent(request->span.get(), "done_received");
+      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
     }
   } catch (...) {
     error = std::current_exception();
@@ -306,7 +306,7 @@ boost::asio::awaitable<void> HandleServerStreamingSource(
     endpoint.eof(request);
     if (endpoint.hasResult()) {
       co_await request->done.AsyncWait();
-      tracing::SpanEvent(request->span.get(), "done_received");
+      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
     }
   } catch (...) {
     error = std::current_exception();
@@ -359,7 +359,7 @@ boost::asio::awaitable<void> HandleBidirectionalStreamingSource(
     endpoint.eof(request, messageCount);
     if (endpoint.hasResult()) {
       co_await request->done.AsyncWait();
-      tracing::SpanEvent(request->span.get(), "done_received");
+      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
     }
   } catch (...) {
     error = std::current_exception();

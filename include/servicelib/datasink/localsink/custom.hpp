@@ -39,6 +39,7 @@ class Endpoint final : public IEndpoint {
   Endpoint(SinkEndpointStream<T, R, E>& stream, Handler handler)
       : environment_(stream.environment()),
         endpointId_(stream.endpointId()),
+        tracingEngineAvailable_(environment_.getTracing() != nullptr),
         streamIdentity_(resolveStreamIdentity(
             environment_, static_cast<int>(stream.streamConfigId()))),
         endpointName_(endpointConfig().name),
@@ -72,11 +73,11 @@ class Endpoint final : public IEndpoint {
       begin.emplace(handler_.beginRequest(context, streamContext_));
     } catch (...) {
       const auto message = tracing::ExceptionMessage(std::current_exception());
-      tracing::SpanError(startedSpan.span(), message);
+      if (auto* traceSpan = startedSpan.span()) tracing::SpanError(traceSpan, message);
       metrics_.beginRequestFailed(message);
       return;
     }
-    tracing::SpanEvent(startedSpan.span(), "begin_request");
+    if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     context = std::move(begin->context);
     const auto startedAt = metrics_.requestStart();
     std::exception_ptr error;
@@ -85,13 +86,18 @@ class Endpoint final : public IEndpoint {
                               payload.get());
     } catch (...) {
       error = std::current_exception();
-      const auto message = tracing::ExceptionMessage(error);
-      tracing::SpanError(startedSpan.span(), message);
-      tracing::SpanEvent(startedSpan.span(), "consume_message.error",
-                         {tracing::Attribute::String("error", message)});
+      if (auto* traceSpan = startedSpan.span()) {
+        const auto message = tracing::ExceptionMessage(error);
+        tracing::SpanError(traceSpan, message);
+        traceSpan->addEvent(
+            "consume_message.error",
+            {tracing::Attribute::String("error", message)});
+      }
       streamContext_.collectError(context, error);
     }
-    if (!error) tracing::SpanEvent(startedSpan.span(), "consume_message");
+    if (!error) {
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("consume_message");
+    }
     try {
       handler_.endRequest(context, streamContext_, error, begin->state);
     } catch (...) {
@@ -113,7 +119,7 @@ class Endpoint final : public IEndpoint {
   }
 
   [[nodiscard]] tracing::ActiveSpan startTrace(MessageContext& context) {
-    if (!tracing::SamplingEnabled(context)) return {};
+    if (!tracingEngineAvailable_ || !tracing::SamplingEnabled(context)) return {};
     auto* engine = environment_.getTracing();
     if (!engine) return {};
     auto tracer = engine->tracer(environment_.getServiceName());
@@ -153,6 +159,7 @@ class Endpoint final : public IEndpoint {
 
   IServiceEnvironment& environment_;
   int endpointId_;
+  bool tracingEngineAvailable_;
   StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   Handler handler_;

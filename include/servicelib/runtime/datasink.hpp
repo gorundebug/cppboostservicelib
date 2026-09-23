@@ -196,7 +196,7 @@ class DataSinkEndpointMetrics final {
                     {log::Field::Str("endpoint", endpoint_),
                      log::Field::Err(error.empty() ? "<unknown>" : error)});
     });
-    bestEffortTelemetry([this] { beginRequestFailed_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { beginRequestFailed_->inc(); });
   }
 
   void lateResult(std::string_view streamId = {}) noexcept {
@@ -205,7 +205,7 @@ class DataSinkEndpointMetrics final {
                    {log::Field::Str("endpoint", endpoint_),
                     log::Field::Str("stream_id", streamId)});
     });
-    bestEffortTelemetry([this] { lateResult_->inc(); });
+    if (enabled_) bestEffortTelemetry([this] { lateResult_->inc(); });
   }
 
   metrics::MetricsScope& scope() noexcept { return *scope_; }

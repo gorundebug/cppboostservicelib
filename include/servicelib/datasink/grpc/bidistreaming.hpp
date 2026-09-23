@@ -113,29 +113,29 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
           const auto error = std::current_exception();
           this->traceError(detachedTrace.span.get(), error,
                            "begin_request.error");
-          tracing::SpanEnd(detachedTrace.span.get());
+          if (detachedTrace.span) tracing::SpanEnd(detachedTrace.span.get());
           this->metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
           cell->error = error;
           cell->markReady();
           dropReservation(streamId, cell);
           return;
         }
-        tracing::SpanEvent(detachedTrace.span.get(), "begin_request");
+        if (auto* traceSpan = detachedTrace.span.get()) traceSpan->addEvent("begin_request");
         context = std::move(begin->context);
         const auto requestContext = this->newRequestStreamId(context);
         const auto startedAt = this->metrics_.requestStart();
         try {
           session = std::make_shared<Session>(
               context, std::move(begin->state),
-              std::invoke(client_, callOptions(requestContext)), startedAt,
+              std::invoke(client_, callOptions(requestContext, this->tracingEnabled())), startedAt,
               detachedTrace.span);
-          tracing::SpanEvent(session->span.get(), "grpc_call");
+          if (auto* traceSpan = session->span.get()) traceSpan->addEvent("grpc_call");
         } catch (...) {
           const auto error = std::current_exception();
           this->traceError(detachedTrace.span.get(), error, "grpc_call.error");
           this->callEnd(context, error, begin->state);
           this->metrics_.requestEnd(startedAt, error);
-          tracing::SpanEnd(detachedTrace.span.get());
+          if (detachedTrace.span) tracing::SpanEnd(detachedTrace.span.get());
           cell->error = error;
           cell->markReady();
           dropReservation(streamId, cell);
@@ -172,13 +172,13 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         const auto error = std::current_exception();
         this->traceError(trace.span.get(), error, "begin_request.error");
         this->metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
-        tracing::SpanEnd(trace.span.get());
+        if (trace.span) tracing::SpanEnd(trace.span.get());
         cell->error = error;
         cell->markReady();
         dropReservation(streamId, cell);
         return;
       }
-      tracing::SpanEvent(trace.span.get(), "begin_request");
+      if (auto* traceSpan = trace.span.get()) traceSpan->addEvent("begin_request");
       context = std::move(begin->context);
       const auto requestContext = this->newRequestStreamId(context);
       const auto startedAt = this->metrics_.requestStart();
@@ -190,7 +190,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       try {
         std::weak_ptr<Session> weakSession = session;
         session->rpc = client_.start(
-            callOptions(requestContext),
+            callOptions(requestContext, this->tracingEnabled()),
             [this, weakSession, weakCell = std::weak_ptr<SessionCell>{cell}](Res response) {
               const auto current = weakSession.lock();
               if (!current) return;
@@ -211,7 +211,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
               if (!current) return;
               finishAsync(current, error);
             });
-        tracing::SpanEvent(session->span.get(), "grpc_call");
+        if (auto* traceSpan = session->span.get()) traceSpan->addEvent("grpc_call");
       } catch (...) {
         const auto error = std::current_exception();
         this->traceError(session->span.get(), error, "grpc_call.error");
@@ -277,12 +277,14 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
             if (!active) return;
             try {
               session->rpc->write(std::move(request));
-              tracing::SpanEvent(session->span.get(), "send");
+              if (auto* traceSpan = session->span.get()) traceSpan->addEvent("send");
             } catch (...) {
-              const auto message = tracing::ExceptionMessage(std::current_exception());
-              tracing::SpanError(session->span.get(), message);
-              tracing::SpanEvent(session->span.get(), "send.error",
-                                 {tracing::Attribute::String("error", message)});
+              if (auto* traceSpan = session->span.get()) {
+                const auto message = tracing::ExceptionMessage(std::current_exception());
+                tracing::SpanError(traceSpan, message);
+                traceSpan->addEvent("send.error",
+                                    {tracing::Attribute::String("error", message)});
+              }
               throw;
             }
           }};
@@ -293,16 +295,16 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         bool expected = false;
         if (session->done.compare_exchange_strong(expected, true,
                                                   std::memory_order_acq_rel)) {
-          tracing::SpanEvent(session->span.get(), "done_called");
+          if (auto* traceSpan = session->span.get()) traceSpan->addEvent("done_called");
           session->rpc->done();
-          tracing::SpanEvent(session->span.get(), "done_received");
+          if (auto* traceSpan = session->span.get()) traceSpan->addEvent("done_received");
         }
       }};
       try {
         this->handler_.consumeMessage(session->context, this->streamContext_,
                                       session->state, payload.get(), sender,
                                       result);
-        tracing::SpanEvent(session->span.get(), "consume_message");
+        if (auto* traceSpan = session->span.get()) traceSpan->addEvent("consume_message");
       } catch (...) {
         this->traceError(session->span.get(), std::current_exception(),
                          "consume_message.error");
@@ -324,12 +326,14 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
             if (!active) return;
             try {
               session->rpc.WriteAndCheck(request);
-              tracing::SpanEvent(session->span.get(), "send");
+              if (auto* traceSpan = session->span.get()) traceSpan->addEvent("send");
             } catch (...) {
-              const auto message = tracing::ExceptionMessage(std::current_exception());
-              tracing::SpanError(session->span.get(), message);
-              tracing::SpanEvent(session->span.get(), "send.error",
-                                 {tracing::Attribute::String("error", message)});
+              if (auto* traceSpan = session->span.get()) {
+                const auto message = tracing::ExceptionMessage(std::current_exception());
+                tracing::SpanError(traceSpan, message);
+                traceSpan->addEvent("send.error",
+                                    {tracing::Attribute::String("error", message)});
+              }
               throw;
             }
           }};
@@ -340,18 +344,18 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         bool expected = false;
         if (session->done.compare_exchange_strong(expected, true,
                                                   std::memory_order_acq_rel)) {
-          tracing::SpanEvent(session->span.get(), "done_called");
+          if (auto* traceSpan = session->span.get()) traceSpan->addEvent("done_called");
           if (!session->rpc.WritesDone()) {
             throw std::runtime_error("gRPC WritesDone failed");
           }
-          tracing::SpanEvent(session->span.get(), "done_received");
+          if (auto* traceSpan = session->span.get()) traceSpan->addEvent("done_received");
         }
       }};
       try {
         this->handler_.consumeMessage(session->context, this->streamContext_,
                                       session->state, payload.get(), sender,
                                       result);
-        tracing::SpanEvent(session->span.get(), "consume_message");
+        if (auto* traceSpan = session->span.get()) traceSpan->addEvent("consume_message");
       } catch (...) {
         this->traceError(session->span.get(), std::current_exception(),
                          "consume_message.error");
@@ -367,7 +371,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
   void respond(const std::shared_ptr<Session>& session, Res response) {
     this->handler_.handleResponse(session->context, this->streamContext_,
                                   session->state, response);
-    tracing::SpanEvent(session->span.get(), "handle_response");
+    if (auto* traceSpan = session->span.get()) traceSpan->addEvent("handle_response");
   }
 
   static boost::asio::awaitable<void> respondWhenReady(
@@ -399,7 +403,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     if (error) self->traceError(session->span.get(), error);
     self->callEnd(session->context, error, session->state);
     self->metrics_.requestEnd(session->startedAt, error);
-    tracing::SpanEnd(session->span.get());
+    if (session->span) tracing::SpanEnd(session->span.get());
     session->operation.reset();
   }
 
@@ -432,8 +436,8 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         break;
       }
       if (!received) {
-        tracing::SpanEvent(
-            session->span.get(), "eof",
+        if (auto* traceSpan = 
+            session->span.get()) traceSpan->addEvent("eof",
             {tracing::Attribute::Int64("messages_received", messageCount)});
         break;
       }

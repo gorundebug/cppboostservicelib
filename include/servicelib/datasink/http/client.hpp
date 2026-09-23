@@ -66,6 +66,7 @@ class Client final {
     std::size_t responseBodyLimit{4 * 1024 * 1024};
     std::chrono::milliseconds timeout{5000};
     std::chrono::milliseconds acquirePollInterval{1};
+    bool tracingEnabled{true};
   };
 
   explicit Client(boost::asio::any_io_executor executor)
@@ -81,7 +82,7 @@ class Client final {
                                         Request request,
                                         MessageContext context = {}) {
     Operation operation{*this};
-    InjectContext(context, request.headers);
+    InjectContext(context, request.headers, options_.tracingEnabled);
     const auto deadline = EffectiveDeadline(context);
     auto connection = co_await boost::asio::co_spawn(
         state_->strand, Acquire(state_, host, port, context, deadline),

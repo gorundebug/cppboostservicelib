@@ -71,8 +71,10 @@ class MultiJoinImpl final : public MultiJoin<_TTp, _JTp, _JoinStrategy, _CCp>,
   using MultiJoin<_TTp, _JTp, _JoinStrategy, _CCp>::consume;
 
   void consume(MessageContext ctx, Payload<_Tp> payload) override {
-    [[maybe_unused]] auto activeSpan =
-        tracing::StartStreamSpan(ctx, *this, "stream.join");
+    tracing::ActiveSpan activeSpan;
+    if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+      activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.join");
+    }
     consumeValue(ctx, payload.get().first, 0,
                  payload.get().second);
   }

@@ -59,7 +59,7 @@ class NoStreamingEndpoint final : public Endpoint<Req, Res, T, R, Handler, E> {
       if (!error) error = std::current_exception();
     }
     if (response) {
-      tracing::SpanEvent(request->span.get(), "result_received");
+      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("result_received");
     }
     this->metrics().requestEnd(startedAt, error);
     if (error) std::rethrow_exception(error);
@@ -111,7 +111,7 @@ class NoStreamingEndpoint final : public Endpoint<Req, Res, T, R, Handler, E> {
       if (!error) error = std::current_exception();
     }
     if (response) {
-      tracing::SpanEvent(request->span.get(), "result_received");
+      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("result_received");
     }
     if (error && resultWaitFailed) this->recordFailure(request, error);
     this->metrics().requestEnd(startedAt, error);

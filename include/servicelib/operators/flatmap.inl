@@ -52,8 +52,10 @@
     using FlatMap<_TTp, _CCp>::consume;
 
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.flatmap");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.flatmap");
+      }
       f_(ctx, *this, payload.get(),
          Collector<_TTp, decltype(*this)>(*this));
     }

@@ -152,8 +152,10 @@
 
    public:
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
-      [[maybe_unused]] auto activeSpan =
-          tracing::StartStreamSpan(ctx, *this, "stream.merge");
+      tracing::ActiveSpan activeSpan;
+      if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
+        activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.merge");
+      }
       if (this->hasConsumer()) {
         context_.template consume<_Tp>(
             std::move(ctx), *this, *this->consumer(), std::move(payload));

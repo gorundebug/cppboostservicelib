@@ -158,10 +158,11 @@ template <auto PrepareAsync, typename Stub, typename Request,
           typename Response>
 boost::asio::awaitable<void> RunServerStreamingClient(
     agrpc::GrpcContext& context, Stub& client, MessageContext message,
-    Request request, std::function<void(Response)> response) {
+    Request request, std::function<void(Response)> response,
+    bool tracingEnabled = true) {
   using RPC = agrpc::ClientRPC<PrepareAsync>;
   RPC rpc{context};
-  InjectContext(message, rpc.context());
+  InjectContext(message, rpc.context(), tracingEnabled);
   detail::ClientCancellation cancellation(message, rpc.context());
   if (co_await rpc.start(client, request, boost::asio::use_awaitable)) {
     typename RPC::Response value;
@@ -179,9 +180,10 @@ template <auto PrepareAsync, typename Stub, typename Request,
 boost::asio::awaitable<void> RunClientStreamingClient(
     std::shared_ptr<agrpc::ClientRPC<PrepareAsync>> rpc,
     std::shared_ptr<detail::ClientWriteQueue<Request>> queue, Stub& client,
-    MessageContext message, std::function<void(Response)> response) {
+    MessageContext message, std::function<void(Response)> response,
+    bool tracingEnabled = true) {
   using RPC = agrpc::ClientRPC<PrepareAsync>;
-  InjectContext(message, rpc->context());
+  InjectContext(message, rpc->context(), tracingEnabled);
   detail::ClientCancellation cancellation(message, rpc->context());
   typename RPC::Response value;
   if (co_await rpc->start(client, value, boost::asio::use_awaitable)) {
@@ -215,10 +217,11 @@ template <auto PrepareAsync, typename Stub, typename Request,
 boost::asio::awaitable<void> RunBidirectionalStreamingClient(
     std::shared_ptr<agrpc::ClientRPC<PrepareAsync>> rpc,
     std::shared_ptr<detail::ClientWriteQueue<Request>> queue, Stub& client,
-    MessageContext message, std::function<void(Response)> response) {
+    MessageContext message, std::function<void(Response)> response,
+    bool tracingEnabled = true) {
   try {
     using RPC = agrpc::ClientRPC<PrepareAsync>;
-    InjectContext(message, rpc->context());
+    InjectContext(message, rpc->context(), tracingEnabled);
     detail::ClientCancellation cancellation(message, rpc->context());
     if (!co_await rpc->start(client, boost::asio::use_awaitable)) {
       throw std::runtime_error("gRPC stream start failed");
@@ -308,6 +311,7 @@ class ClientPool final {
     using RPC = agrpc::ClientRPC<PrepareAsync>;
     struct State final {
       State(MessageContext messageValue,
+            bool tracingEnabled,
             std::function<void(std::exception_ptr, std::optional<Response>)>
                 completionValue,
             std::shared_ptr<servicelib::detail::AsyncOperations::Token>
@@ -315,7 +319,7 @@ class ClientPool final {
           : cancellation(messageValue, context),
             completion(std::move(completionValue)),
             operation(std::move(operationValue)) {
-        InjectContext(messageValue, context);
+        InjectContext(messageValue, context, tracingEnabled);
       }
 
       ::grpc::ClientContext context;
@@ -326,7 +330,8 @@ class ClientPool final {
       std::shared_ptr<servicelib::detail::AsyncOperations::Token> operation;
     };
     auto state = std::make_shared<State>(
-        std::move(options.context), std::move(completion),
+        std::move(options.context), options.tracingEnabled,
+        std::move(completion),
         std::move(operation));
     try {
       RPC::request(
@@ -364,7 +369,7 @@ class ClientPool final {
         servicelib::detail::ParallelExecutorRegistry::Get(),
         RunServerStreamingClient<PrepareAsync, Stub, Request, Response>(
             context_, *client, std::move(options.context), std::move(request),
-            std::move(response)),
+            std::move(response), options.tracingEnabled),
         [completion = std::move(completion), operation = std::move(operation)](
             std::exception_ptr error) mutable noexcept {
           completion(std::move(error));
@@ -396,7 +401,7 @@ class ClientPool final {
         servicelib::detail::ParallelExecutorRegistry::Get(),
         RunClientStreamingClient<PrepareAsync, Stub, Request, Response>(
             rpc, queue, *client, std::move(options.context),
-            std::move(response)),
+            std::move(response), options.tracingEnabled),
         [completion = std::move(completion), operation = std::move(operation)](
             std::exception_ptr error) mutable noexcept {
           completion(std::move(error));
@@ -429,7 +434,7 @@ class ClientPool final {
         servicelib::detail::ParallelExecutorRegistry::Get(),
         RunBidirectionalStreamingClient<PrepareAsync, Stub, Request, Response>(
             rpc, queue, *client, std::move(options.context),
-            std::move(response)),
+            std::move(response), options.tracingEnabled),
         [completion = std::move(completion), operation = std::move(operation)](
             std::exception_ptr error) mutable noexcept {
           completion(std::move(error));

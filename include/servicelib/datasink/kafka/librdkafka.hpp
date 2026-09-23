@@ -403,6 +403,7 @@ class Endpoint final {
         endpointName_(endpointConfig(environment_, stream.endpointId()).name),
         streamIdentity_(resolveStreamIdentity(environment_, stream.streamConfigId())),
         serviceName_(resolveServiceName(environment_)),
+        tracingEnabled_(environment_.getTracing() != nullptr),
         producer_(producer),
         handler_(std::move(handler)),
         streamContext_(stream.resultOutput(), stream.errorOutput()),
@@ -461,17 +462,17 @@ class Endpoint final {
       begin.emplace(handler_.beginRequest(context, streamContext_));
     } catch (...) {
       const auto message = tracing::ExceptionMessage(std::current_exception());
-      tracing::SpanError(startedSpan.span(), message);
+      if (auto* traceSpan = startedSpan.span()) tracing::SpanError(traceSpan, message);
       metrics_.beginRequestFailed(message);
       return;
     }
-    tracing::SpanEvent(startedSpan.span(), "begin_request");
+    if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     context = std::move(begin->context);
     const auto startedAt = metrics_.requestStart();
     std::exception_ptr error;
     try {
       detail::KafkaHeaders headers;
-      detail::InjectKafkaContext(context, headers);
+      detail::InjectKafkaContext(context, headers, tracingEnabled_);
       SinkMessage<R> message{
           topic_, context,
           [this](MessageContext resultContext, R result) {
@@ -490,13 +491,16 @@ class Endpoint final {
           tasks_};
       handler_.consumeMessage(context, streamContext_, begin->state,
                               payload.get(), message);
-      tracing::SpanEvent(startedSpan.span(), "consume_message");
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("consume_message");
     } catch (...) {
       error = std::current_exception();
-      const auto message = tracing::ExceptionMessage(error);
-      tracing::SpanError(startedSpan.span(), message);
-      tracing::SpanEvent(startedSpan.span(), "consume_message.error",
-                         {tracing::Attribute::String("error", message)});
+      if (auto* traceSpan = startedSpan.span()) {
+        const auto message = tracing::ExceptionMessage(error);
+        tracing::SpanError(traceSpan, message);
+        traceSpan->addEvent(
+            "consume_message.error",
+            {tracing::Attribute::String("error", message)});
+      }
       streamContext_.collectError(context, error);
     }
     try {
@@ -509,7 +513,7 @@ class Endpoint final {
 
  private:
   [[nodiscard]] tracing::ActiveSpan startTrace(MessageContext& context) {
-    if (!tracing::SamplingEnabled(context)) return {};
+    if (!tracingEnabled_ || !tracing::SamplingEnabled(context)) return {};
     auto* engine = environment_.getTracing();
     if (!engine) return {};
     auto tracer = engine->tracer(serviceName_);
@@ -584,6 +588,7 @@ class Endpoint final {
   std::string endpointName_;
   StreamTraceIdentity streamIdentity_;
   std::string serviceName_;
+  bool tracingEnabled_{};
   ProducerClient& producer_;
   Handler handler_;
   StreamContext streamContext_;

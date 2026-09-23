@@ -55,6 +55,7 @@ class Server final {
     std::size_t bodyLimit{1024 * 1024};
     std::chrono::seconds idleTimeout{30};
     std::chrono::milliseconds shutdownTimeout{};
+    bool tracingEnabled{true};
   };
 
   Server(boost::asio::any_io_executor executor, std::shared_ptr<Router> router)
@@ -256,7 +257,8 @@ class Server final {
           request.headers[std::string(field.name_string())] =
               std::string(field.value());
         const auto version = message.version();
-        auto context = ContextFromHeaders(request.headers);
+        auto context = ContextFromHeaders(request.headers,
+                                          options_.tracingEnabled);
         std::shared_ptr<RequestCancellation> requestCancellation;
         if (router_->RequiresDisconnectObservation(request.method,
                                                    request.path)) {
@@ -543,7 +545,7 @@ class ResultContext final {
   }
 
   void done() noexcept {
-    tracing::SpanEvent(result_->span.get(), "done_called");
+    if (auto* traceSpan = result_->span.get()) traceSpan->addEvent("done_called");
     bool expected = false;
     if (result_->doneSent.compare_exchange_strong(expected, true,
                                                   std::memory_order_acq_rel)) {
@@ -590,6 +592,7 @@ class BeastEndpoint final : public IBeastEndpoint {
                 bool hasResult, ErrorOutput errorOutput = {})
       : environment_(environment),
         endpointId_(endpointId),
+        tracingEngineAvailable_(environment.getTracing() != nullptr),
         streamIdentity_(resolveStreamIdentity(environment, streamConfigId)),
         endpointName_(endpointConfig(environment, endpointId).name),
         method_(endpointConfig(environment, endpointId).httpMethodType),
@@ -632,8 +635,10 @@ class BeastEndpoint final : public IBeastEndpoint {
 
   boost::asio::awaitable<servicelib::http::Response> handle(
       servicelib::http::Request request, MessageContext requestContext) override {
-    requestContext = ApplyDataSourceEndpointTracing(
-        std::move(requestContext), environment_, endpointId_);
+    if (tracingEngineAvailable_) {
+      requestContext = ApplyDataSourceEndpointTracing(
+          std::move(requestContext), environment_, endpointId_);
+    }
     servicelib::http::Response httpResponse;
     httpResponse.keepAlive = request.keepAlive;
     auto admission = admit();
@@ -653,10 +658,10 @@ class BeastEndpoint final : public IBeastEndpoint {
     requestContext = std::move(requestContext).withExternalCancellation(
         admission->generation->get_token());
     std::shared_ptr<tracing::Tracer> tracer;
-    if (tracing::SamplingEnabled(requestContext)) {
-      if (auto* tracingEngine = environment_.getTracing()) {
-        tracer = tracingEngine->tracer(environment_.getServiceName());
-      }
+    if (auto* tracingEngine =
+            tracingEngineAvailable_ ? environment_.getTracing() : nullptr;
+        tracingEngine && tracing::SamplingEnabled(requestContext)) {
+      tracer = tracingEngine->tracer(environment_.getServiceName());
     }
     tracing::ActiveSpan startedSpan;
     if (tracer) {
@@ -681,7 +686,7 @@ class BeastEndpoint final : public IBeastEndpoint {
       httpResponse.body = std::move(data.responseBody);
       co_return httpResponse;
     }
-    tracing::SpanEvent(startedSpan.span(), "begin_request");
+    if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     auto begin = std::move(*beginResult);
     auto context = std::move(begin.context);
     if (context.streamId().empty()) {
@@ -734,7 +739,7 @@ class BeastEndpoint final : public IBeastEndpoint {
         consumeCompletion.reset();
         co_await consumeCompleted.AsyncWait();
       }
-      tracing::SpanEvent(startedSpan.span(), "consume_message");
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("consume_message");
       if (hasResult_) {
         try {
           co_await result->done.AsyncWait(context);
@@ -757,8 +762,9 @@ class BeastEndpoint final : public IBeastEndpoint {
         externalCancellation.request_stop();
       }
       if (!resultWaitFailed) {
-        tracing::SpanError(startedSpan.span(),
-                           tracing::ExceptionMessage(error));
+        if (auto* traceSpan = startedSpan.span()) {
+          tracing::SpanError(traceSpan, tracing::ExceptionMessage(error));
+        }
       }
     }
 
@@ -776,14 +782,16 @@ class BeastEndpoint final : public IBeastEndpoint {
         error = nullptr;
         doneReceived = true;
       } else if (resultWaitFailed) {
-        const auto message = tracing::ExceptionMessage(error);
-        tracing::SpanError(startedSpan.span(), message);
-        tracing::SpanEvent(
-            startedSpan.span(), "context_cancelled",
-            {tracing::Attribute::String("error", message)});
+        if (auto* traceSpan = startedSpan.span()) {
+          const auto message = tracing::ExceptionMessage(error);
+          tracing::SpanError(traceSpan, message);
+          traceSpan->addEvent(
+              "context_cancelled",
+              {tracing::Attribute::String("error", message)});
+        }
       }
       if (doneReceived) {
-        tracing::SpanEvent(startedSpan.span(), "done_received");
+        if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("done_received");
       }
       if (!result->done.IsReady() && !error) {
         error = std::make_exception_ptr(HttpRequestCancelledError{});
@@ -818,7 +826,7 @@ class BeastEndpoint final : public IBeastEndpoint {
     const auto result = *found;
     if (!result->enter()) {
       metrics_.lateResult(streamId);
-      tracing::SpanEvent(result->span.get(), "late_result");
+      if (auto* traceSpan = result->span.get()) traceSpan->addEvent("late_result");
       return;
     }
     struct ReadGuard {
@@ -829,7 +837,7 @@ class BeastEndpoint final : public IBeastEndpoint {
     const auto current = pending_.get(streamId);
     if (!current || *current != result) {
       metrics_.lateResult(streamId);
-      tracing::SpanEvent(result->span.get(), "late_result");
+      if (auto* traceSpan = result->span.get()) traceSpan->addEvent("late_result");
       return;
     }
 
@@ -843,7 +851,7 @@ class BeastEndpoint final : public IBeastEndpoint {
     }
     if (!callback || !*callback) {
       metrics_.unknownMessageId(streamId, messageId);
-      tracing::SpanEvent(result->span.get(), "unknown_message_id",
+      if (auto* traceSpan = result->span.get()) traceSpan->addEvent("unknown_message_id",
                          {tracing::Attribute::String("message_id", messageId)});
       return;
     }
@@ -852,12 +860,12 @@ class BeastEndpoint final : public IBeastEndpoint {
       const bool duplicate = !result->eraseCallback(messageId);
       if (duplicate) {
         metrics_.duplicateMessageId(streamId, messageId);
-        tracing::SpanEvent(
-            result->span.get(), "duplicate_message_id",
+        if (auto* traceSpan = 
+            result->span.get()) traceSpan->addEvent("duplicate_message_id",
             {tracing::Attribute::String("message_id", messageId)});
       }
     }
-    tracing::SpanEvent(result->span.get(), "result_consumed",
+    if (auto* traceSpan = result->span.get()) traceSpan->addEvent("result_consumed",
                        {tracing::Attribute::String("message_id", messageId)});
   }
 
@@ -923,7 +931,7 @@ class BeastEndpoint final : public IBeastEndpoint {
                          std::string_view event) {
     const auto message = tracing::ExceptionMessage(error);
     tracing::SpanError(span, message);
-    tracing::SpanEvent(span, event,
+    if (auto* traceSpan = span) traceSpan->addEvent(event,
                        {tracing::Attribute::String("error", message)});
   }
   void callEndRequest(MessageContext context, const std::exception_ptr& error,
@@ -937,6 +945,7 @@ class BeastEndpoint final : public IBeastEndpoint {
 
   IServiceEnvironment& environment_;
   int endpointId_;
+  bool tracingEngineAvailable_;
   StreamTraceIdentity streamIdentity_;
   std::string endpointName_;
   api::HTTPMethodType method_;
@@ -944,7 +953,16 @@ class BeastEndpoint final : public IBeastEndpoint {
   Handler handler_;
   StreamContext streamContext_;
   bool hasResult_;
-  store::RotatingMap<std::string, std::shared_ptr<Result>> pending_;
+  struct StreamIdHash {
+    using is_transparent = void;
+
+    std::size_t operator()(std::string_view value) const noexcept {
+      return std::hash<std::string_view>{}(value);
+    }
+  };
+
+  store::RotatingMap<std::string, std::shared_ptr<Result>,
+                     StreamIdHash, std::equal_to<>> pending_;
   servicelib::DataSourceEndpointMetrics metrics_;
   std::atomic<bool> accepting_{true};
   std::atomic<std::shared_ptr<std::stop_source>> cancellationGeneration_{

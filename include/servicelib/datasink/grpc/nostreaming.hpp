@@ -41,7 +41,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       this->metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
       return;
     }
-    tracing::SpanEvent(startedSpan.span(), "begin_request");
+    if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     context = std::move(begin->context);
     const auto requestContext = this->newRequestStreamId(context);
     const auto startedAt = this->metrics_.requestStart();
@@ -54,7 +54,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       if (!request) {
         throw std::runtime_error("gRPC sink handler sent no request");
       }
-      tracing::SpanEvent(startedSpan.span(), "consume_message");
+      if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("consume_message");
     } catch (...) {
       error = std::current_exception();
       this->traceError(startedSpan.span(), error, "consume_message.error");
@@ -63,8 +63,8 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     if (!error) {
       try {
         response.emplace(std::invoke(client_, std::move(*request),
-                                     callOptions(requestContext)));
-        tracing::SpanEvent(startedSpan.span(), "grpc_call");
+                                     callOptions(requestContext, this->tracingEnabled())));
+        if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("grpc_call");
       } catch (...) {
         error = std::current_exception();
         this->traceError(startedSpan.span(), error, "grpc_call.error");
@@ -74,7 +74,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       try {
         this->handler_.handleResponse(context, this->streamContext_,
                                       begin->state, *response);
-        tracing::SpanEvent(startedSpan.span(), "handle_response");
+        if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("handle_response");
       } catch (...) {
         error = std::current_exception();
         this->traceError(startedSpan.span(), error, "handle_response.error");
@@ -106,10 +106,10 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       const auto error = std::current_exception();
       this->traceError(trace.span.get(), error, "begin_request.error");
       this->metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
-      tracing::SpanEnd(trace.span.get());
+      if (trace.span) tracing::SpanEnd(trace.span.get());
       return;
     }
-    tracing::SpanEvent(trace.span.get(), "begin_request");
+    if (auto* traceSpan = trace.span.get()) traceSpan->addEvent("begin_request");
     context = std::move(begin->context);
     const auto requestContext = this->newRequestStreamId(context);
     const auto startedAt = this->metrics_.requestStart();
@@ -122,7 +122,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       if (!request) {
         throw std::runtime_error("gRPC sink handler sent no request");
       }
-      tracing::SpanEvent(trace.span.get(), "consume_message");
+      if (auto* traceSpan = trace.span.get()) traceSpan->addEvent("consume_message");
     } catch (...) {
       error = std::current_exception();
       this->traceError(trace.span.get(), error, "consume_message.error");
@@ -130,7 +130,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     if (error) {
       this->callEnd(context, error, begin->state);
       this->metrics_.requestEnd(startedAt, error);
-      tracing::SpanEnd(trace.span.get());
+      if (trace.span) tracing::SpanEnd(trace.span.get());
       return;
     }
 
@@ -141,7 +141,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       this->traceError(trace.span.get(), error, "grpc_call.error");
       this->callEnd(context, error, begin->state);
       this->metrics_.requestEnd(startedAt, error);
-      tracing::SpanEnd(trace.span.get());
+      if (trace.span) tracing::SpanEnd(trace.span.get());
       return;
     }
 
@@ -150,7 +150,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         std::move(trace.span), std::move(operation), std::move(completion)});
     try {
       client_.async(
-          std::move(*request), callOptions(requestContext),
+          std::move(*request), callOptions(requestContext, this->tracingEnabled()),
           [this, state](std::exception_ptr callError,
                         std::optional<Res> response) mutable noexcept {
             if (!callError && !response) {
@@ -159,11 +159,11 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
             }
             if (!callError) {
               try {
-                tracing::SpanEvent(state->span.get(), "grpc_call");
+                if (auto* traceSpan = state->span.get()) traceSpan->addEvent("grpc_call");
                 this->handler_.handleResponse(
                     state->context, this->streamContext_, state->state,
                     *response);
-                tracing::SpanEvent(state->span.get(), "handle_response");
+                if (auto* traceSpan = state->span.get()) traceSpan->addEvent("handle_response");
               } catch (...) {
                 callError = std::current_exception();
                 this->traceError(state->span.get(), callError,
@@ -175,7 +175,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
             }
             this->callEnd(state->context, callError, state->state);
             this->metrics_.requestEnd(state->startedAt, callError);
-            tracing::SpanEnd(state->span.get());
+            if (state->span) tracing::SpanEnd(state->span.get());
             state->completion.reset();
           });
     } catch (...) {
@@ -183,7 +183,7 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
       this->traceError(state->span.get(), error, "grpc_call.error");
       this->callEnd(state->context, error, state->state);
       this->metrics_.requestEnd(state->startedAt, error);
-      tracing::SpanEnd(state->span.get());
+      if (state->span) tracing::SpanEnd(state->span.get());
       state->completion.reset();
     }
   }
