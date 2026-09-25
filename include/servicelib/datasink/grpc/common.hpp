@@ -187,7 +187,7 @@ struct CallOptions final {
 };
 
 inline CallOptions callOptions(const MessageContext& context,
-                               bool tracingEnabled = true) {
+                               bool tracingEnabled) {
   return CallOptions{context, tracingEnabled};
 }
 
