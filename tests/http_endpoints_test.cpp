@@ -1047,10 +1047,12 @@ TEST(HttpClient, RequestDeadlineCancelsAcceptedReadAndMapsTimeout) {
   auto router = std::make_shared<servicelib::http::Router>();
   router->Add(
       "GET", "/wait",
-      [&](servicelib::http::Request, servicelib::MessageContext context)
+      [&](servicelib::http::Request, servicelib::MessageContext)
           -> boost::asio::awaitable<servicelib::http::Response> {
         accepted.Send();
-        co_await never.AsyncWait(context);
+        // Keep the server from racing the client's deadline with a response.
+        // This test verifies cancellation of an accepted client-side read.
+        co_await never.AsyncWait();
         co_return servicelib::http::Response{499, {}, "cancelled", "text/plain",
                                              false};
       });
@@ -1072,7 +1074,7 @@ TEST(HttpClient, RequestDeadlineCancelsAcceptedReadAndMapsTimeout) {
           "127.0.0.1", std::to_string(server.port()), std::move(request),
           servicelib::MessageContext{}.withDeadline(
               std::chrono::steady_clock::now() +
-              std::chrono::milliseconds{40}))),
+              std::chrono::milliseconds{200}))),
       boost::asio::use_future);
   std::jthread ioThread([&] { io.run(); });
   ASSERT_TRUE(accepted.WaitUntil(std::chrono::steady_clock::now() +
@@ -1080,6 +1082,7 @@ TEST(HttpClient, RequestDeadlineCancelsAcceptedReadAndMapsTimeout) {
   ASSERT_EQ(response.wait_for(std::chrono::seconds{2}),
             std::future_status::ready);
   EXPECT_EQ(response.get(), servicelib::http::ClientErrorCode::kTimeout);
+  never.Send();
   client.Stop();
   server.Stop();
   io.stop();
