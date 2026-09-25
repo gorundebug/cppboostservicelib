@@ -5,6 +5,7 @@
 #include <boost/asio/awaitable.hpp>
 
 #include <servicelib/runtime/detail/http_types.hpp>
+#include <servicelib/runtime/detail/cooperative_execution.hpp>
 
 #include <functional>
 #include <atomic>
@@ -33,7 +34,10 @@ class Router final {
         [handler = std::move(handler)](Request request,
                                        MessageContext context)
             -> boost::asio::awaitable<Response> {
-          co_return handler(std::move(request), std::move(context));
+          co_return co_await servicelib::detail::CooperativeExecution::Run(
+              [handler, request = std::move(request), context = std::move(context)]() mutable {
+                return handler(std::move(request), std::move(context));
+              });
         },
         false);
   }

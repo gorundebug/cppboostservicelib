@@ -113,7 +113,7 @@ class Endpoint final : public IEndpoint {
   Endpoint(IServiceEnvironment& environment, int endpointId,
            DataProducer<Input>& producer, Handler handler, Output output,
            bool hasResult, std::string connectorName, std::string endpointName,
-           ErrorOutput errorOutput = {}, bool processInline = false)
+           ErrorOutput errorOutput = {}, bool processInline = true)
       : Endpoint(environment, endpointId, 0, producer, std::move(handler),
                  std::move(output), hasResult, std::move(connectorName),
                  std::move(endpointName), std::move(errorOutput), processInline,
@@ -122,7 +122,7 @@ class Endpoint final : public IEndpoint {
   Endpoint(IServiceEnvironment& environment, int endpointId, int streamConfigId,
            DataProducer<Input>& producer, Handler handler, Output output,
            bool hasResult, std::string connectorName, std::string endpointName,
-           ErrorOutput errorOutput = {}, bool processInline = false,
+           ErrorOutput errorOutput = {}, bool /*processInline*/ = true,
            std::string traceOperation = "local.input")
       : environment_(environment),
         endpointId_(endpointId),
@@ -134,7 +134,6 @@ class Endpoint final : public IEndpoint {
         handler_(&*ownedHandler_),
         streamContext_(std::move(output), std::move(errorOutput)),
         hasResult_(hasResult),
-        processInline_(processInline),
         traceOperation_(std::move(traceOperation)),
         pending_(kPendingRotationInterval),
         metrics_(environment.getMetrics(), environment.getLogger(),
@@ -153,7 +152,6 @@ class Endpoint final : public IEndpoint {
         handler_(&handler),
         streamContext_(std::move(output), std::move(errorOutput)),
         hasResult_(hasResult),
-        processInline_(false),
         traceOperation_("local.input"),
         pending_(kPendingRotationInterval),
         metrics_(environment.getMetrics(), environment.getLogger(),
@@ -232,7 +230,10 @@ class Endpoint final : public IEndpoint {
       // user producer honoring its noexcept-style stop contract.
     }
     if (producerThread_.joinable()) producerThread_.join();
-    tasks_.CancelAndWait();
+    {
+      std::unique_lock lock(concurrencyMutex_);
+      concurrencyCv_.wait(lock, [this] { return active_ == 0; });
+    }
     if (hasResult_) pending_.stop(std::move(context));
   }
 
@@ -291,29 +292,14 @@ class Endpoint final : public IEndpoint {
  private:
   void submit(MessageContext context, Payload<Input> payload) {
     if (!acquire()) return;
-    if (processInline_) {
-      struct Release final {
-        Endpoint* endpoint;
-        ~Release() { endpoint->release(); }
-      } release{this};
-      process(std::move(context), std::move(payload));
-      return;
-    }
-    try {
-      tasks_.CriticalAsyncDetach(
-          "servicelib-custom-datasource-message",
-          [this, context = std::move(context),
-           payload = std::move(payload)]() mutable {
-            struct Release final {
-              Endpoint* endpoint;
-              ~Release() { endpoint->release(); }
-            } release{this};
-            process(std::move(context), std::move(payload));
-          });
-    } catch (...) {
-      release();
-      throw;
-    }
+    // Like Go DataProducer.Consume, return only after this value's lifecycle.
+    // The legacy constructor flag is accepted for source compatibility; it
+    // must not detach a producer call or change its backpressure semantics.
+    struct Release final {
+      Endpoint* endpoint;
+      ~Release() { endpoint->release(); }
+    } release{this};
+    process(std::move(context), std::move(payload));
   }
 
   bool acquire() {
@@ -383,9 +369,11 @@ class Endpoint final : public IEndpoint {
     const auto startedAt = metrics_.requestStart();
     std::exception_ptr error;
     bool resultWaitFailed = false;
+    bool pendingInserted = false;
     try {
       if (hasResult_) {
         pending_.set(streamId, result);
+        pendingInserted = true;
         metrics_.pendingAdd(streamId);
       }
       try {
@@ -466,7 +454,7 @@ class Endpoint final : public IEndpoint {
             {tracing::Attribute::String("error", message)});
       }
     }
-    if (hasResult_) {
+    if (pendingInserted) {
       static_cast<void>(pending_.pop(streamId));
       metrics_.pendingRemove(streamId);
     }
@@ -521,7 +509,6 @@ class Endpoint final : public IEndpoint {
   Handler* handler_;
   StreamContext streamContext_;
   bool hasResult_;
-  bool processInline_;
   std::string traceOperation_;
   store::RotatingMap<std::string, std::shared_ptr<Result>> pending_;
   DataSourceEndpointMetrics metrics_;
@@ -532,8 +519,6 @@ class Endpoint final : public IEndpoint {
   std::atomic<bool> started_{false};
   std::stop_source requestStopSource_;
   std::thread producerThread_;
-  // Last: all detached work is joined before captured endpoint fields die.
-  detail::TaskStorage tasks_;
 };
 
 }  // namespace servicelib::datasource::localsource

@@ -3,6 +3,8 @@
 #include <servicelib/runtime/detail/grpc_streaming.hpp>
 #include <servicelib/runtime/detail/grpc_client.hpp>
 #include <servicelib/runtime/detail/grpc_runtime.hpp>
+#include <servicelib/datasink/grpc/serverstreaming.hpp>
+#include <servicelib/transformation/streams.hpp>
 
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
@@ -15,6 +17,8 @@
 
 #include <chrono>
 #include <future>
+#include <mutex>
+#include <set>
 #include <stop_token>
 #include <stdexcept>
 #include <string>
@@ -32,6 +36,16 @@ void Require(bool condition, const std::string& message) {
 
 struct AcceptedCancellation final {
   std::promise<servicelib::MessageContext> accepted;
+  servicelib::detail::SingleUseEvent release;
+};
+
+struct ServerSubStreamProbe final {
+  static constexpr int calls = 16;
+  servicelib::ContextKey<int> callerKey;
+  std::mutex mutex;
+  std::set<std::string> requestIds;
+  std::atomic<int> accepted{0};
+  std::promise<void> allAccepted;
   servicelib::detail::SingleUseEvent release;
 };
 
@@ -220,9 +234,325 @@ asio::awaitable<void> RunCancelledBidirectionalStream(
           runtime.grpcContext(), stub, std::move(context), values));
 }
 
+void CheckWriteCompletion() {
+  using Queue = servicelib::grpc_transport::detail::ClientWriteQueue<int>;
+  asio::io_context io;
+  auto queue = std::make_shared<Queue>();
+  bool returned = false;
+  auto sender = asio::co_spawn(io, servicelib::detail::CooperativeExecution::Run([&] {
+    queue->push(42);
+    returned = true;
+  }), asio::use_future);
+  auto transport = [&]() -> asio::awaitable<void> {
+    auto write = co_await queue->pop();
+    Require(write && write->value == 42, "queued request changed");
+    co_await asio::post(asio::use_awaitable);
+    Require(!returned, "Send returned before its transport write completed");
+    queue->complete(write);
+  };
+  auto sent = asio::co_spawn(io, transport(), asio::use_future);
+  io.run();
+  sender.get(); sent.get();
+  Require(returned, "acknowledged Send did not return");
+
+  using OwnedQueue = servicelib::grpc_transport::detail::ClientWriteQueue<std::unique_ptr<int>>;
+  auto owned = std::make_shared<OwnedQueue>();
+  auto sendOwned = [&](int value) {
+    try {
+      owned->push(std::make_unique<int>(value));
+      return false;
+    } catch (const std::logic_error& error) {
+      return std::string{error.what()} == "write failed";
+    }
+  };
+  auto first = std::async(std::launch::async, sendOwned, 17);
+  io.restart();
+  auto pending = asio::co_spawn(io, owned->pop(), asio::use_future);
+  io.run();
+  auto active = pending.get();
+  auto second = std::async(std::launch::async, sendOwned, 23);
+  Require(first.wait_for(20ms) == std::future_status::timeout,
+          "in-flight Send returned before acknowledgement");
+  Require(second.wait_for(20ms) == std::future_status::timeout,
+          "queued Send returned before acknowledgement");
+  owned->fail(std::make_exception_ptr(std::logic_error("write failed")));
+  Require(first.get() && second.get(), "write failure did not reach every sender");
+  Require(active && active->value && *active->value == 17,
+          "cancellation freed an in-flight write payload");
+  owned->complete(active);
+  Require(sendOwned(29), "subsequent Send lost the terminal transport error");
+
+  io.restart();
+  auto empty = std::make_shared<Queue>();
+  std::stop_source stop;
+  auto read = asio::co_spawn(io,
+      empty->pop(servicelib::MessageContext{}.withStopToken(stop.get_token())),
+      asio::use_future);
+  auto cancel = asio::co_spawn(io, servicelib::detail::CooperativeExecution::Run([&] {
+    stop.request_stop();
+  }), asio::use_future);
+  io.run();
+  cancel.get();
+  Require(!read.get(), "cancelled empty writer did not wake");
+}
+
+template <bool Bidi>
+void CheckCooperativePooledWrites(
+    servicelib::grpc_transport::ClientPool<servicelib::test::ConnectorTest::Stub>& pool,
+    const std::vector<servicelib::test::EchoRequest>& requests) {
+  asio::io_context io;
+  struct RestoreExecutor final {
+    asio::any_io_executor previous = servicelib::detail::ParallelExecutorRegistry::Get();
+    ~RestoreExecutor() { servicelib::detail::ParallelExecutorRegistry::Set(previous); }
+  } restore;
+  servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+  std::vector<std::string> values;
+  auto completed = std::make_shared<std::promise<std::exception_ptr>>();
+  auto result = completed->get_future();
+  auto response = [&](servicelib::test::EchoResponse value) {
+    Require(servicelib::detail::CooperativeExecution::Active(),
+            "streaming response is not cooperative");
+    servicelib::detail::CooperativeExecution::Await([] { return asio::post(asio::use_awaitable); });
+    values.push_back(value.value());
+  };
+  auto completion = [completed](std::exception_ptr error) { completed->set_value(error); };
+  auto options = servicelib::datasink::grpc::callOptions(
+      servicelib::MessageContext{}.withDeadline(std::chrono::steady_clock::now() + 3s));
+  auto writer = [&] {
+    if constexpr (Bidi) {
+      return pool.template asyncBidirectionalStreaming<
+          &servicelib::test::ConnectorTest::Stub::PrepareAsyncBidirectionalStreaming,
+          servicelib::test::EchoRequest, servicelib::test::EchoResponse>(options, response, completion);
+    } else {
+      return pool.template asyncClientStreaming<
+          &servicelib::test::ConnectorTest::Stub::PrepareAsyncClientStreaming,
+          servicelib::test::EchoRequest, servicelib::test::EchoResponse>(options, response, completion);
+    }
+  }();
+  auto sent = asio::co_spawn(io, servicelib::detail::CooperativeExecution::Run([&] {
+    for (const auto& request : requests) writer->write(request);
+    writer->done();
+  }), asio::use_future);
+  std::jthread worker([&] { io.run(); });
+  const bool ready = result.wait_for(5s) == std::future_status::ready;
+  if (!ready) writer->cancel();
+  worker.join();
+  sent.get();
+  Require(ready, "cooperative streaming sends did not complete on one worker");
+  Require(!result.get(), "cooperative streaming RPC returned an error");
+  if constexpr (Bidi) {
+    Require(values == std::vector<std::string>{"bidi:a", "bidi:b"}, "bidi responses changed");
+  } else {
+    Require(values == std::vector<std::string>{"ab"}, "client-streaming response changed");
+  }
+}
+
+struct ServerSubStreamConfig final : servicelib::config::IConfig {
+  explicit ServerSubStreamConfig(std::string address) {
+    connector.id = 600; connector.name = "server-substream";
+    connector.address = std::move(address);
+    endpoint.id = 601; endpoint.name = "server-streaming";
+    endpoint.idDataConnector = 600;
+    endpoint.grpcMethodType = servicelib::api::GrpcMethodType::kServerStreaming;
+    endpoint.methodName = "ServerStreaming";
+  }
+  std::vector<const servicelib::config::ServiceConfig*> GetServices() const override { return {}; }
+  std::vector<servicelib::config::StreamConfigRef> GetStreams() const override { return {}; }
+  std::vector<servicelib::config::DataConnectorConfigRef> GetDataConnectors() const override { return {connector}; }
+  std::vector<servicelib::config::EndpointConfigRef> GetEndpoints() const override { return {endpoint}; }
+  std::vector<const servicelib::config::PoolConfig*> GetPools() const override { return {}; }
+  std::vector<const servicelib::config::LinkConfig*> GetLinks() const override { return {}; }
+  std::vector<const servicelib::config::ModuleConfig*> GetModules() const override { return {}; }
+  std::vector<const servicelib::config::TypeConfig*> GetTypes() const override { return {}; }
+  servicelib::config::GrpcDataConnectorConfig connector;
+  servicelib::config::GrpcEndpointConfig endpoint;
+};
+
+using ServerSubStreamOutput = std::function<void(servicelib::MessageContext, const std::string&)>;
+using ServerSubStreamInvoke = std::function<void(servicelib::MessageContext, int, ServerSubStreamOutput)>;
+struct ServerSubStreamCall final {
+  ServerSubStreamOutput output;
+  bool ended{};
+  int responses{};
+  std::exception_ptr error;
+};
+struct ServerSubStreamTypes { template <typename> struct DataType {}; };
+struct ServerSubStreamWork final {
+  ServerSubStreamInvoke* invoke;
+  template <typename Output>
+  void operator()(servicelib::MessageContext context, servicelib::StreamBase&,
+                  int& value, Output&& output) const {
+    (*invoke)(std::move(context), value, [&](servicelib::MessageContext delivered, const std::string& result) {
+      output.out(std::move(delivered), result);
+    });
+  }
+};
+class ServerSubStreamApp final
+    : public servicelib::StreamExecutionEnvironment<ServerSubStreamApp, ServerSubStreamTypes> {
+ public:
+  using Entry = servicelib::SubStream<int, std::string, ServerSubStreamApp>;
+  explicit ServerSubStreamApp(std::string address)
+      : config(std::move(address)), snapshot(std::make_shared<servicelib::config::RuntimeConfig>(config)) {}
+  std::shared_ptr<const servicelib::config::RuntimeConfig> getRuntimeConfigSnapshot() const override { return snapshot; }
+  void init() {
+    servicelib::config::SubStreamConfig entryConfig;
+    entryConfig.id = 611; entryConfig.name = "server-substream";
+    entry = servicelib::makeSubStream<int, std::string, ServerSubStreamApp>(entryConfig, *this);
+    servicelib::config::MapStreamConfig workConfig;
+    workConfig.id = 612; workConfig.name = "invoke-server-streaming";
+    auto& result = entry->map(workConfig, servicelib::StreamType<std::string>{},
+                             servicelib::StreamFunction(ServerSubStreamWork{&invoke}));
+    entry->setSource(result);
+    static_cast<void>(getExecutionRuntime<>());
+  }
+  ServerSubStreamConfig config;
+  std::shared_ptr<const servicelib::config::RuntimeConfig> snapshot;
+  servicelib::ContextKey<ServerSubStreamCall> callKey;
+  ServerSubStreamInvoke invoke;
+  std::shared_ptr<Entry> entry;
+};
+
+class ServerSubStreamSink final : public servicelib::SinkEndpointStream<int, std::string> {
+ public:
+  explicit ServerSubStreamSink(ServerSubStreamApp& app) : app_(app) {}
+  servicelib::IServiceEnvironment& environment() const override { return app_; }
+  int endpointId() const noexcept override { return 601; }
+  std::size_t streamConfigId() const noexcept override { return 612; }
+  void collectResult(servicelib::MessageContext context, servicelib::Payload<std::string> value) override {
+    auto call = context.localValue(app_.callKey);
+    Require(call && static_cast<bool>(call->output), "server-streaming lost its invocation or returned early");
+    call->output(std::move(context), value.get());
+  }
+  void collectError(servicelib::MessageContext, servicelib::Payload<std::exception_ptr> error) override {
+    std::rethrow_exception(error.get());
+  }
+ private:
+  ServerSubStreamApp& app_;
+};
+
+struct ServerSubStreamHandler final {
+  using State = std::shared_ptr<ServerSubStreamCall>;
+  servicelib::ContextKey<ServerSubStreamCall>* key;
+  servicelib::BeginResult<State> beginRequest(servicelib::MessageContext context, auto&) {
+    auto call = context.localValue(*key);
+    Require(static_cast<bool>(call), "server-streaming begin lost call state");
+    return {std::move(context), std::move(call)};
+  }
+  void consumeMessage(servicelib::MessageContext, auto&, State&, const int& value,
+                      auto& sender, auto) {
+    servicelib::test::EchoRequest request;
+    request.set_value("substream-server-" + std::to_string(value) + ":");
+    sender.send(std::move(request));
+  }
+  void handleResponse(servicelib::MessageContext context, auto& stream, State& state,
+                      const servicelib::test::EchoResponse& response) {
+    ++state->responses;
+    stream.collect(std::move(context), response.value());
+  }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr error, State& state) {
+    state->error = std::move(error);
+    state->ended = true;
+  }
+};
+
+struct ServerSubStreamClient final {
+  servicelib::grpc_transport::ClientPool<servicelib::test::ConnectorTest::Stub>* pool;
+  void async(servicelib::test::EchoRequest request, servicelib::datasink::grpc::CallOptions options,
+             std::function<void(servicelib::test::EchoResponse)> response,
+             std::function<void(std::exception_ptr)> completion) {
+    pool->asyncServerStreaming<
+        &servicelib::test::ConnectorTest::Stub::PrepareAsyncServerStreaming,
+        servicelib::test::EchoRequest, servicelib::test::EchoResponse>(
+            std::move(request), std::move(options), std::move(response), std::move(completion));
+  }
+};
+
+void CheckNestedServerSubStreams(
+    servicelib::grpc_transport::ClientPool<servicelib::test::ConnectorTest::Stub>& pool,
+    int port, ServerSubStreamProbe& probe) {
+  asio::io_context io;
+  auto work = asio::make_work_guard(io);
+  struct RestoreExecutor final {
+    asio::any_io_executor previous = servicelib::detail::ParallelExecutorRegistry::Get();
+    ~RestoreExecutor() { servicelib::detail::ParallelExecutorRegistry::Set(previous); }
+  } restore;
+  servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+  ServerSubStreamApp app{"127.0.0.1:" + std::to_string(port)};
+  app.init();
+  ServerSubStreamSink stream{app};
+  servicelib::datasink::grpc::ServerStreamingEndpoint<
+      servicelib::test::EchoRequest, servicelib::test::EchoResponse, int, std::string,
+      ServerSubStreamHandler, ServerSubStreamClient> endpoint{
+          stream, ServerSubStreamHandler{&app.callKey}, ServerSubStreamClient{&pool}};
+  endpoint.start({});
+  app.invoke = [&](servicelib::MessageContext context, int value, ServerSubStreamOutput output) {
+    if (value >= 1000) {
+      int received = 0;
+      auto collector = std::make_shared<servicelib::SubStreamCollectorFunc<std::string>>(
+          [&](servicelib::MessageContext delivered, const std::string& result) {
+            output(std::move(delivered), "nested:" + result);
+            return ++received == 3;
+          });
+      app.entry->consume(std::move(context), servicelib::Payload<int>::make(value - 1000), collector);
+      Require(received == 3, "nested server-streaming returned before three results");
+      return;
+    }
+    auto call = std::make_shared<ServerSubStreamCall>();
+    call->output = std::move(output);
+    struct ClearOutput final {
+      std::shared_ptr<ServerSubStreamCall> call;
+      ~ClearOutput() { call->output = {}; }
+    } clear{call};
+    endpoint.consume(context.withLocalValue(app.callKey, call), servicelib::Payload<int>::make(value));
+    Require(call->ended, "server-streaming Consume returned before EndRequest");
+    if (call->error) std::rethrow_exception(call->error);
+    Require(call->responses == 3, "server-streaming endpoint lost responses");
+  };
+  auto allAccepted = probe.allAccepted.get_future();
+  std::vector<std::future<void>> calls;
+  for (int index = 0; index < ServerSubStreamProbe::calls; ++index) {
+    calls.push_back(asio::co_spawn(io, servicelib::detail::CooperativeExecution::Run([&, index] {
+      std::vector<std::string> results;
+      auto context = servicelib::MessageContext{}.withStreamId("server-substream-parent")
+          .withLocalValue(probe.callerKey, std::make_shared<int>(index))
+          .withDeadline(std::chrono::steady_clock::now() + 8s);
+      auto collector = std::make_shared<servicelib::SubStreamCollectorFunc<std::string>>(
+          [&](servicelib::MessageContext delivered, const std::string& result) {
+            Require(delivered.streamId() == "server-substream-parent", "nested collector lost parent ID");
+            Require(delivered.localValue(probe.callerKey) && *delivered.localValue(probe.callerKey) == index,
+                    "server-streaming delivered another invocation's local context");
+            servicelib::detail::CooperativeExecution::Await([] { return asio::post(asio::use_awaitable); });
+            results.push_back(result);
+            return results.size() == 3;
+          });
+      app.entry->consume(std::move(context), servicelib::Payload<int>::make(1000 + index), collector);
+      std::vector<std::string> expected;
+      for (int response = 0; response < 3; ++response)
+        expected.push_back("nested:substream-server-" + std::to_string(index) + ":" + std::to_string(response));
+      Require(results == expected, "nested server-streaming results crossed calls or changed order");
+    }), asio::use_future));
+  }
+  std::jthread worker([&] { io.run(); });
+  const bool accepted = allAccepted.wait_for(3s) == std::future_status::ready;
+  bool returnedEarly = false;
+  for (auto& call : calls) returnedEarly |= call.wait_for(0ms) == std::future_status::ready;
+  probe.release.Send();
+  bool completed = true;
+  for (auto& call : calls) completed &= call.wait_for(10s) == std::future_status::ready;
+  endpoint.stop({});
+  work.reset();
+  worker.join();
+  Require(accepted && !returnedEarly, "nested server-streaming calls did not overlap before release");
+  Require(completed, "nested server-streaming calls did not drain");
+  for (auto& call : calls) call.get();
+  std::lock_guard lock(probe.mutex);
+  Require(probe.requestIds.size() == ServerSubStreamProbe::calls, "server-streaming reused a wire request ID");
+}
+
 }  // namespace
 
 int main() {
+  CheckWriteCompletion();
   servicelib::test::ConnectorTest::AsyncService service;
   grpc::ServerBuilder builder;
   int port{};
@@ -240,6 +570,7 @@ int main() {
   AcceptedCancellation serverCancellation;
   AcceptedCancellation bidiCancellation;
   AcceptedCancellation shutdownCancellation;
+  ServerSubStreamProbe serverSubStreams;
   std::promise<servicelib::MessageContext> clientContext;
   std::promise<servicelib::MessageContext> serverContext;
   std::promise<servicelib::MessageContext> bidiContext;
@@ -274,12 +605,23 @@ int main() {
   servicelib::grpc_transport::RegisterServerStreamingSource<
       &servicelib::test::ConnectorTest::AsyncService::RequestServerStreaming>(
       runtime.grpcContext(), service,
-      [&serverCancellation, &shutdownCancellation, &serverContext,
+      [&serverCancellation, &shutdownCancellation, &serverSubStreams, &serverContext,
        &serverContextSent](
          servicelib::MessageContext context,
          const servicelib::test::EchoRequest& request)
           -> asio::awaitable<std::vector<servicelib::test::EchoResponse>> {
         if (!serverContextSent.exchange(true)) serverContext.set_value(context);
+        if (request.value().starts_with("substream-server-")) {
+          Require(!context.localValue(serverSubStreams.callerKey), "local SubStream context escaped over gRPC");
+          Require(context.streamId() != "server-substream-parent", "server-streaming did not create an RPC ID");
+          {
+            std::lock_guard lock(serverSubStreams.mutex);
+            Require(serverSubStreams.requestIds.emplace(context.streamId()).second, "duplicate active server-streaming RPC ID");
+          }
+          if (serverSubStreams.accepted.fetch_add(1) + 1 == ServerSubStreamProbe::calls)
+            serverSubStreams.allAccepted.set_value();
+          co_await serverSubStreams.release.AsyncWait(context);
+        }
         if (request.value() == "cancel-server") {
           serverCancellation.accepted.set_value(context);
           co_await serverCancellation.release.AsyncWait(context);
@@ -564,6 +906,18 @@ int main() {
 
     {
       std::vector<std::string> values;
+      asio::io_context oneWorker;
+      struct RestoreExecutor final {
+        asio::any_io_executor previous = servicelib::detail::ParallelExecutorRegistry::Get();
+        ~RestoreExecutor() { servicelib::detail::ParallelExecutorRegistry::Set(previous); }
+      } restoreExecutor;
+      servicelib::detail::ParallelExecutorRegistry::Set(oneWorker.get_executor());
+      servicelib::detail::SingleUseEvent entered, resume;
+      auto sibling = asio::co_spawn(oneWorker,
+          servicelib::detail::CooperativeExecution::Run([&] {
+            entered.Wait();
+            resume.Send();
+          }), asio::use_future);
       auto completed = std::make_shared<std::promise<std::exception_ptr>>();
       auto result = completed->get_future();
       pool.asyncServerStreaming<
@@ -571,16 +925,53 @@ int main() {
           servicelib::test::EchoRequest, servicelib::test::EchoResponse>(
           requests[0], servicelib::datasink::grpc::callOptions(context),
           [&](servicelib::test::EchoResponse response) {
+            entered.Send();
+            Require(servicelib::detail::CooperativeExecution::Active(),
+                    "server-streaming response is not on a cooperative stack");
+            resume.Wait();
             values.push_back(response.value());
           },
           [completed](std::exception_ptr error) {
             completed->set_value(error);
           });
-      Require(result.wait_for(5s) == std::future_status::ready,
+      std::jthread worker([&] { oneWorker.run(); });
+      const bool ready = result.wait_for(5s) == std::future_status::ready;
+      // Unblock cleanup even if the callback accidentally blocks the worker.
+      entered.Send();
+      resume.Send();
+      worker.join();
+      sibling.get();
+      Require(ready,
               "pooled server-streaming call did not complete");
       Require(!result.get(), "pooled server-streaming call returned an error");
       Require((values == std::vector<std::string>{"a0", "a1", "a2"}),
               "pooled server-streaming payload/EOF contract differs");
+    }
+
+    {
+      int delivered = 0;
+      auto completed = std::make_shared<std::promise<std::exception_ptr>>();
+      auto result = completed->get_future();
+      pool.asyncServerStreaming<
+          &servicelib::test::ConnectorTest::Stub::PrepareAsyncServerStreaming,
+          servicelib::test::EchoRequest, servicelib::test::EchoResponse>(
+          requests[0], servicelib::datasink::grpc::callOptions(context),
+          [&](servicelib::test::EchoResponse) {
+            ++delivered;
+            throw std::logic_error("business response failure");
+          },
+          [completed](std::exception_ptr error) { completed->set_value(error); });
+      Require(result.wait_for(5s) == std::future_status::ready,
+              "server-streaming handler failure did not drain the RPC");
+      auto error = result.get();
+      Require(static_cast<bool>(error), "server-streaming handler failure was lost");
+      try {
+        std::rethrow_exception(error);
+      } catch (const std::logic_error& failure) {
+        Require(std::string{failure.what()} == "business response failure",
+                "RPC cancellation replaced the business error");
+      }
+      Require(delivered == 1, "responses continued after handler failure");
     }
 
     {
@@ -631,6 +1022,9 @@ int main() {
       Require((values == std::vector<std::string>{"bidi:a", "bidi:b"}),
               "pooled bidirectional payload/EOF contract differs");
     }
+    CheckCooperativePooledWrites<false>(pool, requests);
+    CheckCooperativePooledWrites<true>(pool, requests);
+    CheckNestedServerSubStreams(pool, port, serverSubStreams);
   }
 
   {

@@ -2,6 +2,8 @@
 #include <atomic>
 #include <future>
 #include <thread>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <servicelib/transformation/streams.hpp>
 
 namespace {
@@ -72,6 +74,131 @@ TEST(SubStream, FalseKeepsWaitingAndNestedBodyRestoresOuterCall) {
   EXPECT_EQ(results, (std::vector<int>{50, 51}));
 }
 
+TEST(SubStream, ConcurrentNestedCallsKeepResultsIsolated) {
+  App app; app.init(); app.prepare();
+  ContextKey<int> key;
+  const auto context = MessageContext{}.withStreamId("shared-parent")
+      .withLocalValue(key, std::make_shared<int>(77));
+  app.function = [&](MessageContext current, int value) {
+    EXPECT_EQ(current.streamId(), "shared-parent");
+    EXPECT_EQ(*current.localValue(key), 77);
+    if (value < 1000) return value * 2;
+    int result = -1;
+    app.entry->consume(current, Payload<int>::make(value - 1000),
+        collect([&](MessageContext caller, const int& nested) {
+          EXPECT_EQ(caller.streamId(), "shared-parent");
+          EXPECT_EQ(*caller.localValue(key), 77);
+          result = nested + 100;
+          return true;
+        }));
+    return result;
+  };
+  std::vector<std::future<void>> calls;
+  for (int value = 0; value < 32; ++value) {
+    calls.push_back(std::async(std::launch::async, [&, value] {
+      int count = 0;
+      app.entry->consume(context, Payload<int>::make(2000 + value),
+          collect([&](MessageContext caller, const int& result) {
+            EXPECT_EQ(caller.streamId(), "shared-parent");
+            EXPECT_EQ(*caller.localValue(key), 77);
+            EXPECT_EQ(result, value * 2 + 200);
+            ++count;
+            return true;
+          }));
+      EXPECT_EQ(count, 1);
+    }));
+  }
+  for (auto& call : calls) call.get();
+}
+
+TEST(SubStream, WaitingInvocationDoesNotBlockSiblingOnOneWorker) {
+  App app; app.init(); app.prepare();
+  boost::asio::io_context io;
+  detail::SingleUseEvent waiting;
+  std::stop_source stop;
+  app.function = [&](MessageContext, int value) {
+    if (value == 0) { waiting.Send(); return -1; }
+    return value;
+  };
+  bool siblingCompleted = false;
+  auto blocked = boost::asio::co_spawn(io, detail::CooperativeExecution::Run([&] {
+    EXPECT_THROW(app.entry->consume(
+        MessageContext{}.withStreamId("same-parent").withStopToken(stop.get_token()),
+        Payload<int>::make(0), collect([](MessageContext, const int&) {
+          ADD_FAILURE(); return true;
+        })), std::runtime_error);
+    EXPECT_TRUE(siblingCompleted);
+  }), boost::asio::use_future);
+  auto sibling = boost::asio::co_spawn(io, detail::CooperativeExecution::Run([&] {
+    waiting.Wait();
+    app.entry->consume(MessageContext{}.withStreamId("same-parent"),
+        Payload<int>::make(7), collect([&](MessageContext, const int& value) {
+          EXPECT_EQ(value, 7); siblingCompleted = true; return true;
+        }));
+    stop.request_stop();
+  }), boost::asio::use_future);
+  io.run();
+  blocked.get(); sibling.get();
+}
+
+TEST(SubStream, ConcurrentNestedInvocationsCanSuspendOnOneWorker) {
+  App app; app.init(); app.prepare();
+  boost::asio::io_context io;
+  detail::SingleUseEvent allWaiting, release;
+  int waiting = 0;
+  app.function = [&](MessageContext context, int value) {
+    if (value >= 1000) {
+      int nested = -1;
+      app.entry->consume(context, Payload<int>::make(value - 1000),
+          collect([&](MessageContext, const int& result) {
+            nested = result; return true;
+          }));
+      return nested + 10;
+    }
+    if (++waiting == 100) allWaiting.Send();
+    release.Wait();
+    return value * 2;
+  };
+  std::vector<std::future<void>> calls;
+  for (int value = 0; value < 100; ++value) {
+    calls.push_back(boost::asio::co_spawn(io, detail::CooperativeExecution::Run([&, value] {
+      int received = 0;
+      app.entry->consume(MessageContext{}.withStreamId("same-parent"),
+          Payload<int>::make(1000 + value), collect([&](MessageContext context, const int& result) {
+            EXPECT_EQ(context.streamId(), "same-parent");
+            EXPECT_EQ(result, value * 2 + 10); ++received; return true;
+          }));
+      EXPECT_EQ(received, 1);
+    }), boost::asio::use_future));
+  }
+  auto releaser = boost::asio::co_spawn(io, detail::CooperativeExecution::Run([&] {
+    allWaiting.Wait(); release.Send();
+  }), boost::asio::use_future);
+  io.run();
+  for (auto& call : calls) call.get();
+  releaser.get();
+}
+
+TEST(SubStream, CancellationDrainsSuspendedCollectorOnOneWorker) {
+  App app; app.init(); app.prepare();
+  boost::asio::io_context io;
+  detail::SingleUseEvent entered, release;
+  std::stop_source stop;
+  bool exited = false;
+  auto call = boost::asio::co_spawn(io, detail::CooperativeExecution::Run([&] {
+    EXPECT_THROW(app.entry->consume(MessageContext{}.withStopToken(stop.get_token()),
+        Payload<int>::make(1), collect([&](MessageContext, const int&) {
+          entered.Send(); release.Wait(); exited = true; return false;
+        })), std::runtime_error);
+    EXPECT_TRUE(exited);
+  }), boost::asio::use_future);
+  auto canceller = boost::asio::co_spawn(io, detail::CooperativeExecution::Run([&] {
+    entered.Wait(); stop.request_stop(); EXPECT_FALSE(exited); release.Send();
+  }), boost::asio::use_future);
+  io.run();
+  call.get(); canceller.get();
+}
+
 TEST(SubStream, CollectorCanCallSameEntry) {
   App app; app.init(); app.prepare();
   int result = 0;
@@ -104,6 +231,29 @@ TEST(SubStream, CancellationClearsRetainedContextAndDoesNotCancelSibling) {
   EXPECT_FALSE(retained.streamId().size());
 }
 
+TEST(SubStream, CancelledContextPrecedesCollectorAndTopologyValidation) {
+  App app; app.init(); app.prepare();
+  std::stop_source stop;
+  stop.request_stop();
+  const auto context = MessageContext{}.withStopToken(stop.get_token());
+  EXPECT_THROW(app.entry->consume(context, Payload<int>::make(1), nullptr),
+               std::runtime_error);
+  config::SubStreamConfig missingConfig;
+  missingConfig.id = 103;
+  missingConfig.name = "missing-body";
+  auto missing = makeSubStream<int, int, App>(missingConfig, app);
+  auto callback = collect([](MessageContext, const int&) {
+    ADD_FAILURE() << "cancelled invocation reached collector";
+    return true;
+  });
+  EXPECT_THROW(missing->consume(context, Payload<int>::make(1), callback),
+               std::runtime_error);
+  EXPECT_THROW(app.entry->consume({}, Payload<int>::make(1), nullptr),
+               std::invalid_argument);
+  EXPECT_THROW(missing->consume({}, Payload<int>::make(1), callback),
+               std::logic_error);
+}
+
 TEST(SubStream, DeadlineAndExternalCancellation) {
   App app; app.init(); app.prepare();
   app.function = [](MessageContext, int) { return -1; };
@@ -117,18 +267,50 @@ TEST(SubStream, DeadlineAndExternalCancellation) {
 }
 
 TEST(SubStream, CancellationDrainsActiveCollector) {
+  for (const bool completed : {false, true}) {
+  SCOPED_TRACE(completed);
   App app; app.init(); app.prepare();
   std::promise<void> entered, release;
   auto released = release.get_future().share();
   std::stop_source stop;
   auto pending = std::async(std::launch::async, [&] {
-    EXPECT_THROW(app.entry->consume(MessageContext{}.withStopToken(stop.get_token()), Payload<int>::make(1), collect([&](MessageContext, const int&) {
-      entered.set_value(); released.wait(); return true;
-    })), std::runtime_error);
+    auto consume = [&] {
+      app.entry->consume(MessageContext{}.withStopToken(stop.get_token()), Payload<int>::make(1), collect([&](MessageContext, const int&) {
+        entered.set_value(); released.wait(); return completed;
+      }));
+    };
+    if (completed) {
+      EXPECT_NO_THROW(consume());
+    } else {
+      EXPECT_THROW(consume(), std::runtime_error);
+    }
   });
   entered.get_future().wait(); stop.request_stop();
   EXPECT_EQ(pending.wait_for(5ms), std::future_status::timeout);
   release.set_value(); pending.get();
+  }
+}
+
+TEST(SubStream, CollectorCompletionWinsItsOwnCancellation) {
+  for (const bool completed : {false, true}) {
+    SCOPED_TRACE(completed);
+    App app; app.init(); app.prepare();
+    std::stop_source stop;
+    int called = 0;
+    auto consume = [&] {
+      app.entry->consume(MessageContext{}.withStopToken(stop.get_token()), Payload<int>::make(1), collect([&](MessageContext, const int&) {
+        ++called;
+        stop.request_stop();
+        return completed;
+      }));
+    };
+    if (completed) {
+      EXPECT_NO_THROW(consume());
+    } else {
+      EXPECT_THROW(consume(), std::runtime_error);
+    }
+    EXPECT_EQ(called, 1);
+  }
 }
 
 TEST(SubStream, CollectorExceptionPropagatesAndClosesCall) {
@@ -147,6 +329,102 @@ TEST(SubStream, TypedContextKeysRemainLocalAndNested) {
   EXPECT_EQ(*outer.localValue(first), 1); EXPECT_EQ(*inner.localValue(first), 2);
   EXPECT_EQ(*inner.withPriority(5).localValue(second), 3);
   EXPECT_FALSE(MessageContext{}.withStreamId(std::string(inner.streamId())).localValue(first));
+}
+
+TEST(SubStream, ExternalCancellationAfterAdmissionReleasesOnlyItsInvocation) {
+  App app; app.init(); app.prepare();
+  boost::asio::io_context io;
+  detail::SingleUseEvent entered;
+  std::stop_source stop;
+  std::optional<MessageContext> retained;
+  app.function = [&](MessageContext context, int value) {
+    if (value == 0) {
+      retained = std::move(context);
+      entered.Send();
+      return -1;
+    }
+    return value;
+  };
+  auto callback = collect([](MessageContext, const int&) {
+    ADD_FAILURE() << "cancelled invocation produced a result";
+    return true;
+  });
+  std::weak_ptr<SubStreamCollector<int>> weak = callback;
+  bool returned = false;
+  bool siblingCompleted = false;
+  const auto parent = MessageContext{}.withStreamId("shared-parent");
+  auto pending = boost::asio::co_spawn(io,
+      detail::CooperativeExecution::Run([&, callback = std::move(callback)]() mutable {
+        EXPECT_THROW(app.entry->consume(
+            parent.withExternalCancellation(stop.get_token()),
+            Payload<int>::make(0), std::move(callback)), std::runtime_error);
+        returned = true;
+        EXPECT_TRUE(weak.expired());
+      }), boost::asio::use_future);
+  auto canceller = boost::asio::co_spawn(io,
+      detail::CooperativeExecution::Run([&] {
+        entered.Wait();
+        EXPECT_FALSE(returned);
+        EXPECT_TRUE(retained.has_value());
+        EXPECT_TRUE(stop.request_stop());
+        app.entry->consume(parent, Payload<int>::make(7),
+            collect([&](MessageContext context, const int& value) {
+              EXPECT_FALSE(context.cancelled());
+              EXPECT_EQ(context.streamId(), "shared-parent");
+              EXPECT_EQ(value, 7);
+              siblingCompleted = true;
+              return true;
+            }));
+      }), boost::asio::use_future);
+  io.run();
+  pending.get();
+  canceller.get();
+  EXPECT_TRUE(returned);
+  EXPECT_TRUE(siblingCompleted);
+  EXPECT_TRUE(retained.has_value());
+  EXPECT_TRUE(weak.expired());
+}
+
+TEST(SubStream, DeadlineDuringAdmittedCollectorDrainsAndPreservesCompletion) {
+  for (const bool completed : {false, true}) {
+    SCOPED_TRACE(completed);
+    App app; app.init(); app.prepare();
+    boost::asio::io_context io;
+    boost::asio::steady_timer timer{io};
+    detail::SingleUseEvent release;
+    bool collectorExited = false;
+    int callbacks = 0;
+    auto pending = boost::asio::co_spawn(io,
+        detail::CooperativeExecution::Run([&] {
+          const auto deadline = std::chrono::steady_clock::now() + 100ms;
+          const auto consume = [&] {
+            app.entry->consume(MessageContext{}.withDeadline(deadline),
+                Payload<int>::make(1), collect([&](MessageContext context, const int&) {
+                  ++callbacks;
+                  EXPECT_FALSE(context.cancelled());
+                  timer.expires_at(deadline + 1ms);
+                  timer.async_wait([&](const boost::system::error_code& error) {
+                    EXPECT_FALSE(error);
+                    EXPECT_FALSE(collectorExited);
+                    release.Send();
+                  });
+                  release.Wait();
+                  EXPECT_TRUE(context.cancelled());
+                  collectorExited = true;
+                  return completed;
+                }));
+          };
+          if (completed) {
+            EXPECT_NO_THROW(consume());
+          } else {
+            EXPECT_THROW(consume(), std::runtime_error);
+          }
+          EXPECT_TRUE(collectorExited);
+          EXPECT_EQ(callbacks, 1);
+        }), boost::asio::use_future);
+    io.run();
+    pending.get();
+  }
 }
 }  // namespace
 

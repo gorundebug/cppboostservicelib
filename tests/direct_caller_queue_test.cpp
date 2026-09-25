@@ -9,9 +9,12 @@
 #include <vector>
 
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/co_spawn.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_future.hpp>
 
 #include <servicelib/runtime/caller.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 
 namespace {
 
@@ -85,6 +88,40 @@ void DirectDeliveryWithoutCompletionFrame() {
   asyncCaller.consume(MessageContext{}, Payload<int>::make(42));
   Require(called && asyncCaller.isAsync(),
           "async metadata must not detach direct delivery");
+}
+
+void DirectDeliveryPreservesCompletedContext() {
+  for (const bool async : {false, true}) {
+    Consumer consumer;
+    servicelib::DirectCaller<int> caller{consumer, Params(), async};
+    std::stop_source stop;
+    stop.request_stop();
+    const auto deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+    const auto context = MessageContext{}.withStreamId("completed-direct-request")
+        .withPriority(0).withStopToken(stop.get_token()).withDeadline(deadline)
+        .withSampling(true)
+        .withTrace({"4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7",
+                    true, "vendor=value", "tenant=acme"});
+    int calls = 0;
+    consumer.receive = [&](MessageContext received, int value) {
+      ++calls;
+      Require(value == 42, "direct call changed a cancelled request payload");
+      Require(received.streamId() == context.streamId(), "direct call lost correlation");
+      Require(received.hasPriority() && received.priority() == 0,
+              "direct call lost an explicitly zero priority");
+      Require(received.cancelled() && received.stopToken().stop_requested(),
+              "direct call lost cancellation");
+      Require(received.deadline() == context.deadline(), "direct call changed deadline");
+      Require(received.samplingEnabled() &&
+                  received.trace().traceId == context.trace().traceId &&
+                  received.trace().spanId == context.trace().spanId &&
+                  received.trace().traceState == context.trace().traceState &&
+                  received.trace().baggage == context.trace().baggage,
+              "direct call lost trace context");
+    };
+    caller.consume(context, Payload<int>::make(42));
+    Require(calls == 1, "direct call silently discarded a completed context");
+  }
 }
 
 void PendingCompletionDoesNotBlockDelivery() {
@@ -174,6 +211,63 @@ void FailureAndReentrantDelivery() {
   caller.consume(context, Payload<int>::make(0));
   Require(received == std::vector<int>({-1, 0, 1, 2}),
           "reentrant delivery must complete before the outer call resumes");
+}
+
+void ClearingCompletionPreservesContextAndOwnership() {
+  const auto original = MessageContext{}.withStreamId("shared-context").withPriority(7);
+  const auto* identity = &original.trace();
+  const auto cleared = original.withoutCompletion();
+  Require(&cleared.trace() == identity, "empty completion cloned shared context");
+  auto movable = original;
+  const auto moved = std::move(movable).withoutCompletion();
+  Require(&moved.trace() == identity, "empty completion cloned moved shared context");
+  auto unique = MessageContext{}.withStreamId("unique-context");
+  const auto* uniqueIdentity = &unique.trace();
+  const auto uniqueCleared = std::move(unique).withoutCompletion();
+  Require(&uniqueCleared.trace() == uniqueIdentity, "empty completion cloned unique context");
+
+  int completed = 0;
+  auto parent = servicelib::AsyncCompletionState::make([&] { ++completed; });
+  const auto attached = original.withCompletion(parent);
+  const auto detached = attached.withoutCompletion();
+  auto sharedAttached = attached;
+  const auto movedDetached = std::move(sharedAttached).withoutCompletion();
+  Require(!detached.retainCompletionToken() && !movedDetached.retainCompletionToken(),
+          "nonempty completion was not detached");
+  Require(detached.streamId() == "shared-context" && detached.priority() == 7 &&
+          movedDetached.streamId() == "shared-context" && movedDetached.priority() == 7,
+          "clearing completion lost unrelated context fields");
+  auto retained = attached.retainCompletionToken();
+  Require(static_cast<bool>(retained), "detaching a copy changed the original context");
+  parent->release();
+  Require(completed == 0, "clearing context released an active operation");
+  retained.reset();
+  Require(completed == 1, "detached context prevented completion");
+}
+
+void AsyncEventRetiresItsDeadlineTimer() {
+  for (const bool cancelled : {false, true}) {
+    boost::asio::io_context io;
+    servicelib::detail::SingleUseEvent event;
+    std::stop_source stop;
+    const auto context = MessageContext{}.withStopToken(stop.get_token())
+        .withDeadline(std::chrono::steady_clock::now() + std::chrono::hours{1});
+    auto completion = boost::asio::co_spawn(io, event.AsyncWait(context),
+                                             boost::asio::use_future);
+    io.poll();
+    Require(completion.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout,
+            "event did not wait for completion or cancellation");
+    if (cancelled) stop.request_stop();
+    else event.Send();
+    io.restart();
+    io.run_for(std::chrono::milliseconds{100});
+    Require(completion.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready,
+            "event did not wake after completion or cancellation");
+    completion.get();
+    Require(io.stopped(), "completed event retained its deadline timer");
+    Require(event.IsReady() != cancelled, "cancellation incorrectly completed the event");
+    event.Send();
+  }
 }
 
 void InlineAndSharedTokensPreserveCompletion() {
@@ -270,9 +364,12 @@ void TimerRetainsParentWithoutBlockingDelivery() {
 int main() {
   try {
     DirectDeliveryWithoutCompletionFrame();
+    DirectDeliveryPreservesCompletedContext();
     PendingCompletionDoesNotBlockDelivery();
     ConcurrentCallsDoNotWaitForCompletion();
     FailureAndReentrantDelivery();
+    ClearingCompletionPreservesContextAndOwnership();
+    AsyncEventRetiresItsDeadlineTimer();
     InlineAndSharedTokensPreserveCompletion();
     ConcurrentInlineTokenRelease();
     TimerRetainsParentWithoutBlockingDelivery();

@@ -262,9 +262,11 @@ class EndpointState final {
     const auto startedAt = metrics_.requestStart();
     std::exception_ptr error;
     bool resultWaitFailed = false;
+    bool pendingInserted = false;
     try {
       if (hasResult_) {
         pending_.set(streamId, result);
+        pendingInserted = true;
         metrics_.pendingAdd(streamId);
       }
       try {
@@ -345,7 +347,7 @@ class EndpointState final {
             {tracing::Attribute::String("error", message)});
       }
     }
-    if (hasResult_) {
+    if (pendingInserted) {
       static_cast<void>(pending_.pop(streamId));
       metrics_.pendingRemove(streamId);
     }

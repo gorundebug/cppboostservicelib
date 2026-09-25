@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <limits>
 #include <list>
 #include <map>
@@ -24,6 +23,7 @@
 #include <vector>
 
 #include <servicelib/runtime/detail/asio_dispatch.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/pool/pool.hpp>
 
@@ -52,8 +52,7 @@ class QueuedPool {
           strand(boost::asio::make_strand(executor)),
           managerTimer(strand),
           lifecycleDeadline(strand),
-          deadlineTimer(strand),
-          drained(drainPromise.get_future().share()) {
+          deadlineTimer(strand) {
       const auto config = env.getRuntimeConfigSnapshot();
       const auto* pool = config ? config->GetPoolByName(name) : nullptr;
       if (!pool)
@@ -100,7 +99,7 @@ class QueuedPool {
     std::uint64_t activity{};
     std::atomic<int> target{0};
     int fallbackExecutors{};
-    // All fields below, except immutable metrics/drain future, are
+    // All fields below, except immutable metrics and the drain event, are
     // strand-owned.
     bool started{}, stopping{}, managerActive{true}, completed{};
     std::size_t busy{};
@@ -109,8 +108,7 @@ class QueuedPool {
     Deadlines deadlines;
     std::optional<std::chrono::steady_clock::time_point> armedAt;
     std::vector<std::unique_ptr<CancelCallback>> lifecycleCancellations;
-    std::promise<void> drainPromise;
-    std::shared_future<void> drained;
+    detail::SingleUseEvent drained;
     bool metricsEnabled{};
     std::unique_ptr<metrics::Int64Gauge> gaugeQueueLength, gaugeExecutorsTarget,
         gaugeExecutorsAllocated, gaugeExecutorsBusy;
@@ -171,7 +169,7 @@ class QueuedPool {
 
   void stop(Context context) {
     const auto state = state_;
-    if (currentExecutingPool_ == state.get()) throw PoolSelfStopError();
+    if (detail::CooperativeExecution::CurrentOwner() == state.get()) throw PoolSelfStopError();
     bool initiateStop;
     {
       std::lock_guard lock(state->activityMutex);
@@ -187,17 +185,16 @@ class QueuedPool {
         dispatch(state);
       });
     }
-    // Synchronous lifecycle API; ServiceApp calls this off the reactor.
-    // All stop callers wait for the same completion.
-    if (context.deadline() && state->drained.wait_until(*context.deadline()) ==
-                                  std::future_status::timeout) {
+    // All callers join the same completion. A callback of another pool may
+    // stop this one, so cooperative callers must leave the reactor available.
+    if (context.deadline() && !state->drained.WaitUntil(*context.deadline())) {
       bestEffort([&] {
         state->stopTimeoutCounter->inc();
         state->env.getLogger().warn("task pool stopped by timeout",
                                     {log::Field::Str("pool", state->name)});
       });
     }
-    state->drained.wait();
+    state->drained.Wait();
   }
 
   void addTask(Context context, int priority, std::function<void()> function) {
@@ -334,7 +331,7 @@ class QueuedPool {
     if (drained) {
       state->completed = true;
       publish(*state);
-      state->drainPromise.set_value();
+      state->drained.Send();
     }
   }
   static void stopManager(const std::shared_ptr<State>& state) {
@@ -455,10 +452,8 @@ class QueuedPool {
       removeDeadline(state, task);
       ++state->busy;
       publish(*state);
-      boost::asio::post(state->executor, [state, task] {
+      boost::asio::co_spawn(state->executor, detail::CooperativeExecution::Run([state, task] {
         task->cancellations.clear();
-        const auto previous = currentExecutingPool_;
-        currentExecutingPool_ = state.get();
         const auto started = state->metricsEnabled
                                  ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
@@ -474,7 +469,6 @@ class QueuedPool {
           bestEffort(
               [&] { state->env.getLogger().warn("task pool task error"); });
         }
-        currentExecutingPool_ = previous;
         task->function = nullptr;
         if (state->metricsEnabled)
           bestEffort([&] {
@@ -492,13 +486,13 @@ class QueuedPool {
           }
           dispatch(state);
         });
-      });
+      }, state.get()),
+          [](std::exception_ptr error) { if (error) std::rethrow_exception(error); });
     }
     publish(*state);
     armDeadline(state);
     checkDrain(state);
   }
-  inline static thread_local const State* currentExecutingPool_{};
   std::shared_ptr<State> state_;
 };
 }  // namespace servicelib::pool::detail_pool

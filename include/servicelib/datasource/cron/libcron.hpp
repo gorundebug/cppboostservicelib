@@ -8,7 +8,6 @@
 #pragma once
 
 #include <functional>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,6 +17,7 @@
 #include <utility>
 
 #include <servicelib/runtime/context.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <servicelib/runtime/environment.hpp>
 #include <servicelib/runtime/payload.hpp>
 #include <servicelib/runtime/schedule.hpp>
@@ -37,7 +37,7 @@ class ResultWaiter final {
 
   struct Pending final {
     std::mutex mutex;
-    std::condition_variable completed;
+    servicelib::detail::SingleUseEvent completed;
     bool done{};
   };
 
@@ -64,16 +64,13 @@ class ResultWaiter final {
       if (pending->done) return Completion::kDuplicate;
       pending->done = true;
     }
-    pending->completed.notify_all();
+    pending->completed.Send();
     return Completion::kCompleted;
   }
 
   void wait(const std::string& streamId,
             const std::shared_ptr<Pending>& pending) {
-    {
-      std::unique_lock lock(pending->mutex);
-      pending->completed.wait(lock, [&pending] { return pending->done; });
-    }
+    pending->completed.Wait();
     erase(streamId, pending);
   }
 

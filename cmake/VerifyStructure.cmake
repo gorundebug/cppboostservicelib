@@ -45,6 +45,7 @@ set(_boost_boundary_replacements
     runtime/config/yaml_value.hpp
     runtime/detail/asio_runtime.hpp
     runtime/detail/asio_dispatch.hpp
+    runtime/detail/cooperative_execution.hpp
     runtime/detail/asio_handler_diagnostics.hpp
     runtime/detail/async_operations.hpp
     runtime/detail/grpc_runtime.hpp

@@ -24,6 +24,9 @@ class WhenLink : public Stream<_Tp, _CCp, _Ctx> {
                  IRuntimeEnvironment* environment) {
     this->setConfigIdentity(cfg);
     this->serde_ = serde;
+    // Go MakeWhenStream resolves the output type, unlike SplitLink which
+    // inherits its parent's serializer. Generated callers pass nullptr here.
+    if (!serde) this->resolveDefaultSerde();
     this->setEnv(environment);
   }
 
@@ -288,6 +291,9 @@ class CaseImpl final : public Case<T> {
       activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.case");
     }
     size_t idx = static_cast<size_t>(f_(ctx, *this, payload.get()));
+    if (idx >= NBranches) {
+      throw StreamException("Case selected a branch index outside its configured branches");
+    }
     if (idx < NBranches && this->branchDispatchers_[idx]) {
       this->branchDispatchers_[idx](std::move(ctx), std::move(payload));
     }

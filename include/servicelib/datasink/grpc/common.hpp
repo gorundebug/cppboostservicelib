@@ -6,6 +6,7 @@
 #include <chrono>
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,7 @@
 #include <servicelib/runtime/config/endpoint_types.hpp>
 #include <servicelib/runtime/datasink.hpp>
 #include <servicelib/runtime/detail/async_operations.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/environment/tracing/tracing.hpp>
 #include <servicelib/runtime/detail/http_types.hpp>
@@ -131,7 +133,29 @@ class DataSink final {
     for (const auto& endpoint : endpoints_) endpoint->start(context);
   }
   void stop(Context context) {
-    for (const auto& endpoint : endpoints_) endpoint->stop(context);
+    // Different endpoint IDs stop concurrently. Consumers of one endpoint
+    // follow Go's reverse-registration, sequential shutdown contract.
+    std::unordered_map<int, std::vector<std::shared_ptr<IEndpoint>>> groups;
+    for (const auto& endpoint : endpoints_) groups[endpoint->id()].push_back(endpoint);
+    std::vector<servicelib::detail::ControlTask<void>> stops;
+    stops.reserve(groups.size());
+    for (auto& group : groups) {
+      stops.emplace_back(
+          [entries = std::move(group.second), context] {
+            for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+              (*it)->stop(context);
+            }
+          });
+    }
+    std::exception_ptr failure;
+    for (auto& stop : stops) {
+      try {
+        stop.get();
+      } catch (...) {
+        if (!failure) failure = std::current_exception();
+      }
+    }
+    if (failure) std::rethrow_exception(failure);
   }
 
  private:

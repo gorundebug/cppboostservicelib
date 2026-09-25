@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <servicelib/runtime/detail/sync.hpp>
 
 #include <servicelib/datasink/grpc/common.hpp>
 
@@ -98,7 +99,10 @@ class ServerStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     std::shared_ptr<tracing::Span> span;
     std::shared_ptr<servicelib::detail::AsyncOperations::Token> operation;
     servicelib::AsyncCompletionToken completion;
-    std::mutex mutex;
+    servicelib::detail::CooperativeMutex mutex;
+    servicelib::detail::SingleUseEvent done;
+    bool finished{};
+    std::exception_ptr callError;
     std::exception_ptr responseError;
     std::int64_t messageCount{};
   };
@@ -154,12 +158,21 @@ class ServerStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     auto state = std::make_shared<AsyncState>(
         std::move(context), std::move(begin->state), startedAt,
         std::move(trace.span), std::move(operation), std::move(completion));
+    const auto finish = [state](std::exception_ptr callError) {
+      {
+        std::lock_guard lock(state->mutex);
+        if (state->finished) return;
+        state->finished = true;
+        state->callError = std::move(callError);
+      }
+      state->done.Send();
+    };
     try {
       client_.async(
           std::move(*request), callOptions(requestContext, this->tracingEnabled()),
           [this, state](Res response) {
             std::lock_guard lock(state->mutex);
-            if (state->responseError) return;
+            if (state->finished || state->responseError) return;
             try {
               this->handler_.handleResponse(
                   state->context, this->streamContext_, state->state, response);
@@ -171,35 +184,29 @@ class ServerStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
               throw;
             }
           },
-          [this, state](std::exception_ptr callError) mutable noexcept {
-            {
-              std::lock_guard lock(state->mutex);
-              if (!callError) callError = state->responseError;
-              if (!callError) {
-                if (auto* traceSpan = 
-                    state->span.get()) traceSpan->addEvent("eof",
-                    {tracing::Attribute::Int64("messages_received",
-                                               state->messageCount)});
-              }
-            }
-            if (callError) {
-              this->traceError(state->span.get(), callError,
-                               "grpc_call.error");
-            }
-            this->callEnd(state->context, callError, state->state);
-            this->metrics_.requestEnd(state->startedAt, callError);
-            if (state->span) tracing::SpanEnd(state->span.get());
-            state->completion.reset();
-          });
+          finish);
       if (auto* traceSpan = state->span.get()) traceSpan->addEvent("grpc_call");
     } catch (...) {
-      error = std::current_exception();
-      this->traceError(state->span.get(), error, "grpc_call.error");
-      this->callEnd(state->context, error, state->state);
-      this->metrics_.requestEnd(state->startedAt, error);
-      if (state->span) tracing::SpanEnd(state->span.get());
-      state->completion.reset();
+      finish(std::current_exception());
     }
+    // A FunctionCall completes after the RPC and its business handlers, not
+    // merely after starting the transport. Waiting releases a reactor worker.
+    state->done.Wait();
+    {
+      std::lock_guard lock(state->mutex);
+      error = state->responseError ? state->responseError : state->callError;
+    }
+    if (error) {
+      this->traceError(state->span.get(), error, "grpc_call.error");
+    } else if (auto* traceSpan = state->span.get()) {
+      traceSpan->addEvent("eof", {tracing::Attribute::Int64(
+          "messages_received", state->messageCount)});
+    }
+    this->callEnd(state->context, error, state->state);
+    this->metrics_.requestEnd(state->startedAt, error);
+    if (state->span) tracing::SpanEnd(state->span.get());
+    state->completion.reset();
+    state->operation.reset();
   }
 
   template <typename Rpc>

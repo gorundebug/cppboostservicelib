@@ -6,6 +6,8 @@
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/use_future.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include <gtest/gtest.h>
 
@@ -16,17 +18,21 @@
 #include <servicelib/runtime/testlog/testlog.hpp>
 #include <servicelib/runtime/testmetrics/testmetrics.hpp>
 #include <servicelib/runtime/testtracing/testtracing.hpp>
+#include <servicelib/transformation/streams.hpp>
 
 #include "test_sink_endpoint_stream.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <exception>
 #include <future>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -74,7 +80,9 @@ CaptureClientError(
 
 class TestConfig final : public servicelib::config::IConfig {
  public:
-  TestConfig() {
+  explicit TestConfig(servicelib::api::HTTPMethodType method =
+                          servicelib::api::HTTPMethodType::kPOST,
+                      bool withSecondEndpoint = false) {
     connector.id = 10;
     connector.name = "http";
     connector.host = "127.0.0.1";
@@ -82,8 +90,14 @@ class TestConfig final : public servicelib::config::IConfig {
     endpoint.id = 1;
     endpoint.name = "http-source";
     endpoint.idDataConnector = connector.id;
-    endpoint.httpMethodType = servicelib::api::HTTPMethodType::kPOST;
+    endpoint.httpMethodType = method;
     endpoint.path = "/orders";
+    if (withSecondEndpoint) {
+      secondEndpoint = endpoint;
+      secondEndpoint->id = 2;
+      secondEndpoint->name = "http-second";
+      secondEndpoint->path = "/second";
+    }
     stream.id = 33;
     stream.name = "Receive Booking";
     stream.pipeline = "booking";
@@ -98,7 +112,10 @@ class TestConfig final : public servicelib::config::IConfig {
   std::vector<servicelib::config::DataConnectorConfigRef> GetDataConnectors()
       const override { return {connector}; }
   std::vector<servicelib::config::EndpointConfigRef> GetEndpoints()
-      const override { return {endpoint}; }
+      const override {
+    if (secondEndpoint) return {endpoint, *secondEndpoint};
+    return {endpoint};
+  }
   std::vector<const servicelib::config::PoolConfig*> GetPools() const override {
     return {};
   }
@@ -113,14 +130,17 @@ class TestConfig final : public servicelib::config::IConfig {
 
   servicelib::config::HttpDataConnectorConfig connector;
   servicelib::config::HttpEndpointConfig endpoint;
+  std::optional<servicelib::config::HttpEndpointConfig> secondEndpoint;
   servicelib::config::InputStreamConfig stream;
 };
 
 class TestEnvironment final : public servicelib::IRuntimeEnvironment {
  public:
   explicit TestEnvironment(
-      servicelib::testtracing::TestTracing* tracing = nullptr)
-      : runtimeConfig_(config_), tracing_(tracing) {
+      servicelib::testtracing::TestTracing* tracing = nullptr,
+      servicelib::api::HTTPMethodType method = servicelib::api::HTTPMethodType::kPOST,
+      bool withSecondEndpoint = false)
+      : config_(method, withSecondEndpoint), runtimeConfig_(config_), tracing_(tracing) {
     service_.name = "http-test";
   }
   servicelib::pool::ITaskPool* getTaskPool(const std::string&) override {
@@ -262,6 +282,145 @@ TEST(HttpDataSource, PreservesCanonicalHandlerAndCorrelationContract) {
       [](const auto& event) { return event.name == "done_received"; }));
   endpoint.stop(servicelib::Context{});
   servicelib::detail::ParallelExecutorRegistry::Clear();
+}
+
+struct CompletionProbeHandler final {
+  using State = int;
+  using Request = std::string;
+  using Response = std::string;
+  bool hasResult;
+  int* endCalls;
+
+  servicelib::BeginResult<State> beginRequest(servicelib::MessageContext context,
+      auto&, servicelib::datasource::http::HandlerData&) {
+    return {std::move(context), 0};
+  }
+  void consumeMessage(servicelib::MessageContext context, auto& stream, State& state,
+      servicelib::datasource::http::HandlerData& data, auto result) {
+    if (hasResult) {
+      Handler{}.consumeMessage(std::move(context), stream, state, data, result);
+    } else {
+      data.responseBody = "accepted";
+      stream.collect(std::move(context), data.request.body);
+    }
+  }
+  std::string getMessageId(servicelib::MessageContext, auto&, State&, const std::string&) {
+    return "result";
+  }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr, State&,
+      servicelib::datasource::http::HandlerData&) noexcept { ++*endCalls; }
+};
+
+TEST(HttpDataSource, TracingDoesNotCreateOrWaitForGraphCompletion) {
+  for (const bool tracingEnabled : {false, true}) {
+    for (const bool hasResult : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "tracing=" << tracingEnabled
+                                      << " hasResult=" << hasResult);
+      boost::asio::io_context io;
+      servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+      servicelib::testtracing::TestTracing tracing;
+      TestEnvironment environment{tracingEnabled ? &tracing : nullptr};
+      servicelib::AsyncCompletionToken retained;
+      std::optional<servicelib::MessageContext> deferred;
+      int endCalls = 0;
+      using Endpoint = servicelib::datasource::http::BeastEndpoint<
+          std::string, std::string, CompletionProbeHandler>;
+      Endpoint endpoint{environment, 1, CompletionProbeHandler{hasResult, &endCalls},
+          [&](servicelib::MessageContext context, servicelib::Payload<std::string>) {
+            retained = context.retainCompletionToken();
+            deferred = std::move(context);
+          }, hasResult};
+      endpoint.start(servicelib::Context{});
+      servicelib::http::Request request;
+      request.method = "POST";
+      request.path = request.target = "/orders";
+      request.body = "one";
+      auto response = boost::asio::co_spawn(io, endpoint.handle(std::move(request),
+          servicelib::tracing::EnableSampling(servicelib::MessageContext{})),
+          boost::asio::use_future);
+      io.poll();
+      EXPECT_TRUE(deferred.has_value());
+      EXPECT_FALSE(static_cast<bool>(retained));
+      if (hasResult && deferred) {
+        EXPECT_EQ(response.wait_for(std::chrono::milliseconds{0}), std::future_status::timeout);
+        endpoint.consumeResult(*deferred, servicelib::Payload<std::string>::make("one"));
+        io.restart();
+        io.poll();
+      }
+      EXPECT_EQ(response.wait_for(std::chrono::milliseconds{0}), std::future_status::ready);
+      EXPECT_EQ(endCalls, 1);
+      // Release the probe even on regression so an unexpected frame cannot hang the test.
+      retained.reset();
+      io.restart();
+      while (response.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready) {
+        ASSERT_GT(io.run_one_for(std::chrono::seconds{1}), 0U);
+      }
+      EXPECT_EQ(response.get().body, hasResult ? "reply:one" : "accepted");
+      if (deferred) {
+        endpoint.consumeResult(*deferred, servicelib::Payload<std::string>::make("late"));
+      }
+      EXPECT_EQ(endCalls, 1);
+      EXPECT_EQ(tracing.spans().size(), tracingEnabled ? 1U : 0U);
+      endpoint.stop(servicelib::Context{});
+      servicelib::detail::ParallelExecutorRegistry::Clear();
+    }
+  }
+}
+
+TEST(HttpDataSource, TracingDoesNotDelayCancellationOrDeadline) {
+  for (const bool tracingEnabled : {false, true}) {
+    for (const bool useDeadline : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "tracing=" << tracingEnabled
+                                      << " deadline=" << useDeadline);
+      boost::asio::io_context io;
+      servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+      servicelib::testtracing::TestTracing tracing;
+      TestEnvironment environment{tracingEnabled ? &tracing : nullptr};
+      servicelib::AsyncCompletionToken retained;
+      std::optional<servicelib::MessageContext> deferred;
+      int endCalls = 0;
+      using Endpoint = servicelib::datasource::http::BeastEndpoint<
+          std::string, std::string, CompletionProbeHandler>;
+      Endpoint endpoint{environment, 1, CompletionProbeHandler{true, &endCalls},
+          [&](servicelib::MessageContext context, servicelib::Payload<std::string>) {
+            retained = context.retainCompletionToken();
+            deferred = std::move(context);
+          }, true};
+      endpoint.start(servicelib::Context{});
+      std::stop_source stop;
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
+      auto context = servicelib::MessageContext{}.withStopToken(stop.get_token());
+      if (useDeadline) context = std::move(context).withDeadline(deadline);
+      servicelib::http::Request request;
+      request.method = "POST";
+      request.path = request.target = "/orders";
+      auto response = boost::asio::co_spawn(io, endpoint.handle(std::move(request),
+          servicelib::tracing::EnableSampling(std::move(context))), boost::asio::use_future);
+      io.poll();
+      EXPECT_TRUE(deferred.has_value());
+      EXPECT_EQ(response.wait_for(std::chrono::milliseconds{0}), std::future_status::timeout);
+      if (useDeadline) std::this_thread::sleep_until(deadline);
+      else stop.request_stop();
+      io.restart();
+      io.poll();
+      EXPECT_EQ(response.wait_for(std::chrono::milliseconds{0}), std::future_status::ready);
+      EXPECT_EQ(endCalls, 1);
+      retained.reset();
+      io.restart();
+      while (response.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready) {
+        ASSERT_GT(io.run_one_for(std::chrono::seconds{1}), 0U);
+      }
+      static_cast<void>(response.get());
+      if (deferred) {
+        EXPECT_TRUE(deferred->cancelled());
+        endpoint.consumeResult(*deferred, servicelib::Payload<std::string>::make("late"));
+      }
+      EXPECT_EQ(endCalls, 1);
+      EXPECT_EQ(tracing.spans().size(), tracingEnabled ? 1U : 0U);
+      endpoint.stop(servicelib::Context{});
+      servicelib::detail::ParallelExecutorRegistry::Clear();
+    }
+  }
 }
 
 struct RetainedCallbackHandler final {
@@ -641,6 +800,75 @@ TEST(HttpServer, ShutdownDeadlineForcesCancellationOfAcceptedRequest) {
             std::future_status::ready);
   EXPECT_THROW(static_cast<void>(request.get()), std::exception);
   io.stop();
+}
+
+TEST(HttpServer, ShutdownDeadlineDoesNotWaitForUncooperativeHandler) {
+  std::weak_ptr<servicelib::http::Router> retainedRouter;
+  {
+    boost::asio::io_context io;
+    servicelib::detail::SingleUseEvent accepted;
+    servicelib::detail::SingleUseEvent release;
+    servicelib::detail::SingleUseEvent retired;
+    std::atomic<bool> handlerReturned{};
+    auto router = std::make_shared<servicelib::http::Router>();
+    retainedRouter = router;
+    router->Add(
+        "POST", "/wait",
+        [&](servicelib::http::Request, servicelib::MessageContext)
+            -> boost::asio::awaitable<servicelib::http::Response> {
+          accepted.Send();
+          // Deliberately ignore request cancellation without blocking a worker.
+          co_await release.AsyncWait();
+          handlerReturned.store(true, std::memory_order_release);
+          retired.Send();
+          co_return servicelib::http::Response{
+              200, {}, "released", "text/plain", false};
+        });
+    servicelib::http::Server::Options options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.shutdownTimeout = std::chrono::milliseconds{30};
+    auto server = std::make_unique<servicelib::http::Server>(
+        io.get_executor(), std::move(router), options);
+    server->Start();
+    auto request = boost::asio::co_spawn(
+        io, SendRequest(server->port()), boost::asio::use_future);
+    std::jthread ioThread([&] { io.run(); });
+    EXPECT_TRUE(accepted.WaitUntil(std::chrono::steady_clock::now() +
+                                  std::chrono::seconds{2}));
+
+    auto stopped = std::async(std::launch::async, [&] { server->Stop(); });
+    const bool returnedBeforeHandler =
+        stopped.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
+    EXPECT_TRUE(returnedBeforeHandler)
+        << "30ms shutdown deadline must not wait for handler completion";
+    EXPECT_FALSE(handlerReturned.load(std::memory_order_acquire));
+    if (returnedBeforeHandler) {
+      stopped.get();
+      server.reset();
+      EXPECT_FALSE(retainedRouter.expired())
+          << "the active session must retain its route after Server destruction";
+    }
+
+    // Always release the handler, including when testing the old blocking Stop.
+    release.Send();
+    EXPECT_TRUE(retired.WaitUntil(std::chrono::steady_clock::now() +
+                                 std::chrono::seconds{2}));
+    if (!returnedBeforeHandler) {
+      EXPECT_EQ(stopped.wait_for(std::chrono::seconds{2}),
+                std::future_status::ready);
+      stopped.get();
+      server.reset();
+    }
+    const auto requestStatus = request.wait_for(std::chrono::seconds{2});
+    EXPECT_EQ(requestStatus, std::future_status::ready);
+    if (requestStatus == std::future_status::ready) {
+      EXPECT_THROW(static_cast<void>(request.get()), std::exception);
+    }
+    io.stop();
+    ioThread.join();
+  }
+  EXPECT_TRUE(retainedRouter.expired());
 }
 
 TEST(HttpServer, RoutesGetPostKeepsConnectionAndEnforcesBodyLimit) {
@@ -1337,6 +1565,465 @@ struct SinkHandler final {
   }
 };
 
+class StopProbeHttpEndpoint final : public servicelib::datasink::http::IEndpoint {
+ public:
+  StopProbeHttpEndpoint(int id, std::function<void()> stop)
+      : id_(id), stop_(std::move(stop)) {}
+  int id() const noexcept override { return id_; }
+  void start(servicelib::Context) override {}
+  void stop(servicelib::Context) override { stop_(); }
+ private:
+  int id_;
+  std::function<void()> stop_;
+};
+
+TEST(HttpDataSink, StopIsConcurrentBetweenIdsButReverseSequentialWithinOneId) {
+  using namespace std::chrono_literals;
+  TestEnvironment environment{nullptr, servicelib::api::HTTPMethodType::kPOST, true};
+  TestSinkEndpointStream<int, int> stream{environment, 1};
+  auto sink = servicelib::datasink::http::BeastDataSink::make(stream);
+  std::promise<void> lastEntered, otherEntered, releaseLast;
+  auto lastReady = lastEntered.get_future();
+  auto otherReady = otherEntered.get_future();
+  auto release = releaseLast.get_future().share();
+  std::atomic<bool> firstStarted{false};
+  std::atomic<bool> lastFinished{false};
+  std::mutex orderMutex;
+  std::vector<int> sameEndpointOrder;
+  sink->addEndpoint(std::make_shared<StopProbeHttpEndpoint>(1, [&] {
+    firstStarted.store(true);
+    EXPECT_TRUE(lastFinished.load());
+    std::lock_guard lock(orderMutex);
+    sameEndpointOrder.push_back(1);
+  }));
+  sink->addEndpoint(std::make_shared<StopProbeHttpEndpoint>(1, [&] {
+    {
+      std::lock_guard lock(orderMutex);
+      sameEndpointOrder.push_back(2);
+    }
+    lastEntered.set_value();
+    release.wait();
+    lastFinished.store(true);
+  }));
+  sink->addEndpoint(std::make_shared<StopProbeHttpEndpoint>(2, [&] {
+    otherEntered.set_value();
+  }));
+  sink->start({});
+  auto stopped = std::async(std::launch::async, [&] { sink->stop({}); });
+  EXPECT_EQ(lastReady.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(otherReady.wait_for(1s), std::future_status::ready);
+  EXPECT_FALSE(firstStarted.load());
+  EXPECT_EQ(stopped.wait_for(0ms), std::future_status::timeout);
+  // Release even after a failed assertion, so a serial implementation cannot
+  // leave the test process waiting indefinitely during future destruction.
+  releaseLast.set_value();
+  EXPECT_NO_THROW(stopped.get());
+  EXPECT_TRUE(firstStarted.load());
+  EXPECT_EQ(sameEndpointOrder, (std::vector<int>{2, 1}));
+}
+
+struct ConfiguredMethodSinkHandler final {
+  using State = int;
+  std::string method;
+  int* ended;
+  servicelib::BeginResult<State> beginRequest(
+      servicelib::MessageContext context, auto&) {
+    return {std::move(context), 0};
+  }
+  void consumeMessage(servicelib::MessageContext, auto&, State&,
+                      const std::string& value,
+                      servicelib::datasink::http::Requester& requester) {
+    requester.newRequest(method, "http://example.test/resource", value);
+  }
+  void handleResponse(servicelib::MessageContext context, auto& stream,
+                      State&, const servicelib::datasink::http::Response& response) {
+    stream.collect(std::move(context), response.body);
+  }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr error,
+                  State&) {
+    EXPECT_FALSE(error);
+    ++*ended;
+  }
+};
+
+class ConfiguredMethodSinkClient final : public servicelib::datasink::http::Client {
+ public:
+  std::string expectedMethod;
+  int calls{};
+  boost::asio::awaitable<servicelib::datasink::http::Response> perform(
+      servicelib::datasink::http::Request request,
+      servicelib::MessageContext) override {
+    EXPECT_EQ(request.method, expectedMethod);
+    ++calls;
+    co_return servicelib::datasink::http::Response{200, "result", {}};
+  }
+};
+
+TEST(HttpDataSink, AcceptsEveryDeclaredMethodAndRejectsInvalidConfiguration) {
+  using Method = servicelib::api::HTTPMethodType;
+  using Endpoint = servicelib::datasink::http::BeastEndpoint<
+      std::string, std::string, ConfiguredMethodSinkHandler>;
+  const std::pair<Method, const char*> methods[] = {
+      {Method::kGET, "GET"}, {Method::kPOST, "POST"},
+      {Method::kPUT, "PUT"}, {Method::kPATCH, "PATCH"},
+      {Method::kDELETE, "DELETE"}, {Method::kHEAD, "HEAD"},
+      {Method::kOPTIONS, "OPTIONS"}, {Method::kTRACE, "TRACE"},
+      {Method::kCONNECT, "CONNECT"}};
+  boost::asio::io_context io;
+  servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+  for (const auto& [method, name] : methods) {
+    SCOPED_TRACE(name);
+    TestEnvironment environment{nullptr, method};
+    ConfiguredMethodSinkClient client;
+    client.expectedMethod = name;
+    int ended = 0;
+    int received = 0;
+    TestSinkEndpointStream<std::string, std::string> stream{
+        environment, 1,
+        [&received](servicelib::MessageContext context,
+                     servicelib::Payload<std::string> value) {
+          EXPECT_EQ(context.streamId(), "method-parent");
+          EXPECT_EQ(value.get(), "result");
+          ++received;
+        }};
+    EXPECT_NO_THROW({
+      Endpoint endpoint(stream, client, ConfiguredMethodSinkHandler{name, &ended});
+      endpoint.start({});
+      io.restart();
+      auto call = boost::asio::co_spawn(io,
+          servicelib::detail::CooperativeExecution::Run([&] {
+            endpoint.consume(servicelib::MessageContext{}.withStreamId("method-parent"),
+                             servicelib::Payload<std::string>::make("request"));
+            EXPECT_EQ(received, 1);
+            EXPECT_EQ(ended, 1);
+          }), boost::asio::use_future);
+      io.run();
+      call.get();
+      endpoint.stop({});
+    });
+    EXPECT_EQ(client.calls, 1);
+    EXPECT_EQ(received, 1);
+    EXPECT_EQ(ended, 1);
+  }
+  for (const auto method : {Method::kUndefined, static_cast<Method>(-1),
+                            static_cast<Method>(99)}) {
+    SCOPED_TRACE(static_cast<int>(method));
+    TestEnvironment environment{nullptr, method};
+    ConfiguredMethodSinkClient client;
+    int ended = 0;
+    TestSinkEndpointStream<std::string, std::string> stream{environment, 1};
+    EXPECT_THROW((Endpoint{stream, client, ConfiguredMethodSinkHandler{"GET", &ended}}),
+                 std::invalid_argument);
+    EXPECT_EQ(client.calls, 0);
+    EXPECT_EQ(ended, 0);
+  }
+  servicelib::detail::ParallelExecutorRegistry::Clear();
+}
+
+struct HttpSubStreamCall final {
+  std::function<void(servicelib::MessageContext, int)> output;
+  bool ended{};
+  std::exception_ptr error;
+};
+
+struct HttpSubStreamHandler final {
+  using State = std::shared_ptr<HttpSubStreamCall>;
+  servicelib::ContextKey<HttpSubStreamCall>* key;
+  std::string url;
+
+  servicelib::BeginResult<State> beginRequest(
+      servicelib::MessageContext context, auto&) {
+    auto state = context.localValue(*key);
+    return {std::move(context), std::move(state)};
+  }
+  void consumeMessage(servicelib::MessageContext, auto&, State&,
+                      const int& value,
+                      servicelib::datasink::http::Requester& requester) {
+    requester.newRequest("POST", url, std::to_string(value));
+  }
+  void handleResponse(servicelib::MessageContext context, auto& stream,
+                      State&, const servicelib::datasink::http::Response& response) {
+    stream.collect(std::move(context), std::stoi(response.body));
+  }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr error,
+                  State& state) {
+    state->error = error;
+    state->ended = true;
+  }
+};
+
+struct HttpSubStreamTypes {
+  template <typename> struct DataType {};
+};
+
+using HttpSubStreamForward = std::function<void(servicelib::MessageContext, int)>;
+using HttpSubStreamInvoke = std::function<void(
+    servicelib::MessageContext, int, HttpSubStreamForward)>;
+
+struct HttpSubStreamWork final {
+  HttpSubStreamInvoke* invoke;
+  template <typename Output>
+  void operator()(servicelib::MessageContext context, servicelib::StreamBase&,
+                  int& value, Output&& output) const {
+    (*invoke)(std::move(context), value,
+        [&output](servicelib::MessageContext returned, int result) {
+          output.out(std::move(returned), result);
+        });
+  }
+};
+
+class HttpSubStreamApp final
+    : public servicelib::StreamExecutionEnvironment<HttpSubStreamApp,
+                                                     HttpSubStreamTypes> {
+ public:
+  std::shared_ptr<servicelib::SubStream<int, int, HttpSubStreamApp>> entry;
+  HttpSubStreamInvoke invoke;
+  void init() {
+    servicelib::config::SubStreamConfig config;
+    config.id = 101;
+    config.name = "remote-lookup";
+    entry = servicelib::makeSubStream<int, int, HttpSubStreamApp>(config, *this);
+    servicelib::config::MapStreamConfig work;
+    work.id = 102;
+    work.name = "http-lookup";
+    auto& result = entry->map(work, servicelib::StreamType<int>{},
+                              servicelib::StreamFunction(HttpSubStreamWork{&invoke}));
+    entry->setSource(result);
+    static_cast<void>(getExecutionRuntime<>());
+  }
+  void delay(servicelib::Context, servicelib::pool::IDelayPool::Duration,
+             std::function<void()> task) override { task(); }
+};
+
+TEST(HttpDataSink, ConcurrentSubStreamsKeepCorrelationOverTcpOnOneWorker) {
+  constexpr int callCount = 16;
+  HttpSubStreamApp app;
+  app.init();
+  boost::asio::io_context io;
+  servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+  servicelib::ContextKey<HttpSubStreamCall> callKey;
+  servicelib::ContextKey<int> callerKey;
+  std::unordered_set<std::string> wireIds;
+  std::vector<std::shared_ptr<boost::asio::steady_timer>> gates;
+  auto router = std::make_shared<servicelib::http::Router>();
+  router->Add("POST", "/lookup",
+      [&](servicelib::http::Request request, servicelib::MessageContext context)
+          -> boost::asio::awaitable<servicelib::http::Response> {
+        EXPECT_FALSE(context.localValue(callerKey));
+        EXPECT_NE(context.streamId(), "shared-parent");
+        EXPECT_TRUE(wireIds.emplace(context.streamId()).second);
+        auto gate = std::make_shared<boost::asio::steady_timer>(
+            io, std::chrono::seconds{5});
+        gates.push_back(gate);
+        if (gates.size() == callCount) {
+          for (const auto& waiting : gates) waiting->cancel();
+        } else {
+          boost::system::error_code error;
+          co_await gate->async_wait(boost::asio::redirect_error(
+              boost::asio::use_awaitable, error));
+          EXPECT_EQ(error, boost::asio::error::operation_aborted);
+        }
+        co_return servicelib::http::Response{
+            200, {}, std::to_string(std::stoi(request.body) * 2),
+            "text/plain", true};
+      });
+  servicelib::http::Server::Options serverOptions;
+  serverOptions.address = "127.0.0.1";
+  serverOptions.port = 0;
+  servicelib::http::Server server(io.get_executor(), router, serverOptions);
+  server.Start();
+  servicelib::http::Client::Options clientOptions;
+  clientOptions.connections = callCount;
+  auto transport = std::make_shared<servicelib::http::Client>(
+      io.get_executor(), clientOptions);
+  servicelib::datasink::http::BeastClient client(transport);
+  TestEnvironment environment;
+  TestSinkEndpointStream<int, int> stream{
+      environment, 1,
+      [&callKey](servicelib::MessageContext context, servicelib::Payload<int> value) {
+        const auto call = context.localValue(callKey);
+        ASSERT_TRUE(call);
+        call->output(std::move(context), value.get());
+      }};
+  servicelib::datasink::http::BeastEndpoint<int, int, HttpSubStreamHandler> endpoint{
+      stream, client, HttpSubStreamHandler{
+          &callKey, "http://127.0.0.1:" + std::to_string(server.port()) + "/lookup"}};
+  endpoint.start({});
+  app.invoke = [&](servicelib::MessageContext context, int value,
+                    HttpSubStreamForward output) {
+    auto call = std::make_shared<HttpSubStreamCall>();
+    call->output = std::move(output);
+    endpoint.consume(context.withLocalValue(callKey, call),
+                     servicelib::Payload<int>::make(value));
+    EXPECT_TRUE(call->ended);
+    call->output = {};
+    if (call->error) std::rethrow_exception(call->error);
+  };
+  std::vector<std::future<void>> calls;
+  for (int value = 0; value < callCount; ++value) {
+    calls.push_back(boost::asio::co_spawn(io,
+        servicelib::detail::CooperativeExecution::Run([&, value] {
+          int received = 0;
+          const auto context = servicelib::MessageContext{}
+              .withStreamId("shared-parent")
+              .withLocalValue(callerKey, std::make_shared<int>(value))
+              .withDeadline(std::chrono::steady_clock::now() + std::chrono::seconds{10});
+          app.entry->consume(context, servicelib::Payload<int>::make(value),
+              std::make_shared<servicelib::SubStreamCollectorFunc<int>>(
+                  [&](servicelib::MessageContext returned, const int& result) {
+                    EXPECT_EQ(returned.streamId(), "shared-parent");
+                    EXPECT_EQ(returned.localValue(callerKey), context.localValue(callerKey));
+                    EXPECT_EQ(result, value * 2);
+                    ++received;
+                    return true;
+                  }));
+          EXPECT_EQ(received, 1);
+        }), boost::asio::use_future));
+  }
+  std::jthread worker([&io] { io.run(); });
+  for (auto& call : calls) EXPECT_NO_THROW(call.get());
+  endpoint.stop({});
+  client.Stop();
+  server.Stop();
+  io.stop();
+  worker.join();
+  EXPECT_EQ(wireIds.size(), callCount);
+  servicelib::detail::ParallelExecutorRegistry::Clear();
+}
+
+TEST(HttpDataSink, CancelledNestedSubStreamReleasesStateWithoutCancellingSibling) {
+  using namespace std::chrono_literals;
+  HttpSubStreamApp app;
+  app.init();
+  boost::asio::io_context io;
+  servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+  servicelib::ContextKey<HttpSubStreamCall> callKey;
+  std::promise<void> firstArrived;
+  auto firstReady = firstArrived.get_future();
+  boost::asio::steady_timer lateResponse(io, 30s);
+  std::unordered_set<std::string> wireIds;
+  auto router = std::make_shared<servicelib::http::Router>();
+  router->Add("POST", "/lookup",
+      [&](servicelib::http::Request request, servicelib::MessageContext context)
+          -> boost::asio::awaitable<servicelib::http::Response> {
+        EXPECT_NE(context.streamId(), "nested-parent");
+        EXPECT_TRUE(wireIds.emplace(context.streamId()).second);
+        const int value = std::stoi(request.body);
+        if (value == 1) {
+          firstArrived.set_value();
+          boost::system::error_code error;
+          co_await lateResponse.async_wait(boost::asio::redirect_error(
+              boost::asio::use_awaitable, error));
+          EXPECT_EQ(error, boost::asio::error::operation_aborted);
+        }
+        co_return servicelib::http::Response{
+            200, {}, std::to_string(value * 2), "text/plain", true};
+      });
+  servicelib::http::Server::Options serverOptions;
+  serverOptions.address = "127.0.0.1";
+  serverOptions.port = 0;
+  servicelib::http::Server server(io.get_executor(), router, serverOptions);
+  server.Start();
+  servicelib::http::Client::Options clientOptions;
+  clientOptions.connections = 2;
+  auto transport = std::make_shared<servicelib::http::Client>(
+      io.get_executor(), clientOptions);
+  servicelib::datasink::http::BeastClient client(transport);
+  TestEnvironment environment;
+  TestSinkEndpointStream<int, int> stream{
+      environment, 1,
+      [&callKey](servicelib::MessageContext context, servicelib::Payload<int> value) {
+        const auto call = context.localValue(callKey);
+        ASSERT_TRUE(call);
+        call->output(std::move(context), value.get());
+      }};
+  servicelib::datasink::http::BeastEndpoint<int, int, HttpSubStreamHandler> endpoint{
+      stream, client, HttpSubStreamHandler{
+          &callKey, "http://127.0.0.1:" + std::to_string(server.port()) + "/lookup"}};
+  endpoint.start({});
+  std::weak_ptr<HttpSubStreamCall> cancelledState;
+  std::atomic<int> ended{0}, failed{0}, cancelledDeliveries{0}, siblingDeliveries{0};
+  app.invoke = [&](servicelib::MessageContext context, int value,
+                    HttpSubStreamForward output) {
+    if (value >= 100) {
+      int nested = -1;
+      int received = 0;
+      app.entry->consume(context, servicelib::Payload<int>::make(value - 100),
+          std::make_shared<servicelib::SubStreamCollectorFunc<int>>(
+              [&](servicelib::MessageContext returned, const int& result) {
+                EXPECT_EQ(returned.streamId(), "nested-parent");
+                nested = result;
+                ++received;
+                return true;
+              }));
+      EXPECT_EQ(received, 1);
+      output(std::move(context), nested + 1000);
+      return;
+    }
+    auto call = std::make_shared<HttpSubStreamCall>();
+    call->output = std::move(output);
+    if (value == 1) cancelledState = call;
+    endpoint.consume(context.withLocalValue(callKey, call),
+                     servicelib::Payload<int>::make(value));
+    EXPECT_TRUE(call->ended);
+    ++ended;
+    if (call->error) ++failed;
+    call->output = {};
+    // No fabricated result on HTTP failure: SubStream must observe its own
+    // cancellation, while a successful sibling completes through its collector.
+  };
+  std::stop_source cancellation;
+  const auto parent = servicelib::MessageContext{}.withStreamId("nested-parent");
+  auto cancelled = boost::asio::co_spawn(io,
+      servicelib::detail::CooperativeExecution::Run([&] {
+        EXPECT_THROW(app.entry->consume(parent.withStopToken(cancellation.get_token()),
+            servicelib::Payload<int>::make(101),
+            std::make_shared<servicelib::SubStreamCollectorFunc<int>>(
+                [&](servicelib::MessageContext, const int&) {
+                  ++cancelledDeliveries;
+                  return true;
+                })), std::runtime_error);
+      }), boost::asio::use_future);
+  auto sibling = boost::asio::co_spawn(io,
+      servicelib::detail::CooperativeExecution::Run([&] {
+        app.entry->consume(parent, servicelib::Payload<int>::make(102),
+            std::make_shared<servicelib::SubStreamCollectorFunc<int>>(
+                [&](servicelib::MessageContext context, const int& result) {
+                  EXPECT_EQ(context.streamId(), "nested-parent");
+                  EXPECT_EQ(result, 1004);
+                  ++siblingDeliveries;
+                  return true;
+                }));
+      }), boost::asio::use_future);
+  std::jthread worker([&io] { io.run(); });
+  EXPECT_EQ(firstReady.wait_for(2s), std::future_status::ready);
+  cancellation.request_stop();
+  const auto cancelledStatus = cancelled.wait_for(2s);
+  EXPECT_EQ(cancelledStatus, std::future_status::ready);
+  EXPECT_EQ(sibling.wait_for(2s), std::future_status::ready);
+  if (cancelledStatus == std::future_status::ready) {
+    EXPECT_NO_THROW(cancelled.get());
+    EXPECT_TRUE(cancelledState.expired());
+  }
+  // Also releases the server if cancellation assertions failed.
+  boost::asio::post(io, [&lateResponse] { lateResponse.cancel(); });
+  if (cancelledStatus != std::future_status::ready) {
+    EXPECT_NO_THROW(cancelled.get());
+  }
+  EXPECT_NO_THROW(sibling.get());
+  endpoint.stop({});
+  client.Stop();
+  server.Stop();
+  io.stop();
+  worker.join();
+  EXPECT_EQ(ended.load(), 2);
+  EXPECT_EQ(failed.load(), 1);
+  EXPECT_EQ(cancelledDeliveries.load(), 0);
+  EXPECT_EQ(siblingDeliveries.load(), 1);
+  EXPECT_EQ(wireIds.size(), 2U);
+  servicelib::detail::ParallelExecutorRegistry::Clear();
+}
+
 TEST(HttpDataSink, PreservesCanonicalRequestLifecycleAndStreamId) {
   boost::asio::io_context io;
   servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
@@ -1355,11 +2042,18 @@ TEST(HttpDataSink, PreservesCanonicalRequestLifecycleAndStreamId) {
                                               SinkHandler>
         endpoint{stream, client, SinkHandler{&endCalls, &hadError}};
     endpoint.start(servicelib::Context{});
-    endpoint.consume(
-        servicelib::tracing::EnableSampling(
-            servicelib::MessageContext{}.withStreamId("stream-42")),
-        servicelib::Payload<std::string>::make("payload"));
-    while (endCalls == 0) ASSERT_GT(io.run_one(), 0U);
+    auto consumed = boost::asio::co_spawn(io,
+        servicelib::detail::CooperativeExecution::Run([&] {
+          endpoint.consume(
+              servicelib::tracing::EnableSampling(
+                  servicelib::MessageContext{}.withStreamId("stream-42")),
+              servicelib::Payload<std::string>::make("payload"));
+          EXPECT_EQ(endCalls, 1);
+          EXPECT_EQ(result, "response");
+        }), boost::asio::use_future);
+    while (consumed.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
+      ASSERT_GT(io.run_one(), 0U);
+    consumed.get();
     io.restart();
     while (io.poll_one() != 0U) {
     }

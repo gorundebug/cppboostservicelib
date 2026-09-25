@@ -2,6 +2,7 @@
 
 #include <servicelib/datasink/localsink/custom.hpp>
 #include <servicelib/datasource/localsource/custom.hpp>
+#include <servicelib/datasource/kafka/detail/endpoint.hpp>
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/testlog/testlog.hpp>
 #include <servicelib/runtime/testmetrics/testmetrics.hpp>
@@ -13,9 +14,11 @@
 
 #include <atomic>
 #include <exception>
+#include <future>
 #include <memory>
 #include <semaphore>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -170,14 +173,220 @@ TEST(CustomDataSource, RunsProducerAndHandlerLifecycle) {
   EXPECT_EQ(observed, "input");
 }
 
+class ObservedReturnProducer final
+    : public servicelib::datasource::localsource::DataProducer<std::string> {
+ public:
+  explicit ObservedReturnProducer(std::atomic<bool>& ended) : ended_(ended) {}
+  void start(servicelib::Context, Consumer consumer) override {
+    consumer(servicelib::MessageContext{},
+             servicelib::Payload<std::string>::make("input"));
+    returned.set_value(ended_.load(std::memory_order_acquire));
+  }
+  void stop(servicelib::Context) override {}
+  std::promise<bool> returned;
+
+ private:
+  std::atomic<bool>& ended_;
+};
+
+struct GatedReturnSourceHandler final {
+  using State = int;
+  test_async::Event* entered;
+  test_async::Event* release;
+  std::atomic<bool>* ended;
+  int concurrency(auto&) { return 1; }
+  servicelib::BeginResult<State> beginRequest(
+      servicelib::MessageContext context, auto&) {
+    return {std::move(context), 0};
+  }
+  void consumeMessage(servicelib::MessageContext, auto&, State&,
+                      const std::string&, auto result) {
+    entered->Send();
+    EXPECT_TRUE(release->WaitForEvent());
+    result.done();
+  }
+  std::string getMessageId(servicelib::MessageContext, auto&, State&,
+                           const int&) { return "result"; }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr error,
+                  State&) noexcept {
+    EXPECT_FALSE(error);
+    ended->store(true, std::memory_order_release);
+  }
+};
+
+TEST(CustomDataSource, ProducerConsumeReturnsOnlyAfterEndRequest) {
+  for (const bool hasResult : {false, true}) {
+    SCOPED_TRACE(hasResult);
+    test_async::AsioRuntime runtime;
+    TestEnvironment environment;
+    std::atomic<bool> ended{false};
+    ObservedReturnProducer producer{ended};
+    auto returned = producer.returned.get_future();
+    test_async::Event entered;
+    test_async::Event release;
+    using Endpoint = servicelib::datasource::localsource::Endpoint<
+        std::string, int, GatedReturnSourceHandler>;
+    Endpoint endpoint{
+        environment, 1, producer,
+        GatedReturnSourceHandler{&entered, &release, &ended},
+        [](servicelib::MessageContext, servicelib::Payload<std::string>) {},
+        hasResult};
+    endpoint.start(servicelib::Context{});
+    EXPECT_TRUE(entered.WaitForEvent());
+    EXPECT_EQ(returned.wait_for(std::chrono::milliseconds{100}),
+              std::future_status::timeout);
+    release.Send();
+    const auto status = returned.wait_for(test_async::kMaxTestWaitTime);
+    endpoint.stop(servicelib::Context{});
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_TRUE(returned.get());
+    EXPECT_TRUE(ended.load(std::memory_order_acquire));
+  }
+}
+
+struct DuplicateSourceProbe final {
+  test_async::Event firstConsumed;
+  test_async::Event duplicateReturned;
+  test_async::Event reuseReturned;
+  std::atomic<int> begins{0};
+  std::atomic<int> consumes{0};
+  std::atomic<int> results{0};
+  std::atomic<int> successfulEnds{0};
+  std::atomic<int> duplicateErrors{0};
+  std::function<void()> rescueFirst;
+};
+
+class DuplicateSourceProducer final
+    : public servicelib::datasource::localsource::DataProducer<std::string> {
+ public:
+  explicit DuplicateSourceProducer(DuplicateSourceProbe& probe) : probe_(probe) {}
+  void start(servicelib::Context, Consumer consumer) override {
+    const auto context = servicelib::MessageContext{}.withStreamId("source-collision");
+    std::thread first([&] {
+      consumer(context, servicelib::Payload<std::string>::make("first"));
+    });
+    EXPECT_TRUE(probe_.firstConsumed.WaitForEvent());
+    consumer(context, servicelib::Payload<std::string>::make("duplicate"));
+    probe_.duplicateReturned.Send();
+    first.join();
+    consumer(context, servicelib::Payload<std::string>::make("reuse"));
+    probe_.reuseReturned.Send();
+  }
+  void stop(servicelib::Context) override {}
+
+ private:
+  DuplicateSourceProbe& probe_;
+};
+
+struct DuplicateSourceHandler final {
+  using State = int;
+  DuplicateSourceProbe* probe;
+  int concurrency(auto&) { return 0; }
+  servicelib::BeginResult<State> beginRequest(servicelib::MessageContext context, auto&) {
+    return {std::move(context), ++probe->begins};
+  }
+  void consumeMessage(servicelib::MessageContext, auto&, State& ordinal,
+                      const std::string&, auto result) {
+    ++probe->consumes;
+    if (ordinal != 1) {
+      result.done();
+      return;
+    }
+    result.setResultCallback("answer", [probe = probe, result](
+        servicelib::MessageContext, auto&, State&, const int& value) mutable {
+      EXPECT_EQ(value, 42);
+      ++probe->results;
+      result.done();
+      return true;
+    });
+    probe->rescueFirst = [result]() mutable {
+      result.setResultCallback("answer", nullptr);
+      result.done();
+    };
+    probe->firstConsumed.Send();
+  }
+  std::string getMessageId(servicelib::MessageContext, auto&, State&,
+                           const int&) { return "answer"; }
+  void endRequest(servicelib::MessageContext, auto&, std::exception_ptr error,
+                  State& ordinal) noexcept {
+    if (ordinal == 2) {
+      EXPECT_TRUE(error);
+      if (error) {
+        try {
+          std::rethrow_exception(error);
+        } catch (const servicelib::store::DuplicateKeyError&) {
+          ++probe->duplicateErrors;
+        } catch (...) {
+          ADD_FAILURE() << "duplicate registration returned the wrong error";
+        }
+      }
+    } else {
+      EXPECT_FALSE(error);
+      ++probe->successfulEnds;
+    }
+  }
+};
+
+template <typename MakeEndpoint>
+void CheckDuplicateSourceKeepsOriginalResult(MakeEndpoint makeEndpoint) {
+  test_async::AsioRuntime runtime;
+  TestEnvironment environment;
+  DuplicateSourceProbe probe;
+  DuplicateSourceProducer producer{probe};
+  auto endpoint = makeEndpoint(environment, producer, probe);
+  endpoint->start(servicelib::Context{});
+  EXPECT_TRUE(probe.duplicateReturned.WaitForEvent());
+  endpoint->consumeResult(
+      servicelib::MessageContext{}.withStreamId("source-collision"),
+      servicelib::Payload<int>::make(42));
+  EXPECT_EQ(probe.results.load(), 1);
+  // Complete the first request explicitly if a broken duplicate cleanup lost it.
+  if (probe.results.load() == 0 && probe.rescueFirst) probe.rescueFirst();
+  EXPECT_TRUE(probe.reuseReturned.WaitForEvent());
+  endpoint->stop(servicelib::Context{});
+  probe.rescueFirst = {};
+  EXPECT_EQ(probe.begins.load(), 3);
+  EXPECT_EQ(probe.consumes.load(), 2);
+  EXPECT_EQ(probe.duplicateErrors.load(), 1);
+  EXPECT_EQ(probe.successfulEnds.load(), 2);
+}
+
+TEST(CustomDataSource, DuplicateRegistrationPreservesOriginalResult) {
+  CheckDuplicateSourceKeepsOriginalResult([](auto& environment, auto& producer,
+                                             auto& probe) {
+    using Endpoint = servicelib::datasource::localsource::Endpoint<
+        std::string, int, DuplicateSourceHandler>;
+    return std::make_unique<Endpoint>(
+        environment, 1, producer, DuplicateSourceHandler{&probe},
+        [](servicelib::MessageContext, servicelib::Payload<std::string>) {}, true);
+  });
+}
+
+TEST(KafkaSourceState, DuplicateRegistrationPreservesOriginalResult) {
+  CheckDuplicateSourceKeepsOriginalResult([](auto& environment, auto& producer,
+                                             auto& probe) {
+    using Endpoint = servicelib::datasource::kafka::detail::EndpointState<
+        std::string, int, DuplicateSourceHandler, std::exception_ptr,
+        std::string, DuplicateSourceProducer>;
+    return std::make_unique<Endpoint>(
+        environment, 1, 0, producer, DuplicateSourceHandler{&probe},
+        [](servicelib::MessageContext, servicelib::Payload<std::string>) {},
+        true, "kafka-probe", "input", typename Endpoint::ErrorOutput{});
+  });
+}
+
 class FourValueProducer final
     : public servicelib::datasource::localsource::DataProducer<std::string> {
  public:
   void start(servicelib::Context, Consumer consumer) override {
+    std::vector<std::thread> producers;
     for (int index = 0; index < 4; ++index) {
-      consumer(servicelib::MessageContext{},
-               servicelib::Payload<std::string>::make("input"));
+      producers.emplace_back([consumer] {
+        consumer(servicelib::MessageContext{},
+                 servicelib::Payload<std::string>::make("input"));
+      });
     }
+    for (auto& producer : producers) producer.join();
   }
   void stop(servicelib::Context) override {}
 };

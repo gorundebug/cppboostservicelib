@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cassert>
+#include <source_location>
 #include <chrono>
 #include <concepts>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -22,11 +24,27 @@ namespace {
 
 test_async::AsioRuntime asioRuntime;
 
+void Require(bool condition,
+             const std::source_location location = std::source_location::current()) {
+  if (!condition) {
+    throw std::runtime_error(std::string(location.file_name()) + ":" +
+                             std::to_string(location.line()) +
+                             ": service lifecycle assertion failed");
+  }
+}
+
 struct ServiceDataTypes final {
   template <typename>
   struct DataType {};
 };
 class Service final : public servicelib::ServiceApp<Service, ServiceDataTypes> {};
+class RuntimeOwnerProbe final
+    : public servicelib::ServiceApp<RuntimeOwnerProbe, ServiceDataTypes> {
+ public:
+  bool runtimeBelongsToThisInstance() {
+    return &getExecutionRuntime<>().getExecutionEnvironment() == this;
+  }
+};
 static_assert(std::derived_from<servicelib::IRuntimeEnvironment,
                                 servicelib::IServiceEnvironment>);
 static_assert(std::derived_from<Service, servicelib::IRuntimeEnvironment>);
@@ -165,12 +183,14 @@ struct Component final {
   bool failStop{};
   std::chrono::milliseconds stopDelay{};
   std::atomic<bool>* stopped{};
+  std::shared_future<void> stopGate;
 
   void start(servicelib::Context) {
     events->add(name + ":start");
     if (failStart) throw std::runtime_error("start failed");
   }
   void stop(servicelib::Context) {
+    if (stopGate.valid()) stopGate.wait();
     if (stopDelay > std::chrono::milliseconds::zero()) {
       std::this_thread::sleep_for(stopDelay);
     }
@@ -224,22 +244,22 @@ void startsAndStopsInServiceOrder() {
   lifecycle.start({});
   lifecycle.stopBeforeGraphDrain({});
   const auto beforeGraphDrain = events.snapshot();
-  assert(std::find(beforeGraphDrain.begin(), beforeGraphDrain.end(),
+  Require(std::find(beforeGraphDrain.begin(), beforeGraphDrain.end(),
                    "sink:stop") == beforeGraphDrain.end());
   lifecycle.stopAfterGraphDrain({});
   const auto recorded = events.snapshot();
-  assert(recorded.size() == 14);
-  assert((std::vector(recorded.begin(), recorded.begin() + 7) ==
+  Require(recorded.size() == 14);
+  Require((std::vector(recorded.begin(), recorded.begin() + 7) ==
           std::vector<std::string>{"storage:start", "delay:start",
                                    "task:start", "priority:start",
                                    "component:start", "sink:start",
                                    "source:start"}));
-  assert(recorded.back() == "sink:stop");
-  assert(std::find(recorded.begin() + 7, recorded.end(), "source:stop") !=
+  Require(recorded.back() == "sink:stop");
+  Require(std::find(recorded.begin() + 7, recorded.end(), "source:stop") !=
          recorded.end());
-  assert(std::find(recorded.begin() + 7, recorded.end(), "delay:stop") !=
+  Require(std::find(recorded.begin() + 7, recorded.end(), "delay:stop") !=
          recorded.end());
-  assert(std::find(recorded.begin() + 7, recorded.end(), "source:stop") <
+  Require(std::find(recorded.begin() + 7, recorded.end(), "source:stop") <
          std::find(recorded.begin() + 7, recorded.end(), "delay:stop"));
 }
 
@@ -250,16 +270,26 @@ void rollsBackStartedComponents() {
                 std::make_shared<Component>("source", &events, true));
   lifecycle.add(servicelib::ServiceComponentKind::kDataSink,
                 std::make_shared<Component>("sink", &events));
+  lifecycle.add(servicelib::ServiceComponentKind::kDataSink,
+                std::make_shared<Component>("failing-sink", &events, false, true));
+  lifecycle.add(servicelib::ServiceComponentKind::kStorage,
+                std::make_shared<Component>("storage", &events, false, true));
   bool failed = false;
   try {
     lifecycle.start({});
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error& error) {
     failed = true;
+    Require(std::string_view(error.what()) == "start failed");
   }
-  assert(failed);
-  assert((events.snapshot() ==
-          std::vector<std::string>{"sink:start", "source:start",
-                                   "sink:stop"}));
+  Require(failed);
+  Require((events.snapshot() ==
+          std::vector<std::string>{"storage:start", "sink:start",
+                                   "failing-sink:start", "source:start",
+                                   "failing-sink:stop", "sink:stop",
+                                   "storage:stop"}));
+  const auto afterRollback = events.snapshot();
+  lifecycle.stop({});
+  Require(events.snapshot() == afterRollback);
 }
 
 void stopFailureDoesNotSkipResources() {
@@ -273,61 +303,70 @@ void stopFailureDoesNotSkipResources() {
   lifecycle.start({});
   lifecycle.stop({}, logger);
   const auto recorded = events.snapshot();
-  assert(std::find(recorded.begin(), recorded.end(), "healthy:stop") !=
+  Require(std::find(recorded.begin(), recorded.end(), "healthy:stop") !=
          recorded.end());
-  assert(std::find(recorded.begin(), recorded.end(), "failing:stop") !=
+  Require(std::find(recorded.begin(), recorded.end(), "failing:stop") !=
          recorded.end());
-  assert(logger.records.size() == 1);
-  assert(logger.records.front().message ==
+  Require(logger.records.size() == 1);
+  Require(logger.records.front().message ==
          "service shutdown operation failed");
-  assert(logger.records.front().resource == "component:1");
-  assert(logger.records.front().error == "stop failed");
+  Require(logger.records.front().resource == "component:1");
+  Require(logger.records.front().error == "stop failed");
 }
 
 void deadlineDiagnosesButDoesNotReleaseLiveResource() {
   EventLog events;
   RecordingLogger logger;
   std::atomic<bool> stopped{false};
+  std::promise<void> release;
   servicelib::ServiceLifecycle lifecycle;
   lifecycle.add(servicelib::ServiceComponentKind::kComponent,
                 std::make_shared<Component>(
                     "slow", &events, false, false,
-                    std::chrono::milliseconds{30}, &stopped));
+                    std::chrono::milliseconds{0}, &stopped,
+                    release.get_future().share()));
   lifecycle.start({});
   const auto started = std::chrono::steady_clock::now();
   lifecycle.stop(servicelib::Context{}.bounded(std::chrono::milliseconds{1}),
                  logger);
-  assert(std::chrono::steady_clock::now() - started >=
-         std::chrono::milliseconds{20});
-  assert(stopped.load());
-  assert(logger.records.size() == 1);
-  assert(logger.records.front().message ==
+  Require(std::chrono::steady_clock::now() - started < std::chrono::seconds{2});
+  Require(!stopped.load());
+  Require(logger.records.size() == 1);
+  Require(logger.records.front().message ==
          "service shutdown operation timed out");
-  assert(logger.records.front().resource == "component:0");
+  Require(logger.records.front().resource == "component:0");
+  release.set_value();
+  lifecycle.finishShutdown(logger);
+  Require(stopped.load());
 }
 
 void connectorTimeoutMatchesTelemetry() {
   EventLog events;
   std::atomic<bool> stopped{false};
+  std::promise<void> release;
   servicelib::testmetrics::TestMetrics metrics;
   servicelib::testlog::TestLog logger;
   servicelib::ServiceLifecycle lifecycle;
   lifecycle.add(servicelib::ServiceComponentKind::kDataSource,
                 std::make_shared<Component>(
                     "source", &events, false, false,
-                    std::chrono::milliseconds{30}, &stopped),
+                    std::chrono::milliseconds{0}, &stopped,
+                    release.get_future().share()),
                 &metrics, &logger);
   lifecycle.start({});
   lifecycle.stop(servicelib::Context{}.bounded(std::chrono::milliseconds{1}),
                  logger);
-  assert(stopped.load());
-  assert(metrics
+  Require(!stopped.load());
+  Require(metrics
              .counter("datasource_connector.events_total",
                       {{"connector", "0"}, {"event", "stop_timeout"}})
              .count() == 1);
   const auto entries = logger.entries();
-  assert(entries.size() == 1);
-  assert(entries.front().message == "data source stopped by timeout");
+  Require(entries.size() == 1);
+  Require(entries.front().message == "data source stopped by timeout");
+  release.set_value();
+  lifecycle.finishShutdown(logger);
+  Require(stopped.load());
 }
 
 void preparesConfiguredPoolsBeforeGraphConstruction() {
@@ -336,7 +375,7 @@ void preparesConfiguredPoolsBeforeGraphConstruction() {
       std::make_shared<const servicelib::config::RuntimeConfig>(config));
   {
     Service service;
-    assert(service.getPriorityTaskPool("Default Pool") != nullptr);
+    Require(service.getPriorityTaskPool("Default Pool") != nullptr);
   }
   servicelib::config::RuntimeConfigRegistry::Publish({});
 }
@@ -349,7 +388,7 @@ void exposesCanonicalServiceInfoMetric() {
   {
     TelemetryService service(metrics);
     service.start();
-    assert(metrics
+    Require(metrics
                .gauge("service.info",
                       {{"service", "Metrics Service"},
                        {"environment", "debug"}})
@@ -369,8 +408,8 @@ void runtimeConfigSnapshotOwnsConcreteConfigAcrossReload() {
       std::make_shared<const ServiceInfoConfig>("second"));
   servicelib::config::RuntimeConfigRegistry::Publish(second);
 
-  assert(first->GetOnlyServiceConfig()->name == "first");
-  assert(servicelib::config::RuntimeConfigRegistry::Snapshot()
+  Require(first->GetOnlyServiceConfig()->name == "first");
+  Require(servicelib::config::RuntimeConfigRegistry::Snapshot()
              ->GetOnlyServiceConfig()
              ->name == "second");
   servicelib::config::RuntimeConfigRegistry::Publish({});
@@ -393,10 +432,10 @@ void stopWaitsForAcceptedInputInvocation() {
     });
 
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    assert(!stopReturned.load(std::memory_order_acquire));
+    Require(!stopReturned.load(std::memory_order_acquire));
     invocation.reset();
     stopThread.join();
-    assert(stopReturned.load(std::memory_order_acquire));
+    Require(stopReturned.load(std::memory_order_acquire));
 #ifdef NDEBUG
     bool rejected = false;
     try {
@@ -404,15 +443,64 @@ void stopWaitsForAcceptedInputInvocation() {
     } catch (const servicelib::StreamException&) {
       rejected = true;
     }
-    assert(rejected);
+    Require(rejected);
 #endif
   }
   servicelib::config::RuntimeConfigRegistry::Publish({});
 }
 
+void stopDeadlineReturnsBeforeAcceptedInputCompletes() {
+  PriorityPoolConfig config;
+  servicelib::config::RuntimeConfigRegistry::Publish(
+      std::make_shared<const servicelib::config::RuntimeConfig>(config));
+  bool returnedByDeadline = false;
+  {
+    auto destroyed = std::make_shared<std::promise<void>>();
+    auto destruction = destroyed->get_future();
+    auto service = std::shared_ptr<Service>(new Service, [destroyed](Service* value) {
+      delete value;
+      destroyed->set_value();
+    });
+    std::weak_ptr<Service> retained = service;
+    service->start();
+    auto invocation = std::make_unique<
+        decltype(service->beginInputInvocation())>(
+        service->beginInputInvocation());
+    auto stopped = std::async(std::launch::async, [&] {
+      service->stop(servicelib::Context{}.bounded(std::chrono::milliseconds{20}));
+    });
+    // The generous watchdog is not the requested shutdown deadline. It lets
+    // the test report an unbounded wait without leaving a blocked thread.
+    returnedByDeadline =
+        stopped.wait_for(std::chrono::seconds{2}) == std::future_status::ready;
+    if (returnedByDeadline) {
+      stopped.get();
+      service.reset();
+      Require(!retained.expired());
+      invocation.reset();
+    } else {
+      invocation.reset();
+      stopped.get();
+      service.reset();
+    }
+    Require(destruction.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  }
+  servicelib::config::RuntimeConfigRegistry::Publish({});
+  Require(returnedByDeadline);
+}
+
 }  // namespace
 
 int main() {
+  {
+    std::optional<RuntimeOwnerProbe> first;
+    std::optional<RuntimeOwnerProbe> second;
+    first.emplace();
+    Require(first->runtimeBelongsToThisInstance());
+    first.reset();
+    second.emplace();
+    Require(second->runtimeBelongsToThisInstance());
+  }
   startsAndStopsInServiceOrder();
   rollsBackStartedComponents();
   stopFailureDoesNotSkipResources();
@@ -422,4 +510,5 @@ int main() {
   exposesCanonicalServiceInfoMetric();
   runtimeConfigSnapshotOwnsConcreteConfigAcrossReload();
   stopWaitsForAcceptedInputInvocation();
+  stopDeadlineReturnsBeforeAcceptedInputCompletes();
 }

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -498,6 +499,188 @@ TEST(Operators, MergeForwardsEveryParentIntoOneOrderedOutput) {
   secondOwner->consume({}, servicelib::Payload<int>::make(2));
   firstOwner->consume({}, servicelib::Payload<int>::make(3));
   EXPECT_EQ(observed, (std::vector<int>{1, 2, 3}));
+}
+
+TEST(Operators, MergeInheritsFirstParentSerdeRegardlessOfArrivalOrder) {
+  auto& app = operatorApp();
+  for (const bool reverse : {false, true}) {
+    const int base = reverse ? 650 : 640;
+    auto left = inputStream<int>(app, base, "serde-merge-left");
+    auto right = inputStream<int>(app, base + 1, "serde-merge-right");
+    ASSERT_NE(left->getSerde(), nullptr);
+    ASSERT_NE(right->getSerde(), nullptr);
+    ASSERT_NE(left->getSerde(), right->getSerde());
+    auto& first = reverse ? *right : *left;
+    auto& second = reverse ? *left : *right;
+    auto& merged = first.merge(
+        operatorConfig<servicelib::config::MergeStreamConfig>(base + 2, "serde-merge"),
+        second);
+    EXPECT_EQ(merged.getSerde(), first.getSerde());
+    EXPECT_NE(merged.getSerde(), second.getSerde());
+    std::vector<int> observed;
+    merged.sink(
+        sinkConfig(base + 3, "serde-merge-output"), servicelib::StreamType<int>{},
+        servicelib::StreamFunction([&observed](servicelib::MessageContext context,
+                                             const int& value) {
+          EXPECT_EQ(context.streamId(), "merge-correlation");
+          observed.push_back(value);
+        }));
+    const auto context = servicelib::MessageContext{}.withStreamId("merge-correlation");
+    second.consume(context, servicelib::Payload<int>::make(7));
+    EXPECT_EQ(observed, (std::vector<int>{7}));
+    first.consume(context, servicelib::Payload<int>::make(8));
+    EXPECT_EQ(observed, (std::vector<int>{7, 8}));
+    EXPECT_EQ(merged.getSerde(), first.getSerde());
+  }
+}
+
+namespace {
+class IsolatedSplitMergeApp final
+    : public servicelib::StreamExecutionEnvironment<IsolatedSplitMergeApp, OperatorDataTypes> {
+ public:
+  void delay(servicelib::Context, servicelib::pool::IDelayPool::Duration,
+             std::function<void()> task) override { task(); }
+  void prepare() { static_cast<void>(getExecutionRuntime<>()); }
+};
+}  // namespace
+
+TEST(Operators, SplitMergeDeliversBothBranchesBeforeReturning) {
+  IsolatedSplitMergeApp app;
+  auto input = servicelib::makeInputStream<int, std::monostate, int, IsolatedSplitMergeApp>(
+      operatorConfig<servicelib::config::InputStreamConfig>(660, "split-merge-input"),
+      nullptr, app);
+  auto& split = input->split<2>(
+      operatorConfig<servicelib::config::SplitStreamConfig>(661, "split-merge-split"));
+  std::vector<std::string> trace;
+  auto record = [&trace](std::string label) {
+    return [&trace, label = std::move(label)](
+               servicelib::MessageContext context, servicelib::StreamBase&, const int&) {
+      EXPECT_EQ(context.streamId(), "split-merge-correlation");
+      trace.push_back(label);
+      return true;
+    };
+  };
+  auto& left = split.get<0>().filter(
+      operatorConfig<servicelib::config::FilterStreamConfig>(662, "split-merge-left"),
+      servicelib::StreamFunction(record("left")));
+  auto& right = split.get<1>().filter(
+      operatorConfig<servicelib::config::FilterStreamConfig>(663, "split-merge-right"),
+      servicelib::StreamFunction(record("right")));
+  auto& merged = right.merge(
+      operatorConfig<servicelib::config::MergeStreamConfig>(664, "split-merge-merge"), left);
+  EXPECT_EQ(split.getSerde(), input->getSerde());
+  EXPECT_EQ(left.getSerde(), input->getSerde());
+  EXPECT_EQ(right.getSerde(), input->getSerde());
+  EXPECT_EQ(merged.getSerde(), right.getSerde());
+  std::vector<int> observed;
+  merged.sink(
+      sinkConfig(665, "split-merge-output"), servicelib::StreamType<int>{},
+      servicelib::StreamFunction(([&trace, &observed](servicelib::MessageContext context,
+                                                   const int& value) {
+        EXPECT_EQ(context.streamId(), "split-merge-correlation");
+        trace.push_back("result");
+        observed.push_back(value);
+      })));
+  const auto context = servicelib::MessageContext{}.withStreamId("split-merge-correlation");
+  app.prepare();
+  input->consume(context, servicelib::Payload<int>::make(7));
+  input->consume(context, servicelib::Payload<int>::make(8));
+  EXPECT_EQ(observed, (std::vector<int>{7, 7, 8, 8}));
+  EXPECT_EQ(trace, (std::vector<std::string>{
+      "left", "result", "right", "result", "left", "result", "right", "result"}));
+}
+
+namespace {
+
+class DeferredMergePool final : public servicelib::pool::ITaskPool {
+ public:
+  const std::string& getName() const noexcept override { return name_; }
+  int getExecutorsCount() const override { return 1; }
+  void start(servicelib::Context) override {}
+  void stop(servicelib::Context) override {}
+  void addTask(servicelib::Context, std::function<void()> task) override {
+    tasks.push_back(std::move(task));
+  }
+  void drain() {
+    auto admitted = std::move(tasks);
+    tasks.clear();
+    for (auto& task : admitted) task();
+  }
+  std::vector<std::function<void()>> tasks;
+
+ private:
+  const std::string name_{"deferred-merge"};
+};
+
+}  // namespace
+
+TEST(Operators, MergeDoesNotWaitForQueuedParentAndPreservesCorrelation) {
+  auto& app = operatorApp();
+  auto direct = inputStream<int>(app, 180, "merge-direct");
+  auto deferred = inputStream<int>(app, 181, "merge-deferred");
+  auto& merged = direct->merge(
+      operatorConfig<servicelib::config::MergeStreamConfig>(182, "mixed-merge"),
+      *deferred);
+  std::vector<std::pair<int, std::string>> observed;
+  merged.sink(
+      sinkConfig(183, "mixed-merge-output"), servicelib::StreamType<int>{},
+      servicelib::StreamFunction(
+          [&observed](servicelib::MessageContext context, const int& value) {
+            observed.emplace_back(value, std::string{context.streamId()});
+          }));
+  DeferredMergePool pool;
+  servicelib::TaskPoolCaller<int> deferredCaller{
+      *deferred, pool, app.getLogger(), callerParams()};
+  servicelib::DirectCaller<int> directCaller{*direct, callerParams(), true};
+  const auto context = servicelib::MessageContext{}.withStreamId("mixed-call");
+  deferredCaller.consume(context, servicelib::Payload<int>::make(2));
+  EXPECT_TRUE(observed.empty());
+  ASSERT_EQ(pool.tasks.size(), 1U);
+  directCaller.consume(context, servicelib::Payload<int>::make(1));
+  EXPECT_TRUE(directCaller.isAsync());
+  EXPECT_EQ(observed,
+            (std::vector<std::pair<int, std::string>>{{1, "mixed-call"}}));
+  pool.drain();
+  EXPECT_EQ(observed,
+            (std::vector<std::pair<int, std::string>>{
+                {1, "mixed-call"}, {2, "mixed-call"}}));
+}
+
+TEST(Operators, MergeDoesNotSerializeIndependentParentCalls) {
+  auto& app = operatorApp();
+  auto first = inputStream<int>(app, 184, "concurrent-merge-first");
+  auto second = inputStream<int>(app, 185, "concurrent-merge-second");
+  auto& merged = first->merge(
+      operatorConfig<servicelib::config::MergeStreamConfig>(186, "concurrent-merge"),
+      *second);
+  std::atomic<int> entered{0};
+  std::atomic<int> total{0};
+  test_async::Event bothEntered;
+  test_async::Event release;
+  merged.sink(
+      sinkConfig(187, "concurrent-merge-output"), servicelib::StreamType<int>{},
+      servicelib::StreamFunction(
+          ([&entered, &total, &bothEntered, &release](
+              servicelib::MessageContext context, const int& value) {
+            EXPECT_EQ(context.streamId(), value == 1 ? "first-call" : "second-call");
+            if (entered.fetch_add(1) == 1) bothEntered.Send();
+            EXPECT_TRUE(release.WaitForEvent());
+            total.fetch_add(value);
+          })));
+  std::thread firstCall([&] {
+    first->consume(servicelib::MessageContext{}.withStreamId("first-call"),
+                   servicelib::Payload<int>::make(1));
+  });
+  std::thread secondCall([&] {
+    second->consume(servicelib::MessageContext{}.withStreamId("second-call"),
+                    servicelib::Payload<int>::make(2));
+  });
+  EXPECT_TRUE(bothEntered.WaitForEvent());
+  release.Send();
+  firstCall.join();
+  secondCall.join();
+  EXPECT_EQ(entered.load(), 2);
+  EXPECT_EQ(total.load(), 3);
 }
 
 TEST(Operators, CallerSemanticsDispatchPreserveContextPriorityAndStatistics) {

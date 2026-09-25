@@ -29,6 +29,7 @@
 
 #include <servicelib/datasink/grpc/common.hpp>
 #include <servicelib/runtime/detail/asio_dispatch.hpp>
+#include <servicelib/runtime/detail/cooperative_execution.hpp>
 #include <servicelib/runtime/detail/grpc_transport.hpp>
 #include <servicelib/runtime/detail/sync.hpp>
 
@@ -48,9 +49,8 @@ class StatusError final : public std::runtime_error {
   ::grpc::StatusCode code_;
 };
 
-// Non-blocking write side of a generated client-streaming RPC.  The public
-// sink endpoint keeps the canonical Sender/ResultContext contract; this small
-// transport handle only replaces userver's synchronous stream object.
+// Synchronous business-facing send contract over asynchronous gRPC writes.
+// A cooperative caller suspends until its actual transport write completes.
 template <typename Request>
 class AsyncWriter final {
  public:
@@ -86,69 +86,108 @@ namespace detail {
 template <typename T>
 class ClientWriteQueue final {
  public:
+  struct Write final {
+    explicit Write(T request) : value(std::move(request)) {}
+    T value;
+    void complete(std::exception_ptr error = {}) {
+      {
+        std::lock_guard lock(mutex);
+        if (completed) return;
+        completed = true;
+        failure = std::move(error);
+      }
+      done.Send();
+    }
+    void wait() {
+      done.Wait();
+      std::lock_guard lock(mutex);
+      if (failure) std::rethrow_exception(failure);
+    }
+   private:
+    std::mutex mutex;
+    bool completed{};
+    std::exception_ptr failure;
+    servicelib::detail::SingleUseEvent done;
+  };
+
   void push(T value) {
-    std::vector<std::shared_ptr<boost::asio::steady_timer>> waiters;
+    auto write = std::make_shared<Write>(std::move(value));
+    std::shared_ptr<servicelib::detail::SingleUseEvent> available;
     {
       std::lock_guard lock(mutex_);
+      if (failure_) std::rethrow_exception(failure_);
       if (closed_) throw std::runtime_error("gRPC stream is already closed");
-      values_.push_back(std::move(value));
-      collectWaiters(waiters);
+      values_.push_back(write);
+      available = std::exchange(available_, {});
     }
-    wake(std::move(waiters));
+    if (available) available->Send();
+    write->wait();
+  }
+
+  void complete(const std::shared_ptr<Write>& write) {
+    write->complete();
+    std::lock_guard lock(mutex_);
+    if (active_ == write) active_.reset();
+  }
+
+  void fail(std::exception_ptr error) {
+    std::deque<std::shared_ptr<Write>> pending;
+    std::shared_ptr<Write> active;
+    std::shared_ptr<servicelib::detail::SingleUseEvent> available;
+    {
+      std::lock_guard lock(mutex_);
+      if (!failure_) failure_ = std::move(error);
+      error = failure_;
+      closed_ = true;
+      pending.swap(values_);
+      active = std::exchange(active_, {});
+      available = std::exchange(available_, {});
+    }
+    // The transport coroutine still owns an in-flight Write and its value.
+    if (active) active->complete(error);
+    for (const auto& write : pending) write->complete(error);
+    if (available) available->Send();
   }
 
   void close() noexcept {
-    std::vector<std::shared_ptr<boost::asio::steady_timer>> waiters;
+    std::shared_ptr<servicelib::detail::SingleUseEvent> available;
     {
       std::lock_guard lock(mutex_);
       if (closed_) return;
       closed_ = true;
-      collectWaiters(waiters);
+      available = std::exchange(available_, {});
     }
-    wake(std::move(waiters));
+    if (available) available->Send();
   }
 
-  boost::asio::awaitable<std::optional<T>> pop() {
-    const auto executor = co_await boost::asio::this_coro::executor;
+  boost::asio::awaitable<std::shared_ptr<Write>> pop(MessageContext context = {}) {
     for (;;) {
-      auto timer = std::make_shared<boost::asio::steady_timer>(
-          executor, std::chrono::steady_clock::time_point::max());
+      if (context.cancelled()) {
+        fail(std::make_exception_ptr(std::runtime_error("gRPC stream cancelled")));
+        co_return nullptr;
+      }
+      std::shared_ptr<servicelib::detail::SingleUseEvent> available;
       {
         std::lock_guard lock(mutex_);
         if (!values_.empty()) {
-          auto value = std::move(values_.front());
+          active_ = std::move(values_.front());
           values_.pop_front();
-          co_return value;
+          co_return active_;
         }
-        if (closed_) co_return std::nullopt;
-        waiters_.push_back(timer);
+        if (closed_) co_return nullptr;
+        if (!available_) available_ = std::make_shared<servicelib::detail::SingleUseEvent>();
+        available = available_;
       }
-      boost::system::error_code error;
-      co_await timer->async_wait(
-          boost::asio::redirect_error(boost::asio::use_awaitable, error));
+      co_await available->AsyncWait(context);
     }
   }
 
  private:
-  void collectWaiters(
-      std::vector<std::shared_ptr<boost::asio::steady_timer>>& result) {
-    for (auto& waiter : waiters_) {
-      if (auto timer = waiter.lock()) result.push_back(std::move(timer));
-    }
-    waiters_.clear();
-  }
-
-  static void wake(
-      std::vector<std::shared_ptr<boost::asio::steady_timer>> waiters) {
-    for (auto& waiter : waiters) {
-      boost::asio::dispatch(waiter->get_executor(),
-                            [waiter] { waiter->cancel(); });
-    }
-  }
-
   std::mutex mutex_;
-  std::deque<T> values_;
-  std::vector<std::weak_ptr<boost::asio::steady_timer>> waiters_;
+  std::deque<std::shared_ptr<Write>> values_;
+  std::shared_ptr<Write> active_;
+  std::shared_ptr<servicelib::detail::SingleUseEvent> available_;
+  std::exception_ptr failure_;
   bool closed_{false};
 };
 
@@ -160,19 +199,30 @@ boost::asio::awaitable<void> RunServerStreamingClient(
     agrpc::GrpcContext& context, Stub& client, MessageContext message,
     Request request, std::function<void(Response)> response,
     bool tracingEnabled = true) {
-  using RPC = agrpc::ClientRPC<PrepareAsync>;
-  RPC rpc{context};
-  InjectContext(message, rpc.context(), tracingEnabled);
-  detail::ClientCancellation cancellation(message, rpc.context());
-  if (co_await rpc.start(client, request, boost::asio::use_awaitable)) {
-    typename RPC::Response value;
-    while (co_await rpc.read(value, boost::asio::use_awaitable)) {
-      response(std::move(value));
-      value = typename RPC::Response{};
+  co_await servicelib::detail::CooperativeExecution::Run([&] {
+    using Execution = servicelib::detail::CooperativeExecution;
+    using RPC = agrpc::ClientRPC<PrepareAsync>;
+    RPC rpc{context};
+    InjectContext(message, rpc.context(), tracingEnabled);
+    detail::ClientCancellation cancellation(message, rpc.context());
+    std::exception_ptr responseError;
+    if (Execution::Await([&] { return rpc.start(client, request, boost::asio::use_awaitable); })) {
+      typename RPC::Response value;
+      while (Execution::Await([&] { return rpc.read(value, boost::asio::use_awaitable); })) {
+        try {
+          response(std::move(value));
+        } catch (...) {
+          responseError = std::current_exception();
+          rpc.context().TryCancel();
+          break;
+        }
+        value = typename RPC::Response{};
+      }
     }
-  }
-  auto status = co_await rpc.finish(boost::asio::use_awaitable);
-  if (!status.ok()) throw StatusError(status);
+    auto status = Execution::Await([&] { return rpc.finish(boost::asio::use_awaitable); });
+    if (responseError) std::rethrow_exception(responseError);
+    if (!status.ok()) throw StatusError(status);
+  });
 }
 
 template <auto PrepareAsync, typename Stub, typename Request,
@@ -182,33 +232,58 @@ boost::asio::awaitable<void> RunClientStreamingClient(
     std::shared_ptr<detail::ClientWriteQueue<Request>> queue, Stub& client,
     MessageContext message, std::function<void(Response)> response,
     bool tracingEnabled = true) {
-  using RPC = agrpc::ClientRPC<PrepareAsync>;
-  InjectContext(message, rpc->context(), tracingEnabled);
-  detail::ClientCancellation cancellation(message, rpc->context());
-  typename RPC::Response value;
-  if (co_await rpc->start(client, value, boost::asio::use_awaitable)) {
-    while (auto request = co_await queue->pop()) {
-      if (!co_await rpc->write(*request, boost::asio::use_awaitable)) {
-        throw std::runtime_error("gRPC stream write cancelled");
+  co_await servicelib::detail::CooperativeExecution::Run([&] {
+    using Execution = servicelib::detail::CooperativeExecution;
+    using RPC = agrpc::ClientRPC<PrepareAsync>;
+    InjectContext(message, rpc->context(), tracingEnabled);
+    detail::ClientCancellation cancellation(message, rpc->context());
+    typename RPC::Response value;
+    std::exception_ptr writeError;
+    try {
+      if (Execution::Await([&] { return rpc->start(client, value, boost::asio::use_awaitable); })) {
+        while (auto request = Execution::Await([&] { return queue->pop(message); })) {
+          if (!Execution::Await([&] { return rpc->write(request->value, boost::asio::use_awaitable); })) {
+            throw std::runtime_error("gRPC stream write cancelled");
+          }
+          queue->complete(request);
+        }
       }
+    } catch (...) {
+      writeError = std::current_exception();
+      rpc->context().TryCancel();
+      queue->fail(writeError);
     }
-  }
-  auto status = co_await rpc->finish(boost::asio::use_awaitable);
-  if (!status.ok()) throw StatusError(status);
-  response(std::move(value));
+    try {
+      auto status = Execution::Await([&] { return rpc->finish(boost::asio::use_awaitable); });
+      if (writeError) std::rethrow_exception(writeError);
+      if (!status.ok()) throw StatusError(status);
+      queue->fail(std::make_exception_ptr(std::runtime_error("gRPC stream is closed")));
+      response(std::move(value));
+    } catch (...) {
+      queue->fail(std::current_exception());
+      throw;
+    }
+  });
 }
 
 template <typename RPC, typename Request>
 boost::asio::awaitable<void> RunBidirectionalWrites(
     std::shared_ptr<RPC> rpc,
-    std::shared_ptr<detail::ClientWriteQueue<Request>> queue) {
-  while (auto request = co_await queue->pop()) {
-    if (!co_await rpc->write(*request, boost::asio::use_awaitable)) {
-      throw std::runtime_error("gRPC stream write cancelled");
+    std::shared_ptr<detail::ClientWriteQueue<Request>> queue,
+    MessageContext context) {
+  try {
+    while (auto request = co_await queue->pop(context)) {
+      if (!co_await rpc->write(request->value, boost::asio::use_awaitable)) {
+        throw std::runtime_error("gRPC stream write cancelled");
+      }
+      queue->complete(request);
     }
-  }
-  if (!co_await rpc->writes_done(boost::asio::use_awaitable)) {
-    throw std::runtime_error("gRPC WritesDone failed");
+    if (!co_await rpc->writes_done(boost::asio::use_awaitable)) {
+      throw std::runtime_error("gRPC WritesDone failed");
+    }
+  } catch (...) {
+    queue->fail(std::current_exception());
+    throw;
   }
 }
 
@@ -219,11 +294,15 @@ boost::asio::awaitable<void> RunBidirectionalStreamingClient(
     std::shared_ptr<detail::ClientWriteQueue<Request>> queue, Stub& client,
     MessageContext message, std::function<void(Response)> response,
     bool tracingEnabled = true) {
+  co_await servicelib::detail::CooperativeExecution::Run([&] {
+  using Execution = servicelib::detail::CooperativeExecution;
   try {
     using RPC = agrpc::ClientRPC<PrepareAsync>;
     InjectContext(message, rpc->context(), tracingEnabled);
     detail::ClientCancellation cancellation(message, rpc->context());
-    if (!co_await rpc->start(client, boost::asio::use_awaitable)) {
+    if (!Execution::Await([&] { return rpc->start(client, boost::asio::use_awaitable); })) {
+      const auto status = Execution::Await([&] { return rpc->finish(boost::asio::use_awaitable); });
+      if (!status.ok()) throw StatusError(status);
       throw std::runtime_error("gRPC stream start failed");
     }
 
@@ -232,7 +311,7 @@ boost::asio::awaitable<void> RunBidirectionalStreamingClient(
     auto writeMutex = std::make_shared<std::mutex>();
     boost::asio::co_spawn(
         servicelib::detail::ParallelExecutorRegistry::Get(),
-        RunBidirectionalWrites<RPC, Request>(rpc, queue),
+        RunBidirectionalWrites<RPC, Request>(rpc, queue, message),
         [rpc, writesDone, writeError,
          writeMutex](std::exception_ptr error) noexcept {
           bool failed{};
@@ -245,24 +324,34 @@ boost::asio::awaitable<void> RunBidirectionalStreamingClient(
           writesDone->Send();
         });
 
-    typename RPC::Response value;
-    while (co_await rpc->read(value, boost::asio::use_awaitable)) {
-      response(std::move(value));
-      value = typename RPC::Response{};
+    std::exception_ptr responseError;
+    try {
+      typename RPC::Response value;
+      while (Execution::Await([&] { return rpc->read(value, boost::asio::use_awaitable); })) {
+        response(std::move(value));
+        value = typename RPC::Response{};
+      }
+    } catch (...) {
+      responseError = std::current_exception();
+      rpc->context().TryCancel();
+      queue->fail(responseError);
     }
     queue->close();
-    co_await writesDone->AsyncWait();
+    writesDone->Wait();
+    auto status = Execution::Await([&] { return rpc->finish(boost::asio::use_awaitable); });
+    if (responseError) std::rethrow_exception(responseError);
     {
       std::lock_guard lock(*writeMutex);
       if (*writeError) std::rethrow_exception(*writeError);
     }
-    auto status = co_await rpc->finish(boost::asio::use_awaitable);
     if (!status.ok()) throw StatusError(status);
+    queue->fail(std::make_exception_ptr(std::runtime_error("gRPC stream is closed")));
   } catch (...) {
-    queue->close();
     rpc->context().TryCancel();
+    queue->fail(std::current_exception());
     throw;
   }
+  });
 }
 
 // A generated connector owns one standard gRPC Stub per configured
@@ -394,8 +483,8 @@ class ClientPool final {
         [queue](Request request) { queue->push(std::move(request)); },
         [queue] { queue->close(); },
         [queue, rpc] {
-          queue->close();
           rpc->context().TryCancel();
+          queue->fail(std::make_exception_ptr(std::runtime_error("gRPC stream cancelled")));
         });
     boost::asio::co_spawn(
         servicelib::detail::ParallelExecutorRegistry::Get(),
@@ -427,8 +516,8 @@ class ClientPool final {
         [queue](Request request) { queue->push(std::move(request)); },
         [queue] { queue->close(); },
         [queue, rpc] {
-          queue->close();
           rpc->context().TryCancel();
+          queue->fail(std::make_exception_ptr(std::runtime_error("gRPC stream cancelled")));
         });
     boost::asio::co_spawn(
         servicelib::detail::ParallelExecutorRegistry::Get(),

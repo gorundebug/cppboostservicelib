@@ -135,16 +135,20 @@ class Server final {
       }
       lock.unlock();
       for (const auto& session : sessions) session->Stop();
-      lock.lock();
       sessions.clear();
-      // The timeout only changes graceful shutdown into forced socket
-      // cancellation. It must never allow a session coroutine to outlive the
-      // router and the execution graph it can call. The executor is still
-      // running here, so wait until every completion handler has erased its
-      // session before returning to ServiceGenerated::releaseRuntime().
-      sessionRegistry_->drained.wait(
-          lock, [this] { return sessionRegistry_->sessions.empty(); });
+      // Sessions retain their router and registry until their completion
+      // handlers run. Do not extend the graceful shutdown deadline while
+      // waiting for application code which may ignore request cancellation.
     }
+  }
+
+  // Finalization is separate from deadline-bounded admission shutdown.
+  // Keep the executor and any state borrowed by route handlers alive until
+  // this returns. Generated hosts perform this wait before releasing graphs.
+  void WaitStopped() noexcept {
+    std::unique_lock lock(sessionRegistry_->mutex);
+    sessionRegistry_->drained.wait(
+        lock, [this] { return sessionRegistry_->sessions.empty(); });
   }
 
   [[nodiscard]] bool running() const noexcept {
@@ -659,6 +663,15 @@ class BeastEndpoint final : public IBeastEndpoint {
 
   boost::asio::awaitable<servicelib::http::Response> handle(
       servicelib::http::Request request, MessageContext requestContext) override {
+    co_return co_await servicelib::detail::CooperativeExecution::Run(
+        [this, request = std::move(request), context = std::move(requestContext)]() mutable {
+          return handleCooperative(std::move(request), std::move(context));
+        });
+  }
+
+ private:
+  servicelib::http::Response handleCooperative(
+      servicelib::http::Request request, MessageContext requestContext) {
     if (tracingEngineAvailable_) {
       requestContext = ApplyDataSourceEndpointTracing(
           std::move(requestContext), environment_, endpointId_);
@@ -668,12 +681,12 @@ class BeastEndpoint final : public IBeastEndpoint {
     auto admission = admit();
     if (!admission) {
       httpResponse.status = 503;
-      co_return httpResponse;
+      return httpResponse;
     }
     if (!methodMatches(request.method)) {
       metrics_.invalidHttpMethod(request.method, request.path);
       httpResponse.status = 405;
-      co_return httpResponse;
+      return httpResponse;
     }
 
     auto& externalCancellation = *admission->cancellation;
@@ -708,7 +721,7 @@ class BeastEndpoint final : public IBeastEndpoint {
       traceError(startedSpan.span(), error, "begin_request.error");
       metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
       httpResponse.body = std::move(data.responseBody);
-      co_return httpResponse;
+      return httpResponse;
     }
     if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     auto begin = std::move(*beginResult);
@@ -730,13 +743,6 @@ class BeastEndpoint final : public IBeastEndpoint {
     bool pendingInserted = false;
     bool resultWaitFailed = false;
     bool doneReceived = false;
-    servicelib::detail::SingleUseEvent consumeCompleted;
-    std::shared_ptr<servicelib::AsyncCompletionState> consumeCompletion;
-    if (startedSpan.span()) {
-      consumeCompletion = servicelib::AsyncCompletionState::make(
-          [&consumeCompleted] { consumeCompleted.Send(); });
-      context = std::move(context).withCompletion(consumeCompletion);
-    }
     try {
       if (hasResult_) {
         pending_.set(streamId, result);
@@ -749,24 +755,12 @@ class BeastEndpoint final : public IBeastEndpoint {
       } catch (...) {
         const auto consumeError = std::current_exception();
         traceError(startedSpan.span(), consumeError, "consume_message.error");
-        if (consumeCompletion) {
-          consumeCompletion->release();
-          consumeCompletion.reset();
-        }
         std::rethrow_exception(consumeError);
-      }
-      if (consumeCompletion) {
-        // FunctionCall retains this frame through every asynchronous adapter;
-        // pooled callers deliberately detach from it. Thus this event denotes
-        // the same logical ConsumeMessage boundary as in Go for both profiles.
-        consumeCompletion->release();
-        consumeCompletion.reset();
-        co_await consumeCompleted.AsyncWait();
       }
       if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("consume_message");
       if (hasResult_) {
         try {
-          co_await result->done.AsyncWait(context);
+          servicelib::detail::CooperativeExecution::Await([&] { return result->done.AsyncWait(context); });
           if (context.cancelled() && !result->done.IsReady()) {
             throw HttpRequestCancelledError{};
           }
@@ -777,10 +771,6 @@ class BeastEndpoint final : public IBeastEndpoint {
         }
       }
     } catch (...) {
-      if (consumeCompletion) {
-        consumeCompletion->release();
-        consumeCompletion.reset();
-      }
       error = std::current_exception();
       if (context.cancelled()) {
         externalCancellation.request_stop();
@@ -794,10 +784,8 @@ class BeastEndpoint final : public IBeastEndpoint {
 
     // Retirement must outlive every admitted result callback, even when
     // the transport coroutine has received Asio cancellation.
-    co_await boost::asio::this_coro::reset_cancellation_state(
-        boost::asio::disable_cancellation());
     if (hasResult_) {
-      co_await result->retire();
+      servicelib::detail::CooperativeExecution::Await([&] { return result->retire(); });
       if (pendingInserted) {
         static_cast<void>(pending_.pop(streamId));
         metrics_.pendingRemove(streamId);
@@ -833,8 +821,10 @@ class BeastEndpoint final : public IBeastEndpoint {
     externalCancellation.request_stop();
     metrics_.requestEnd(startedAt, error);
     httpResponse.body = std::move(data.responseBody);
-    co_return httpResponse;
+    return httpResponse;
   }
+
+ public:
 
   void consumeResult(MessageContext context, Payload<R> payload) {
     if (context.streamId().empty()) {

@@ -15,6 +15,8 @@
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/pool/delaypool.hpp>
 #include <servicelib/runtime/pool/prioritytaskpool.hpp>
+#include <servicelib/runtime/pool/taskpool.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <servicelib/runtime/testlog/testlog.hpp>
 #include <servicelib/runtime/testmetrics/testmetrics.hpp>
 
@@ -145,6 +147,256 @@ servicelib::metrics::Labels DelayEventLabels(std::string event) {
   auto labels = DelayLabels();
   labels.emplace("event", std::move(event));
   return labels;
+}
+
+template <typename Factory, typename Submit>
+void CheckPoolCooperativeWait(Factory factory, Submit submit, bool checkSlot = false) {
+  boost::asio::io_context io;
+  auto work = boost::asio::make_work_guard(io);
+  struct RestoreExecutor final {
+    boost::asio::any_io_executor previous =
+        servicelib::detail::ParallelExecutorRegistry::Get();
+    ~RestoreExecutor() {
+      servicelib::detail::ParallelExecutorRegistry::Set(previous);
+    }
+  } restore;
+  servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+  TestEnvironment environment;
+  auto pool = factory(environment);
+  pool->start(servicelib::Context{});
+  servicelib::detail::SingleUseEvent release;
+  std::promise<void> entered;
+  auto started = entered.get_future();
+  std::promise<bool> completed;
+  auto result = completed.get_future();
+  std::atomic<bool> secondStarted{};
+  std::jthread worker([&] { io.run(); });
+  submit(*pool, [&] {
+    entered.set_value();
+    const bool signalled = release.WaitUntil(
+        std::chrono::steady_clock::now() + 500ms);
+    EXPECT_THROW(pool->stop(servicelib::Context{}), servicelib::pool::PoolSelfStopError);
+    completed.set_value(signalled);
+  });
+  const bool accepted = started.wait_for(2s) == std::future_status::ready;
+  if (accepted) {
+    if (checkSlot) submit(*pool, [&] { secondStarted.store(true); });
+    boost::asio::post(io, [&] {
+      EXPECT_FALSE(servicelib::detail::CooperativeExecution::Active());
+      EXPECT_EQ(servicelib::detail::CooperativeExecution::CurrentOwner(), nullptr);
+      if (checkSlot) {
+        EXPECT_FALSE(secondStarted.load());
+      }
+      release.Send();
+    });
+  }
+  const bool returned = result.wait_for(2s) == std::future_status::ready;
+  // Rescue before shutdown even on failure; a regression must not hang ctest.
+  release.Send();
+  pool->stop(servicelib::Context{});
+  work.reset();
+  worker.join();
+  EXPECT_TRUE(accepted);
+  ASSERT_TRUE(returned);
+  EXPECT_TRUE(result.get()) << "pool callback blocked its executor worker";
+  if (checkSlot) {
+    EXPECT_TRUE(secondStarted.load());
+  }
+}
+
+template <typename Factory, typename Submit>
+void CheckPeerPoolStop(Factory factory, Submit submit) {
+  for (bool expiredDeadline : {false, true}) {
+    boost::asio::io_context io;
+    auto work = boost::asio::make_work_guard(io);
+    struct RestoreExecutor final {
+      boost::asio::any_io_executor previous =
+          servicelib::detail::ParallelExecutorRegistry::Get();
+      ~RestoreExecutor() { servicelib::detail::ParallelExecutorRegistry::Set(previous); }
+    } restore;
+    servicelib::detail::ParallelExecutorRegistry::Set(io.get_executor());
+    TestEnvironment environment;
+    auto target = factory(environment);
+    servicelib::pool::DelayPoolImpl caller(environment);
+    target->start({});
+    caller.start({});
+    servicelib::detail::SingleUseEvent release;
+    std::promise<void> entered, stopping, stopped, pulse;
+    auto enteredFuture = entered.get_future();
+    auto stoppingFuture = stopping.get_future();
+    auto stoppedFuture = stopped.get_future();
+    auto pulseFuture = pulse.get_future();
+    std::atomic<bool> completed{false};
+    std::jthread worker([&] { io.run(); });
+    submit(*target, [&] {
+      entered.set_value();
+      release.Wait();
+      completed = true;
+    });
+    const bool accepted = enteredFuture.wait_for(2s) == std::future_status::ready;
+    caller.delay({}, 0ms, [&] {
+      stopping.set_value();
+      try {
+        auto context = servicelib::Context{};
+        if (expiredDeadline)
+          context = context.withDeadline(std::chrono::steady_clock::now() - 1ms);
+        target->stop(context);
+        EXPECT_TRUE(completed.load());
+        stopped.set_value();
+      } catch (...) {
+        stopped.set_exception(std::current_exception());
+      }
+    });
+    const bool stopStarted = stoppingFuture.wait_for(2s) == std::future_status::ready;
+    boost::asio::post(io, [&] {
+      release.Send();
+      pulse.set_value();
+    });
+    const bool progressed = pulseFuture.wait_for(500ms) == std::future_status::ready;
+    if (!progressed) {
+      // Test-only rescue: a blocking stop must fail rather than hang cleanup.
+      io.run_for(50ms);
+    }
+    const bool stopReturned = stoppedFuture.wait_for(2s) == std::future_status::ready;
+    release.Send();
+    caller.stop({});
+    target->stop({});
+    work.reset();
+    worker.join();
+    EXPECT_TRUE(accepted);
+    EXPECT_TRUE(stopStarted);
+    EXPECT_TRUE(progressed) << "stopping another pool blocked the only reactor worker";
+    ASSERT_TRUE(stopReturned);
+    EXPECT_NO_THROW(stoppedFuture.get());
+  }
+}
+
+template <typename Factory, typename Submit>
+void CheckPoolCaptureCleanup(Factory factory, Submit submit) {
+  for (bool throwFromCallback : {false, true}) {
+    TestEnvironment environment;
+    auto pool = factory(environment);
+    pool->start({});
+    std::promise<void> entered, release, stopped, stopping;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future();
+    auto stoppedFuture = stopped.get_future();
+    auto stoppingFuture = stopping.get_future();
+    std::atomic<bool> cleaned{false};
+    auto owned = std::shared_ptr<int>(new int(42), [&](int* value) {
+      delete value;
+      entered.set_value();
+      cleaned = releaseFuture.wait_for(3s) == std::future_status::ready;
+    });
+    submit(*pool, [owned = std::move(owned), throwFromCallback] {
+      EXPECT_EQ(*owned, 42);
+      if (throwFromCallback) throw std::runtime_error("pool callback failed");
+    });
+    const bool cleanupEntered = enteredFuture.wait_for(2s) == std::future_status::ready;
+    std::jthread stopper([&] {
+      stopping.set_value();
+      pool->stop({});
+      EXPECT_TRUE(cleaned.load());
+      stopped.set_value();
+    });
+    const bool stopStarted = stoppingFuture.wait_for(2s) == std::future_status::ready;
+    const bool premature = stoppedFuture.wait_for(5ms) == std::future_status::ready;
+    release.set_value();
+    stopper.join();
+    EXPECT_TRUE(cleanupEntered);
+    EXPECT_TRUE(stopStarted);
+    EXPECT_FALSE(premature);
+    EXPECT_TRUE(cleaned.load());
+  }
+}
+
+TEST(DelayPool, PeerPoolStopReleasesExecutorWorker) {
+  CheckPeerPoolStop(
+      [](TestEnvironment& env) { return std::make_unique<servicelib::pool::DelayPoolImpl>(env); },
+      [](auto& pool, auto callback) { pool.delay({}, 1ms, std::move(callback)); });
+}
+
+TEST(TaskPool, PeerPoolStopReleasesExecutorWorker) {
+  CheckPeerPoolStop(
+      [](TestEnvironment& env) { return std::make_unique<servicelib::pool::TaskPoolImpl>(kPoolName, env); },
+      [](auto& pool, auto callback) { pool.addTask({}, std::move(callback)); });
+}
+
+TEST(PriorityTaskPool, PeerPoolStopReleasesExecutorWorker) {
+  CheckPeerPoolStop(
+      [](TestEnvironment& env) { return std::make_unique<servicelib::pool::PriorityTaskPoolImpl>(kPoolName, env); },
+      [](auto& pool, auto callback) { pool.addTask({}, 0, std::move(callback)); });
+}
+
+TEST(DelayPool, StopWaitsForCallbackCaptureCleanup) {
+  CheckPoolCaptureCleanup(
+      [](TestEnvironment& env) { return std::make_unique<servicelib::pool::DelayPoolImpl>(env); },
+      [](auto& pool, auto callback) { pool.delay({}, 1ms, std::move(callback)); });
+}
+
+TEST(TaskPool, StopWaitsForCallbackCaptureCleanup) {
+  CheckPoolCaptureCleanup(
+      [](TestEnvironment& env) { return std::make_unique<servicelib::pool::TaskPoolImpl>(kPoolName, env); },
+      [](auto& pool, auto callback) { pool.addTask({}, std::move(callback)); });
+}
+
+TEST(PriorityTaskPool, StopWaitsForCallbackCaptureCleanup) {
+  CheckPoolCaptureCleanup(
+      [](TestEnvironment& env) { return std::make_unique<servicelib::pool::PriorityTaskPoolImpl>(kPoolName, env); },
+      [](auto& pool, auto callback) { pool.addTask({}, 0, std::move(callback)); });
+}
+
+TEST(DelayPool, WaitingCallbackReleasesExecutorWorker) {
+  CheckPoolCooperativeWait(
+      [](TestEnvironment& env) {
+        return std::make_unique<servicelib::pool::DelayPoolImpl>(env);
+      },
+      [](auto& pool, auto callback) {
+        pool.delay(servicelib::Context{}, 1ms, std::move(callback));
+      });
+}
+
+TEST(TaskPool, WaitingCallbackReleasesExecutorWorker) {
+  CheckPoolCooperativeWait(
+      [](TestEnvironment& env) {
+        return std::make_unique<servicelib::pool::TaskPoolImpl>(kPoolName, env);
+      },
+      [](auto& pool, auto callback) {
+        pool.addTask(servicelib::Context{}, std::move(callback));
+      }, true);
+}
+
+TEST(PriorityTaskPool, WaitingCallbackReleasesExecutorWorker) {
+  CheckPoolCooperativeWait(
+      [](TestEnvironment& env) {
+        return std::make_unique<servicelib::pool::PriorityTaskPoolImpl>(kPoolName, env);
+      },
+      [](auto& pool, auto callback) {
+        pool.addTask(servicelib::Context{}, 0, std::move(callback));
+      }, true);
+}
+
+TEST(DelayPool, AlreadyCompletedContextRejectsCallback) {
+  for (const bool expired : {false, true}) {
+    SCOPED_TRACE(expired ? "deadline" : "cancelled");
+    TestEnvironment environment;
+    servicelib::pool::DelayPoolImpl pool{environment};
+    pool.start(servicelib::Context{});
+    StopPoolOnExit stopGuard{pool};
+    std::stop_source stop;
+    stop.request_stop();
+    auto context = expired
+        ? servicelib::Context{}.withDeadline(std::chrono::steady_clock::now() - 1s)
+        : servicelib::Context{}.withStopToken(stop.get_token());
+    std::atomic<int> calls{};
+    EXPECT_THROW({
+      pool.delay(context, 100ms, [&] {
+        calls.fetch_add(1);
+      });
+    }, servicelib::pool::PoolCancelledError);
+    pool.stop(servicelib::Context{});
+    EXPECT_EQ(calls.load(), 0);
+  }
 }
 
 TEST(PriorityTaskPool, PriorityFifoAndDeadlinePromotion) {

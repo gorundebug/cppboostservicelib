@@ -74,6 +74,7 @@ class CppBoostServiceLibConan(ConanFile):
         # The framework contract intentionally pins newer compatible versions;
         # requirements() records the corresponding Conan overrides explicitly.
         self.options["boost"].shared = False
+        self.options["boost"].without_context = False
         # Conan's Boost CMake package exports every declared component target.
         # Keep the test library present even though ServiceLib itself only asks
         # for Boost.JSON; otherwise loading BoostConfig.cmake fails while it

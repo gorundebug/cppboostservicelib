@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
-#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +23,7 @@
 #include <vector>
 
 #include <servicelib/runtime/detail/asio_dispatch.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/pool/pool.hpp>
 
@@ -54,8 +54,7 @@ class DelayPoolImpl final : public IDelayPool {
     explicit SharedState(IServiceEnvironment& environment)
         : env(environment),
           executor(detail::ParallelExecutorRegistry::Get()),
-          strand(boost::asio::make_strand(executor)), timer(strand),
-          drained(drainPromise.get_future().share()) {
+          strand(boost::asio::make_strand(executor)), timer(strand) {
       const auto serviceSnapshot = env.getServiceConfigSnapshot();
       const auto* service = serviceSnapshot.get();
       metricsEnabled = env.getMetrics().enabled();
@@ -95,8 +94,7 @@ class DelayPoolImpl final : public IDelayPool {
     bool started{};
     bool closed{};
     bool drainSignalled{};
-    std::promise<void> drainPromise;
-    std::shared_future<void> drained;
+    detail::SingleUseEvent drained;
     bool metricsEnabled{};
     std::unique_ptr<metrics::Int64Gauge> gaugeWaitQueueLength;
     std::unique_ptr<metrics::Int64Counter> tasksTotal;
@@ -135,7 +133,7 @@ class DelayPoolImpl final : public IDelayPool {
 
   void stop(Context ctx) override {
     const auto state = state_;
-    if (currentExecutingPool_ == state.get()) throw PoolSelfStopError();
+    if (detail::CooperativeExecution::CurrentOwner() == state.get()) throw PoolSelfStopError();
     bool drained;
     {
       std::lock_guard lock(state->activityMutex);
@@ -143,12 +141,13 @@ class DelayPoolImpl final : public IDelayPool {
       drained = state->activeTasks == 0;
     }
     if (drained) signalDrained(state);
-    // This synchronous lifecycle boundary is called off-reactor by ServiceApp.
+    // Native callers wait on their thread; cooperative callers suspend so
+    // timer and callback completion can use the same reactor worker.
     // Never hold the activity mutex while waiting for accepted work to finish.
-    if (ctx.deadline() && state->drained.wait_until(*ctx.deadline()) == std::future_status::timeout) {
+    if (ctx.deadline() && !state->drained.WaitUntil(*ctx.deadline())) {
       recordStopTimeout(state);
     }
-    state->drained.wait();
+    state->drained.Wait();
   }
 
   void delay(Context ctx, Duration delayDuration,
@@ -256,7 +255,7 @@ class DelayPoolImpl final : public IDelayPool {
       if (state->drainSignalled) return;
       state->drainSignalled = true;
     }
-    state->drainPromise.set_value();
+    state->drained.Send();
   }
 
   static void retire(const std::shared_ptr<SharedState>& state) {
@@ -272,7 +271,10 @@ class DelayPoolImpl final : public IDelayPool {
 
   static void dispatch(const std::shared_ptr<DelayTask>& task, bool expedited) {
     // Independent executor task, never execute user code on the timer strand.
-    boost::asio::post(task->state->executor, [task, expedited] { execute(task, expedited); });
+    boost::asio::co_spawn(task->state->executor,
+        detail::CooperativeExecution::Run(
+            [task, expedited] { execute(task, expedited); }, task->state.get()),
+        [](std::exception_ptr error) { if (error) std::rethrow_exception(error); });
   }
 
   static void armNext(const std::shared_ptr<SharedState>& state) {
@@ -331,8 +333,6 @@ class DelayPoolImpl final : public IDelayPool {
     task->cancelCallback.reset();
     task->externalCancelCallbacks.clear();
     const auto state = task->state;
-    const auto* previous = currentExecutingPool_;
-    currentExecutingPool_ = state.get();
     const auto startedAt = state->metricsEnabled
                                ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -352,7 +352,6 @@ class DelayPoolImpl final : public IDelayPool {
              log::Field::Str("error", "<unknown>")});
       });
     }
-    currentExecutingPool_ = previous;
     task->fn = nullptr;
     if (state->metricsEnabled) {
       bestEffort([state] { state->tasksTotal->inc(); });
@@ -369,7 +368,6 @@ class DelayPoolImpl final : public IDelayPool {
     retire(state);
   }
 
-  inline static thread_local const SharedState* currentExecutingPool_{};
   std::shared_ptr<SharedState> state_;
 };
 

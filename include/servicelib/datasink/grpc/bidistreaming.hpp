@@ -1,6 +1,9 @@
 #pragma once
 
 #include <functional>
+#include <deque>
+#include <mutex>
+#include <optional>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <servicelib/datasink/grpc/streaming_lifecycle.hpp>
@@ -37,6 +40,14 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
   using State = typename Handler::State;
   using Rpc =
       typename detail::BidirectionalStreamingRpcType<ClientFunction>::type;
+  struct DeferredResponse final {
+    DeferredResponse(Res value, std::shared_ptr<detail::StreamingActivity::Token> token)
+        : response(std::move(value)), active(std::move(token)) {}
+    Res response;
+    std::shared_ptr<detail::StreamingActivity::Token> active;
+    servicelib::detail::SingleUseEvent finished;
+    std::exception_ptr error;
+  };
   struct Session final {
     Session(MessageContext contextValue, State stateValue, Rpc rpcValue,
             DataSinkEndpointMetrics::Clock::time_point started,
@@ -54,7 +65,14 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     std::shared_ptr<tracing::Span> span;
     std::shared_ptr<detail::StreamingActivity::Token> operation;
     std::atomic<bool> done{false};
+    std::atomic<bool> terminalStarted{false};
     detail::StreamingActivity lifetime;
+    std::mutex responseErrorMutex;
+    std::exception_ptr responseError;
+    std::mutex responseQueueMutex;
+    bool responseRunning{};
+    // Allocate a queue only if startup or an earlier callback delays a response.
+    std::optional<std::deque<std::shared_ptr<DeferredResponse>>> deferredResponses;
   };
 
   using SessionCell = detail::StreamingCell<Session>;
@@ -66,13 +84,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
             std::move(handler)),
         client_(std::move(client)),
         pending_(std::chrono::seconds{30}),
-        executor_(servicelib::detail::ParallelExecutorRegistry::Get()),
-        continuationExecutor_([this] {
-          if constexpr (requires { typename ClientFunction::AsyncSession; })
-            return executor_;
-          else
-            return servicelib::detail::BlockingExecutorRegistry::Get();
-        }()) {}
+        executor_(servicelib::detail::ParallelExecutorRegistry::Get()) {}
 
   void start(Context context) override {
     Endpoint<T, R, Handler, E>::start(context);
@@ -100,6 +112,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
 
       auto [cell, loaded] = pending_.getOrCreate(
           streamId, [] { return std::make_shared<SessionCell>(); });
+      if (rejectCompletingSession(cell, loaded)) return;
 
       std::shared_ptr<Session> session;
       if (!loaded) {
@@ -133,11 +146,11 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         } catch (...) {
           const auto error = std::current_exception();
           this->traceError(detachedTrace.span.get(), error, "grpc_call.error");
+          cell->error = error;
+          cell->markReady();
           this->callEnd(context, error, begin->state);
           this->metrics_.requestEnd(startedAt, error);
           if (detachedTrace.span) tracing::SpanEnd(detachedTrace.span.get());
-          cell->error = error;
-          cell->markReady();
           dropReservation(streamId, cell);
           return;
         }
@@ -153,15 +166,27 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
   }
 
  private:
+  bool rejectCompletingSession(const std::shared_ptr<SessionCell>& cell,
+                               bool loaded) {
+    if (loaded && cell->ready.IsReady() &&
+        (cell->error || (cell->session &&
+                        cell->session->terminalStarted.load(std::memory_order_acquire)))) {
+      this->metrics_.beginRequestFailed("gRPC bidi-streaming session is still completing");
+      return true;
+    }
+    return false;
+  }
+
   void consumeAsync(MessageContext context, Payload<T> payload,
                     std::shared_ptr<detail::StreamingActivity::Token> operation) {
     context = this->ensureStreamId(std::move(context));
     const std::string streamId{context.streamId()};
     auto [cell, loaded] = pending_.getOrCreate(
         streamId, [] { return std::make_shared<SessionCell>(); });
+    if (rejectCompletingSession(cell, loaded)) return;
     std::shared_ptr<Session> session;
     if (!loaded) {
-      sessions_.add(cell);
+      cell->registration = sessions_.add(cell);
       auto trace = this->startDetachedTrace(std::move(context));
       context = std::move(trace.context);
       std::optional<servicelib::BeginResult<State>> begin;
@@ -198,13 +223,7 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
               if (!active) return;
               auto cell = weakCell.lock();
               if (!cell) return;
-              if (cell->ready.IsReady()) {
-                respond(current, std::move(response));
-              } else {
-                boost::asio::co_spawn(executor_, respondWhenReady(
-                    this, std::move(cell), current, std::move(response),
-                    std::move(active)), boost::asio::detached);
-              }
+              receiveResponse(cell, current, std::move(response), std::move(active));
             },
             [this, weakSession](std::exception_ptr error) noexcept {
               const auto current = weakSession.lock();
@@ -228,35 +247,12 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
   }
 
   void deliverOrWait(const std::shared_ptr<SessionCell>& cell,
-                     MessageContext context, Payload<T> payload,
-                     std::shared_ptr<detail::StreamingActivity::Token> operation) {
-    if (cell->ready.IsReady()) {
-      if (!cell->error && !context.cancelled()) deliver(cell, std::move(payload));
-      return;
-    }
-    // Each message resumes in its own task; no strand serializes handlers.
-    boost::asio::co_spawn(executor_, consumeWhenReady(
-        this, cell, std::move(context), std::move(payload), std::move(operation)),
-        boost::asio::detached);
-  }
-
-  static boost::asio::awaitable<void> consumeWhenReady(
-      BidirectionalStreamingEndpoint* self, std::shared_ptr<SessionCell> cell,
-      MessageContext context, Payload<T> payload,
-      std::shared_ptr<detail::StreamingActivity::Token> operation) {
-    co_await cell->ready.AsyncWait(context);
-    if (!cell->ready.IsReady() || cell->error || context.cancelled()) co_return;
-    if constexpr (requires { typename ClientFunction::AsyncSession; }) {
-      self->deliver(cell, std::move(payload));
-    } else {
-      // A legacy RPC's Write/Finish may block. Resume it on the existing
-      // blocking executor, never on the reactor that awaited readiness.
-      boost::asio::post(self->continuationExecutor_,
-          [self, cell = std::move(cell), payload = std::move(payload),
-           operation = std::move(operation)]() mutable {
-            self->deliver(cell, std::move(payload));
-          });
-    }
+                     [[maybe_unused]] MessageContext context, Payload<T> payload,
+                     [[maybe_unused]] std::shared_ptr<detail::StreamingActivity::Token> operation) {
+    // Like Go, wait for the shared creation result before processing this message.
+    // This suspends a cooperative caller without detaching its business work.
+    cell->ready.Wait();
+    if (!cell->error) deliver(cell, std::move(payload));
   }
 
   void deliver(const std::shared_ptr<SessionCell>& cell, Payload<T> payload) {
@@ -369,41 +365,116 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
   }
 
   void respond(const std::shared_ptr<Session>& session, Res response) {
-    this->handler_.handleResponse(session->context, this->streamContext_,
-                                  session->state, response);
+    try {
+      this->handler_.handleResponse(session->context, this->streamContext_,
+                                    session->state, response);
+    } catch (...) {
+      // Transport completion may already be waiting for this admitted callback.
+      // Preserve its failure before releasing the lifetime token.
+      std::lock_guard lock(session->responseErrorMutex);
+      if (!session->responseError) session->responseError = std::current_exception();
+      throw;
+    }
     if (auto* traceSpan = session->span.get()) traceSpan->addEvent("handle_response");
   }
 
-  static boost::asio::awaitable<void> respondWhenReady(
-      BidirectionalStreamingEndpoint* self, std::shared_ptr<SessionCell> cell,
-      std::shared_ptr<Session> session, Res response,
-      std::shared_ptr<detail::StreamingActivity::Token> active) {
-    co_await cell->ready.AsyncWait();
-    if (!cell->error) {
-      try { self->respond(session, std::move(response)); }
-      catch (...) {
-        const auto error = std::current_exception();
-        self->traceError(session->span.get(), error, "handle_response.error");
-        self->finishAsync(session, error);
-        session->rpc->cancel();
+  void receiveResponse(
+      const std::shared_ptr<SessionCell>& cell, const std::shared_ptr<Session>& session,
+      Res response, std::shared_ptr<detail::StreamingActivity::Token> active) {
+    std::shared_ptr<DeferredResponse> deferred;
+    bool launch = false;
+    bool ready;
+    {
+      std::lock_guard lock(session->responseQueueMutex);
+      ready = cell->ready.IsReady();
+      if (!ready || session->responseRunning) {
+        deferred = std::make_shared<DeferredResponse>(std::move(response), std::move(active));
+        if (!session->deferredResponses) session->deferredResponses.emplace();
+        session->deferredResponses->push_back(deferred);
+        launch = !session->responseRunning;
       }
+      session->responseRunning = true;
     }
-    static_cast<void>(active);
+    if (!deferred) {
+      const auto error = processResponse(session, std::move(response));
+      drainResponses(this, cell, session);
+      if (error) std::rethrow_exception(error);
+      return;
+    }
+    if (launch) {
+      // One root drains startup responses in arrival order. Keep its activity
+      // token until the whole drain returns, including the empty-queue check.
+      servicelib::detail::CooperativeExecution::Post(executor_,
+          [this, cell, session, activity = deferred->active] {
+            drainResponses(this, cell, session);
+            static_cast<void>(activity);
+          });
+    }
+    // Startup callbacks cannot wait for startup itself. Once published, keep
+    // normal transport backpressure by returning only after this response runs.
+    if (ready) {
+      deferred->finished.Wait();
+      if (deferred->error) std::rethrow_exception(deferred->error);
+    }
+  }
+
+  std::exception_ptr processResponse(const std::shared_ptr<Session>& session, Res response) {
+    {
+      std::lock_guard lock(session->responseErrorMutex);
+      if (session->responseError) return {};
+    }
+    try { respond(session, std::move(response)); }
+    catch (...) {
+      const auto error = std::current_exception();
+      this->traceError(session->span.get(), error, "handle_response.error");
+      finishAsync(session, error);
+      session->rpc->cancel();
+      return error;
+    }
+    return {};
+  }
+
+  static void drainResponses(
+      BidirectionalStreamingEndpoint* self, const std::shared_ptr<SessionCell>& cell,
+      const std::shared_ptr<Session>& session) {
+    cell->ready.Wait();
+    for (;;) {
+      std::shared_ptr<DeferredResponse> response;
+      {
+        std::lock_guard lock(session->responseQueueMutex);
+        if (!session->deferredResponses || session->deferredResponses->empty()) {
+          session->deferredResponses.reset();
+          session->responseRunning = false;
+          return;
+        }
+        response = std::move(session->deferredResponses->front());
+        session->deferredResponses->pop_front();
+      }
+      if (!cell->error)
+        response->error = self->processResponse(session, std::move(response->response));
+      response->finished.Send();
+    }
   }
 
   void finishAsync(const std::shared_ptr<Session>& session, std::exception_ptr error) {
+    session->terminalStarted.store(true, std::memory_order_release);
     if (!session->lifetime.close()) return;
-    boost::asio::co_spawn(executor_, finalize(this, session, error), boost::asio::detached);
+    servicelib::detail::CooperativeExecution::Post(executor_,
+        [this, session, error] { finalize(this, session, error); });
   }
 
-  static boost::asio::awaitable<void> finalize(
+  static void finalize(
       BidirectionalStreamingEndpoint* self, std::shared_ptr<Session> session, std::exception_ptr error) {
-    co_await session->lifetime.asyncWait();
-    static_cast<void>(self->pending_.pop(session->streamId));
+    session->lifetime.wait();
+    {
+      std::lock_guard lock(session->responseErrorMutex);
+      if (session->responseError) error = session->responseError;
+    }
     if (error) self->traceError(session->span.get(), error);
     self->callEnd(session->context, error, session->state);
     self->metrics_.requestEnd(session->startedAt, error);
     if (session->span) tracing::SpanEnd(session->span.get());
+    static_cast<void>(self->pending_.pop(session->streamId));
     session->operation.reset();
   }
 
@@ -451,11 +522,12 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         break;
       }
     }
+    session->terminalStarted.store(true, std::memory_order_release);
     session->lifetime.close();
     session->lifetime.wait();
-    static_cast<void>(pending_.pop(streamId));
     this->callEnd(session->context, error, session->state);
     this->metrics_.requestEnd(session->startedAt, error);
+    static_cast<void>(pending_.pop(streamId));
   }
 
   ClientFunction client_;
@@ -464,7 +536,6 @@ class BidirectionalStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
   detail::StreamingRegistry<SessionCell> sessions_;
   detail::StreamingActivity operations_;
   boost::asio::any_io_executor executor_;
-  boost::asio::any_io_executor continuationExecutor_;
 };
 
 }  // namespace servicelib::datasink::grpc

@@ -74,7 +74,7 @@ class Sender final {
   }
 
  private:
-  std::mutex mu_;
+  servicelib::detail::CooperativeMutex mu_;
   Send send_;
   std::shared_ptr<tracing::Span> span_;
   bool active_{true};
@@ -102,7 +102,7 @@ struct RequestState final {
   servicelib::detail::SingleUseEvent done;
   std::atomic<bool> doneSent{false};
   std::atomic<bool> pendingInserted{false};
-  std::shared_mutex lifetimeMutex;
+  servicelib::detail::CooperativeSharedMutex lifetimeMutex;
   std::mutex callbacksMutex;
   std::unordered_map<std::string, std::shared_ptr<Callback>> callbacks;
 };
@@ -263,10 +263,10 @@ class Endpoint : public IEndpoint {
  public:
   [[nodiscard]] int id() const noexcept override { return endpointId_; }
   void start(Context context) override {
-    if (hasResult_) pending_.start(std::move(context));
+    pending_.start(std::move(context));
   }
   void stop(Context context) override {
-    if (hasResult_) pending_.stop(std::move(context));
+    pending_.stop(std::move(context));
   }
 
   [[nodiscard]] config::GrpcEndpointConfig endpointConfig() const {
@@ -349,10 +349,11 @@ class Endpoint : public IEndpoint {
   }
 
   void activate(const std::shared_ptr<Request>& request) {
-    if (!hasResult_) return;
+    // Reserve the RPC ID even without a result stream. set() rejects an
+    // existing key atomically; a rejected request never owns that registration.
     pending_.set(std::string{request->context.streamId()}, request);
     request->pendingInserted.store(true, std::memory_order_release);
-    if (metrics_.enabled()) {
+    if (hasResult_ && metrics_.enabled()) {
       metrics_.pendingAdd(request->context.streamId());
     }
   }
@@ -389,7 +390,13 @@ class Endpoint : public IEndpoint {
 
   void waitDone(const std::shared_ptr<Request>& request) {
     if (hasResult_) {
-      request->done.Wait();
+      if (!request->done.IsReady()) {
+        servicelib::detail::CooperativeExecution::Await(
+            [&] { return request->done.AsyncWait(request->context); });
+      }
+      if (request->context.cancelled() && !request->done.IsReady()) {
+        throw RpcCancelledError{};
+      }
       if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
     }
   }
@@ -414,18 +421,26 @@ class Endpoint : public IEndpoint {
       error = nullptr;
       if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
     }
-    if (request->pendingInserted.exchange(false, std::memory_order_acq_rel)) {
-      static_cast<void>(pending_.pop(std::string{request->context.streamId()}));
-      if (metrics_.enabled()) {
-        metrics_.pendingRemove(std::string{request->context.streamId()});
-      }
-    }
-    request->sender->close();
+    // Stop accepting results, but keep the ID reserved while EndRequest runs.
+    // In particular, an EndRequest callback may itself deliver a late result;
+    // consumeResult must discard it without waiting on this exclusive lock.
+    const bool registered =
+        request->pendingInserted.exchange(false, std::memory_order_acq_rel);
+    std::exception_ptr endError;
     try {
       handler_.endRequest(request->context, streamContext_, error,
                           request->state);
     } catch (...) {
-      const auto endError = std::current_exception();
+      endError = std::current_exception();
+    }
+    request->sender->close();
+    if (registered) {
+      static_cast<void>(pending_.pop(std::string{request->context.streamId()}));
+      if (hasResult_ && metrics_.enabled()) {
+        metrics_.pendingRemove(std::string{request->context.streamId()});
+      }
+    }
+    if (endError) {
       if (auto* traceSpan = request->span.get()) {
         tracing::SpanError(traceSpan, tracing::ExceptionMessage(endError));
       }
@@ -444,15 +459,24 @@ class Endpoint : public IEndpoint {
       return;
     }
     const std::string streamId{context.streamId()};
+    if (!hasResult_) {
+      metrics_.lateResult(streamId);
+      return;
+    }
     auto found = pending_.get(streamId);
     if (!found) {
       metrics_.lateResult(streamId);
       return;
     }
     auto request = *found;
+    if (!request->pendingInserted.load(std::memory_order_acquire)) {
+      metrics_.lateResult(streamId);
+      return;
+    }
     std::shared_lock lifetimeLock(request->lifetimeMutex);
     const auto current = pending_.get(streamId);
-    if (!current || *current != request) {
+    if (!request->pendingInserted.load(std::memory_order_acquire) ||
+        !current || *current != request) {
       metrics_.lateResult(streamId);
       if (auto* traceSpan = request->span.get()) traceSpan->addEvent("late_result");
       return;

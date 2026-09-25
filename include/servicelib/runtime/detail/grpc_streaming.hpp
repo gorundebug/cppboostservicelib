@@ -11,14 +11,9 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/detached.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/redirect_error.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
-#include <chrono>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -28,114 +23,6 @@
 #include <vector>
 
 namespace servicelib::grpc_transport {
-
-namespace detail {
-
-template <typename T>
-class AsyncQueue final {
- public:
-  void push(T value) {
-    std::vector<std::shared_ptr<boost::asio::steady_timer>> waiters;
-    {
-      std::lock_guard lock(mutex_);
-      if (closed_) return;
-      values_.push_back(std::move(value));
-      collectWaiters(waiters);
-    }
-    wake(std::move(waiters));
-  }
-
-  void close() {
-    std::vector<std::shared_ptr<boost::asio::steady_timer>> waiters;
-    {
-      std::lock_guard lock(mutex_);
-      if (closed_) return;
-      closed_ = true;
-      collectWaiters(waiters);
-    }
-    wake(std::move(waiters));
-  }
-
-  boost::asio::awaitable<std::optional<T>> pop() {
-    const auto executor = co_await boost::asio::this_coro::executor;
-    for (;;) {
-      auto timer = std::make_shared<boost::asio::steady_timer>(
-          executor, std::chrono::steady_clock::time_point::max());
-      {
-        std::lock_guard lock(mutex_);
-        if (!values_.empty()) {
-          auto value = std::move(values_.front());
-          values_.pop_front();
-          co_return value;
-        }
-        if (closed_) co_return std::nullopt;
-        waiters_.push_back(timer);
-      }
-      boost::system::error_code error;
-      co_await timer->async_wait(
-          boost::asio::redirect_error(boost::asio::use_awaitable, error));
-    }
-  }
-
- private:
-  void collectWaiters(
-      std::vector<std::shared_ptr<boost::asio::steady_timer>>& result) {
-    for (auto& waiter : waiters_) {
-      if (auto timer = waiter.lock()) result.push_back(std::move(timer));
-    }
-    waiters_.clear();
-  }
-
-  static void wake(
-      std::vector<std::shared_ptr<boost::asio::steady_timer>> waiters) {
-    for (auto& waiter : waiters) {
-      boost::asio::dispatch(waiter->get_executor(),
-                            [waiter] { waiter->cancel(); });
-    }
-  }
-
-  std::mutex mutex_;
-  std::deque<T> values_;
-  std::vector<std::weak_ptr<boost::asio::steady_timer>> waiters_;
-  bool closed_{false};
-};
-
-struct WriterCompletion final {
-  servicelib::detail::SingleUseEvent done;
-  std::mutex mutex;
-  std::exception_ptr error;
-};
-
-template <typename RPC, typename Response>
-void StartWriter(RPC& rpc, std::shared_ptr<AsyncQueue<Response>> queue,
-                 std::shared_ptr<WriterCompletion> completion) {
-  boost::asio::co_spawn(
-      servicelib::detail::ParallelExecutorRegistry::Get(),
-      [&rpc, queue]() -> boost::asio::awaitable<void> {
-        while (auto response = co_await queue->pop()) {
-          if (!co_await rpc.write(*response, boost::asio::use_awaitable)) {
-            throw std::runtime_error("gRPC stream write cancelled");
-          }
-        }
-      },
-      [&rpc, completion](std::exception_ptr error) noexcept {
-        const bool failed = static_cast<bool>(error);
-        {
-          std::lock_guard lock(completion->mutex);
-          completion->error = std::move(error);
-        }
-        if (failed) rpc.context().TryCancel();
-        completion->done.Send();
-      });
-}
-
-inline std::exception_ptr WriterError(
-    const std::shared_ptr<WriterCompletion>& completion) {
-  std::lock_guard lock(completion->mutex);
-  return completion->error;
-}
-
-}  // namespace detail
 
 template <typename Response>
 struct StreamResult final {
@@ -223,6 +110,8 @@ BidirectionalStreamCall(
 template <typename Endpoint, typename RPC>
 boost::asio::awaitable<typename RPC::Response> HandleClientStreamingSource(
     Endpoint& endpoint, RPC& rpc, MessageContext transportContext) {
+  co_return co_await servicelib::detail::CooperativeExecution::Run(
+      [&endpoint, &rpc, transportContext = std::move(transportContext)]() mutable -> typename RPC::Response {
   using Response = typename RPC::Response;
   using Request = typename Endpoint::Request;
   auto startedSpan = endpoint.startTrace(transportContext);
@@ -247,33 +136,41 @@ boost::asio::awaitable<typename RPC::Response> HandleClientStreamingSource(
   *requestSlot = request;
   const auto startedAt = endpoint.metrics().requestStart();
   std::exception_ptr error;
+  bool resultWaitFailed = false;
   try {
     endpoint.activate(request);
     typename RPC::Request value;
     std::int64_t messageCount = 0;
-    while (co_await rpc.read(value, boost::asio::use_awaitable)) {
+    while (servicelib::detail::CooperativeExecution::Await([&] { return rpc.read(value, boost::asio::use_awaitable); })) {
       endpoint.consume(request, value);
       value = typename RPC::Request{};
       ++messageCount;
     }
     endpoint.eof(request, messageCount);
     if (endpoint.hasResult()) {
-      co_await request->done.AsyncWait();
-      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
+      resultWaitFailed = true;
+      endpoint.waitDone(request);
+      resultWaitFailed = false;
+    } else {
+      request->sender->send(Response{});
     }
   } catch (...) {
     error = std::current_exception();
-    endpoint.recordFailure(request, error);
+    if (!resultWaitFailed) endpoint.recordFailure(request, error);
   }
   try {
-    endpoint.finish(request, error);
+    endpoint.finish(request, error, [&] {
+      return resultWaitFailed && request->done.IsReady();
+    });
   } catch (...) {
     if (!error) error = std::current_exception();
   }
+  if (error && resultWaitFailed) endpoint.recordFailure(request, error);
   endpoint.metrics().requestEnd(startedAt, error);
   if (error) std::rethrow_exception(error);
   std::lock_guard lock(responseMutex);
-  co_return response ? std::move(*response) : Response{};
+  return response ? std::move(*response) : Response{};
+      });
 }
 
 template <typename Endpoint, typename RPC>
@@ -287,41 +184,48 @@ template <typename Endpoint, typename RPC>
 boost::asio::awaitable<void> HandleServerStreamingSource(
     Endpoint& endpoint, RPC& rpc, const typename RPC::Request& value,
     MessageContext transportContext) {
+  co_return co_await servicelib::detail::CooperativeExecution::Run(
+      [&endpoint, &rpc, &value, transportContext = std::move(transportContext)]() mutable -> void {
   using Response = typename RPC::Response;
   auto startedSpan = endpoint.startTrace(transportContext);
-  auto queue = std::make_shared<detail::AsyncQueue<Response>>();
-  auto completion = std::make_shared<detail::WriterCompletion>();
   auto sender =
       std::make_shared<datasource::grpc::Sender<Response>>(
-      [queue](Response response) { queue->push(std::move(response)); },
+      [&rpc](Response response) {
+        if (!servicelib::detail::CooperativeExecution::Await(
+                [&] { return rpc.write(response, boost::asio::use_awaitable); })) {
+          throw std::runtime_error("gRPC stream write cancelled");
+        }
+      },
       startedSpan.sharedSpan());
   auto request = endpoint.begin(transportContext, std::move(sender),
                                 startedSpan.sharedSpan());
   const auto startedAt = endpoint.metrics().requestStart();
-  detail::StartWriter(rpc, queue, completion);
   std::exception_ptr error;
+  bool resultWaitFailed = false;
   try {
     endpoint.activate(request);
     endpoint.consume(request, value);
     endpoint.eof(request);
     if (endpoint.hasResult()) {
-      co_await request->done.AsyncWait();
-      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
+      resultWaitFailed = true;
+      endpoint.waitDone(request);
+      resultWaitFailed = false;
     }
   } catch (...) {
     error = std::current_exception();
-    endpoint.recordFailure(request, error);
+    if (!resultWaitFailed) endpoint.recordFailure(request, error);
   }
-  queue->close();
-  co_await completion->done.AsyncWait();
-  if (!error) error = detail::WriterError(completion);
   try {
-    endpoint.finish(request, error);
+    endpoint.finish(request, error, [&] {
+      return resultWaitFailed && request->done.IsReady();
+    });
   } catch (...) {
     if (!error) error = std::current_exception();
   }
+  if (error && resultWaitFailed) endpoint.recordFailure(request, error);
   endpoint.metrics().requestEnd(startedAt, error);
   if (error) std::rethrow_exception(error);
+      });
 }
 
 template <typename Endpoint, typename RPC>
@@ -334,47 +238,54 @@ boost::asio::awaitable<void> HandleServerStreamingSource(
 template <typename Endpoint, typename RPC>
 boost::asio::awaitable<void> HandleBidirectionalStreamingSource(
     Endpoint& endpoint, RPC& rpc, MessageContext transportContext) {
+  co_return co_await servicelib::detail::CooperativeExecution::Run(
+      [&endpoint, &rpc, transportContext = std::move(transportContext)]() mutable -> void {
   using Response = typename RPC::Response;
   auto startedSpan = endpoint.startTrace(transportContext);
-  auto queue = std::make_shared<detail::AsyncQueue<Response>>();
-  auto completion = std::make_shared<detail::WriterCompletion>();
   auto sender =
       std::make_shared<datasource::grpc::Sender<Response>>(
-      [queue](Response response) { queue->push(std::move(response)); },
+      [&rpc](Response response) {
+        if (!servicelib::detail::CooperativeExecution::Await(
+                [&] { return rpc.write(response, boost::asio::use_awaitable); })) {
+          throw std::runtime_error("gRPC stream write cancelled");
+        }
+      },
       startedSpan.sharedSpan());
   auto request = endpoint.begin(transportContext, std::move(sender),
                                 startedSpan.sharedSpan());
   const auto startedAt = endpoint.metrics().requestStart();
-  detail::StartWriter(rpc, queue, completion);
   std::exception_ptr error;
+  bool resultWaitFailed = false;
   try {
     endpoint.activate(request);
     typename RPC::Request value;
     std::int64_t messageCount = 0;
-    while (co_await rpc.read(value, boost::asio::use_awaitable)) {
+    while (servicelib::detail::CooperativeExecution::Await([&] { return rpc.read(value, boost::asio::use_awaitable); })) {
       endpoint.consume(request, value);
       value = typename RPC::Request{};
       ++messageCount;
     }
     endpoint.eof(request, messageCount);
     if (endpoint.hasResult()) {
-      co_await request->done.AsyncWait();
-      if (auto* traceSpan = request->span.get()) traceSpan->addEvent("done_received");
+      resultWaitFailed = true;
+      endpoint.waitDone(request);
+      resultWaitFailed = false;
     }
   } catch (...) {
     error = std::current_exception();
-    endpoint.recordFailure(request, error);
+    if (!resultWaitFailed) endpoint.recordFailure(request, error);
   }
-  queue->close();
-  co_await completion->done.AsyncWait();
-  if (!error) error = detail::WriterError(completion);
   try {
-    endpoint.finish(request, error);
+    endpoint.finish(request, error, [&] {
+      return resultWaitFailed && request->done.IsReady();
+    });
   } catch (...) {
     if (!error) error = std::current_exception();
   }
+  if (error && resultWaitFailed) endpoint.recordFailure(request, error);
   endpoint.metrics().requestEnd(startedAt, error);
   if (error) std::rethrow_exception(error);
+      });
 }
 
 template <typename Endpoint, typename RPC>

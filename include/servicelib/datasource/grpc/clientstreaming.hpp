@@ -45,6 +45,7 @@ class ClientStreamingEndpoint final
     *requestSlot = request;
     const auto startedAt = this->metrics().requestStart();
     std::exception_ptr error;
+    bool resultWaitFailed = false;
     try {
       this->activate(request);
       Req value;
@@ -54,16 +55,22 @@ class ClientStreamingEndpoint final
         ++messageCount;
       }
       this->eof(request, messageCount);
+      if (!this->hasResult()) request->sender->send(Res{});
+      resultWaitFailed = true;
       this->waitDone(request);
+      resultWaitFailed = false;
     } catch (...) {
       error = std::current_exception();
-      this->recordFailure(request, error);
+      if (!resultWaitFailed) this->recordFailure(request, error);
     }
     try {
-      this->finish(request, error);
+      this->finish(request, error, [&] {
+        return resultWaitFailed && request->done.IsReady();
+      });
     } catch (...) {
       if (!error) error = std::current_exception();
     }
+    if (error && resultWaitFailed) this->recordFailure(request, error);
     this->metrics().requestEnd(startedAt, error);
     if (error) std::rethrow_exception(error);
     return response ? std::move(*response) : Res{};

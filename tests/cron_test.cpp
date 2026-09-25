@@ -12,6 +12,9 @@
 
 #include <atomic>
 #include <thread>
+#include <array>
+
+#include "test_async.hpp"
 
 #include <servicelib/datasource/cron/libcron.hpp>
 
@@ -45,4 +48,33 @@ TEST(CronDataSource, WaitsForCorrelatedPipelineResult) {
                 kCompleted);
   waiting.join();
   EXPECT_TRUE(completed.load(std::memory_order_acquire));
+}
+
+TEST(CronDataSource, CorrelatedWaitDoesNotOccupyExecutorWorkers) {
+  test_async::AsioRuntime runtime;
+  servicelib::datasource::cron::detail::ResultWaiter waiter;
+  std::array<std::string, 4> ids{"cron-0", "cron-1", "cron-2", "cron-3"};
+  std::atomic<unsigned> entered{0};
+  std::atomic<unsigned> finished{0};
+  test_async::Event allEntered;
+  test_async::Event allFinished;
+  test_async::Event delivered;
+  for (const auto& id : ids) {
+    auto pending = waiter.begin(id);
+    servicelib::detail::ParallelExecutorRegistry::Post([&, id, pending] {
+      if (entered.fetch_add(1) == ids.size() - 1) allEntered.Send();
+      waiter.wait(id, pending);
+      if (finished.fetch_add(1) == ids.size() - 1) allFinished.Send();
+    });
+  }
+  EXPECT_TRUE(allEntered.WaitForEvent());
+  servicelib::detail::ParallelExecutorRegistry::Post([&] {
+    for (const auto& id : ids) static_cast<void>(waiter.complete(id));
+    delivered.Send();
+  });
+  EXPECT_TRUE(delivered.WaitForEventFor(std::chrono::milliseconds{200}));
+  // Rescue a blocking implementation so a failed assertion does not hang CTest.
+  for (const auto& id : ids) static_cast<void>(waiter.complete(id));
+  EXPECT_TRUE(allFinished.WaitForEvent());
+  EXPECT_TRUE(delivered.WaitForEvent());
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <servicelib/runtime/detail/sync.hpp>
 
 #include <servicelib/datasink/grpc/common.hpp>
 
@@ -24,13 +25,8 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
         client_(std::move(client)) {}
 
   void consume(MessageContext context, Payload<T> payload) {
-    if constexpr (requires(ClientFunction& client, Req request,
-                           CallOptions options, AsyncCompletion completion) {
-                    client.async(std::move(request), std::move(options),
-                                 std::move(completion));
-                  }) {
-      consumeAsync(std::move(context), std::move(payload));
-    } else {
+    auto operation = this->asyncOperations_.acquire();
+    auto completion = context.retainCompletionToken();
       auto startedSpan = this->startTrace(context);
     std::optional<servicelib::BeginResult<typename Handler::State>> begin;
     try {
@@ -62,7 +58,8 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     std::optional<Res> response;
     if (!error) {
       try {
-        response.emplace(std::invoke(client_, std::move(*request),
+        if (!operation) throw std::runtime_error("gRPC sink endpoint is stopped");
+        response.emplace(callClient(std::move(*request),
                                      callOptions(requestContext, this->tracingEnabled())));
         if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("grpc_call");
       } catch (...) {
@@ -82,109 +79,35 @@ class NoStreamingEndpoint final : public Endpoint<T, R, Handler, E> {
     }
     this->callEnd(context, error, begin->state);
       this->metrics_.requestEnd(startedAt, error);
-    }
   }
 
  private:
-  struct AsyncState final {
-    MessageContext context;
-    typename Handler::State state;
-    DataSinkEndpointMetrics::Clock::time_point startedAt;
-    std::shared_ptr<tracing::Span> span;
-    std::shared_ptr<servicelib::detail::AsyncOperations::Token> operation;
-    servicelib::AsyncCompletionToken completion;
-  };
-
-  void consumeAsync(MessageContext context, Payload<T> payload) {
-    auto completion = context.retainCompletionToken();
-    auto trace = this->startDetachedTrace(std::move(context));
-    context = std::move(trace.context);
-    std::optional<servicelib::BeginResult<typename Handler::State>> begin;
-    try {
-      begin.emplace(this->handler_.beginRequest(context, this->streamContext_));
-    } catch (...) {
-      const auto error = std::current_exception();
-      this->traceError(trace.span.get(), error, "begin_request.error");
-      this->metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
-      if (trace.span) tracing::SpanEnd(trace.span.get());
-      return;
-    }
-    if (auto* traceSpan = trace.span.get()) traceSpan->addEvent("begin_request");
-    context = std::move(begin->context);
-    const auto requestContext = this->newRequestStreamId(context);
-    const auto startedAt = this->metrics_.requestStart();
-    std::optional<Req> request;
-    std::exception_ptr error;
-    try {
-      Sender<Req> sender{[&](Req value) { request.emplace(std::move(value)); }};
-      this->handler_.consumeMessage(context, this->streamContext_, begin->state,
-                                    payload.get(), sender, ResultContext{});
-      if (!request) {
-        throw std::runtime_error("gRPC sink handler sent no request");
-      }
-      if (auto* traceSpan = trace.span.get()) traceSpan->addEvent("consume_message");
-    } catch (...) {
-      error = std::current_exception();
-      this->traceError(trace.span.get(), error, "consume_message.error");
-    }
-    if (error) {
-      this->callEnd(context, error, begin->state);
-      this->metrics_.requestEnd(startedAt, error);
-      if (trace.span) tracing::SpanEnd(trace.span.get());
-      return;
-    }
-
-    auto operation = this->asyncOperations_.acquire();
-    if (!operation) {
-      error = std::make_exception_ptr(
-          std::runtime_error("gRPC sink endpoint is stopped"));
-      this->traceError(trace.span.get(), error, "grpc_call.error");
-      this->callEnd(context, error, begin->state);
-      this->metrics_.requestEnd(startedAt, error);
-      if (trace.span) tracing::SpanEnd(trace.span.get());
-      return;
-    }
-
-    auto state = std::make_shared<AsyncState>(AsyncState{
-        std::move(context), std::move(begin->state), startedAt,
-        std::move(trace.span), std::move(operation), std::move(completion)});
-    try {
-      client_.async(
-          std::move(*request), callOptions(requestContext, this->tracingEnabled()),
-          [this, state](std::exception_ptr callError,
-                        std::optional<Res> response) mutable noexcept {
-            if (!callError && !response) {
-              callError = std::make_exception_ptr(
-                  std::runtime_error("gRPC call returned no response"));
-            }
-            if (!callError) {
-              try {
-                if (auto* traceSpan = state->span.get()) traceSpan->addEvent("grpc_call");
-                this->handler_.handleResponse(
-                    state->context, this->streamContext_, state->state,
-                    *response);
-                if (auto* traceSpan = state->span.get()) traceSpan->addEvent("handle_response");
-              } catch (...) {
-                callError = std::current_exception();
-                this->traceError(state->span.get(), callError,
-                                 "handle_response.error");
-              }
-            } else {
-              this->traceError(state->span.get(), callError,
-                               "grpc_call.error");
-            }
-            this->callEnd(state->context, callError, state->state);
-            this->metrics_.requestEnd(state->startedAt, callError);
-            if (state->span) tracing::SpanEnd(state->span.get());
-            state->completion.reset();
+  Res callClient(Req request, CallOptions options) {
+    if constexpr (requires(ClientFunction& client, AsyncCompletion completion) {
+                    client.async(std::move(request), std::move(options),
+                                 std::move(completion));
+                  }) {
+      struct Pending final {
+        servicelib::detail::SingleUseEvent done;
+        std::exception_ptr error;
+        std::optional<Res> response;
+      };
+      auto pending = std::make_shared<Pending>();
+      client_.async(std::move(request), std::move(options),
+          [pending](std::exception_ptr error, std::optional<Res> response) {
+            pending->error = std::move(error);
+            pending->response = std::move(response);
+            pending->done.Send();
           });
-    } catch (...) {
-      error = std::current_exception();
-      this->traceError(state->span.get(), error, "grpc_call.error");
-      this->callEnd(state->context, error, state->state);
-      this->metrics_.requestEnd(state->startedAt, error);
-      if (state->span) tracing::SpanEnd(state->span.get());
-      state->completion.reset();
+      // The completion callback only publishes the transport result. Business
+      // handlers resume on the caller's stack, never on a CQ callback worker.
+      pending->done.Wait();
+      if (pending->error) std::rethrow_exception(pending->error);
+      if (!pending->response)
+        throw std::runtime_error("gRPC call returned no response");
+      return std::move(*pending->response);
+    } else {
+      return std::invoke(client_, std::move(request), std::move(options));
     }
   }
 

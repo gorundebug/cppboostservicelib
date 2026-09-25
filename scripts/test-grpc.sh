@@ -22,7 +22,8 @@ docker run --rm \
     -DCPPBOOSTSERVICELIB_BUILD_TESTS=ON \
     && cmake --build build/grpc-docker --parallel ${CMAKE_BUILD_PARALLEL_LEVEL:+"$CMAKE_BUILD_PARALLEL_LEVEL"} \
       --target cppboostservicelib_grpc_runtime_test \
+               cppboostservicelib_grpc_endpoints_test \
                cppboostservicelib_grpc_unary_test \
                cppboostservicelib_grpc_streaming_test \
     && ctest --test-dir build/grpc-docker --output-on-failure \
-      -R 'cppboostservicelib_grpc_(runtime|unary|streaming)_test'"
+      -R 'cppboostservicelib_grpc_(runtime|endpoints|unary|streaming)_test'"

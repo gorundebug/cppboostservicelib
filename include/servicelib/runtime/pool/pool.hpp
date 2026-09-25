@@ -72,6 +72,8 @@ class IDelayPool {
   // that deadline becomes the effective delay. Explicit cancellation or ctx
   // deadline expiry executes fn early; exactly one path is allowed to win.
   // A non-positive effective delay still executes asynchronously.
+  // An already-cancelled/expired ctx is rejected before admission and fn is
+  // not called. Early execution on cancellation applies to accepted tasks.
   virtual void delay(Context ctx, Duration delay, std::function<void()> fn) = 0;
 };
 

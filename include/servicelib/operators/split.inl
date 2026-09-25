@@ -281,8 +281,9 @@
       // environment explicitly. Operators created from a branch then keep
       // runtime-config reload and telemetry semantics identical to Go.
       std::apply(
-          [env, &cfg, index = std::size_t{0}](auto&... link) mutable {
-            ((link.setEnv(env),
+          [env, serde, &cfg, index = std::size_t{0}](auto&... link) mutable {
+            ((link.serde_ = serde,
+              link.setEnv(env),
               link.setName(
                   (cfg.name + "SplitLink" + std::to_string(index++)).c_str())),
              ...);

@@ -39,6 +39,7 @@ class BidirectionalStreamingEndpoint final
                                startedSpan.sharedSpan());
     const auto startedAt = this->metrics().requestStart();
     std::exception_ptr error;
+    bool resultWaitFailed = false;
     try {
       this->activate(request);
       Req value;
@@ -48,16 +49,21 @@ class BidirectionalStreamingEndpoint final
         ++messageCount;
       }
       this->eof(request, messageCount);
+      resultWaitFailed = true;
       this->waitDone(request);
+      resultWaitFailed = false;
     } catch (...) {
       error = std::current_exception();
-      this->recordFailure(request, error);
+      if (!resultWaitFailed) this->recordFailure(request, error);
     }
     try {
-      this->finish(request, error);
+      this->finish(request, error, [&] {
+        return resultWaitFailed && request->done.IsReady();
+      });
     } catch (...) {
       if (!error) error = std::current_exception();
     }
+    if (error && resultWaitFailed) this->recordFailure(request, error);
     this->metrics().requestEnd(startedAt, error);
     if (error) std::rethrow_exception(error);
   }

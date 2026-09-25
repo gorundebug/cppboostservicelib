@@ -5,26 +5,109 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <servicelib/runtime/context.hpp>
 #include <servicelib/runtime/detail/asio_dispatch.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <servicelib/runtime/environment.hpp>
 #include <servicelib/runtime/pool/delaypool.hpp>
 #include <servicelib/runtime/pool/prioritytaskpool.hpp>
 #include <servicelib/runtime/pool/taskpool.hpp>
 
 namespace servicelib {
+
+namespace detail {
+
+// The task owns its callback independently of the lifetime of a bounded wait.
+// ServiceApp retains the complete host until deferred shutdown has finished.
+class ShutdownTask final {
+  struct State final {
+    std::mutex mutex;
+    bool complete{};
+    std::exception_ptr error;
+    SingleUseEvent done;
+    std::shared_ptr<SingleUseEvent> waiter;
+  };
+
+ public:
+  template <typename Function>
+  explicit ShutdownTask(Function&& function) : state_(std::make_shared<State>()) {
+    std::thread worker(
+        [state = state_, callback = std::optional<std::decay_t<Function>>{
+             std::in_place, std::forward<Function>(function)}]() mutable {
+          std::exception_ptr error;
+          try { std::invoke(*callback); }
+          catch (...) { error = std::current_exception(); }
+          callback.reset();
+          std::shared_ptr<SingleUseEvent> waiter;
+          {
+            std::lock_guard lock(state->mutex);
+            state->error = std::move(error);
+            state->complete = true;
+            waiter = std::move(state->waiter);
+          }
+          state->done.Send();
+          if (waiter) waiter->Send();
+        });
+    worker.detach();
+  }
+
+  bool ready() const {
+    std::lock_guard lock(state_->mutex);
+    return state_->complete;
+  }
+
+  bool wait(Context context) const {
+    auto wake = std::make_shared<SingleUseEvent>();
+    {
+      std::lock_guard lock(state_->mutex);
+      if (state_->complete) return true;
+      state_->waiter = wake;
+    }
+    using Callback = std::stop_callback<std::function<void()>>;
+    std::vector<std::unique_ptr<Callback>> cancellations;
+    const auto subscribe = [&](std::stop_token token) {
+      if (token.stop_possible()) {
+        cancellations.push_back(std::make_unique<Callback>(
+            token, [wake] { wake->Send(); }));
+      }
+    };
+    subscribe(context.stopToken());
+    for (auto token : context.externalStopTokens()) subscribe(token);
+    if (!context.cancelled()) {
+      if (context.deadline()) static_cast<void>(wake->WaitUntil(*context.deadline()));
+      else wake->Wait();
+    }
+    return ready();
+  }
+
+  std::exception_ptr get() const {
+    if (!ready()) state_->done.Wait();
+    std::lock_guard lock(state_->mutex);
+    return state_->error;
+  }
+
+ private:
+  std::shared_ptr<State> state_;
+};
+
+}  // namespace detail
 
 enum class ServiceComponentKind : std::size_t {
   kDataSource,
@@ -156,6 +239,21 @@ class ServiceLifecycle final {
     stopPhase(context, logger, sinks);
 
     state_ = State::kStopped;
+    if (!hasPendingShutdown()) finishShutdown(logger);
+  }
+
+  bool hasPendingShutdown() const {
+    for (const auto& pending : pendingStops_) {
+      if (!pending.task.ready()) return true;
+    }
+    return false;
+  }
+
+  void finishShutdown(log::Logger& logger = log::NoopLogger::instance()) {
+    for (auto& pending : pendingStops_) {
+      reportStop(pending, pending.task.get(), logger);
+    }
+    pendingStops_.clear();
     clear();
   }
 
@@ -169,6 +267,12 @@ class ServiceLifecycle final {
     std::function<void(Context)> start;
     std::function<void(Context)> stop;
     std::function<void()> onStopTimeout;
+  };
+
+  struct PendingStop final {
+    Entry* entry;
+    detail::ShutdownTask task;
+    bool reported{};
   };
 
   static constexpr std::size_t index(ServiceComponentKind kind) noexcept {
@@ -286,73 +390,46 @@ class ServiceLifecycle final {
     }
   }
 
-  static void stopPhase(Context context, log::Logger& logger,
+  void stopPhase(Context context, log::Logger& logger,
                         const std::vector<Entry*>& entries) {
     if (entries.empty()) return;
-
-    std::vector<std::future<std::exception_ptr>> tasks;
-    tasks.reserve(entries.size());
+    const auto first = pendingStops_.size();
+    pendingStops_.reserve(first + entries.size());
     for (auto* entry : entries) {
-      // stop() may synchronously join the component's own blocking-executor
-      // work. A per-component control task preserves canonical parallel stop
-      // semantics without occupying a reactor worker or deadlocking the same
-      // bounded executor that is being drained.
       auto stop = entry->stop;
       auto owner = entry->owner;
-      tasks.push_back(std::async(
-          std::launch::async,
+      pendingStops_.push_back(PendingStop{entry, detail::ShutdownTask(
           [stop = std::move(stop), owner = std::move(owner),
-           context]() mutable -> std::exception_ptr {
+           context]() mutable {
             static_cast<void>(owner);
-            try {
-              stop(std::move(context));
-              return {};
-            } catch (...) {
-              return std::current_exception();
-            }
-          }));
+            stop(std::move(context));
+          })});
     }
-
-    bool ready = true;
-    if (context.deadline()) {
-      for (auto& task : tasks) {
-        if (task.wait_until(*context.deadline()) != std::future_status::ready) {
-          ready = false;
+    for (auto i = first; i < pendingStops_.size(); ++i) {
+      auto& pending = pendingStops_[i];
+      if (!pending.task.wait(context)) {
+        if (pending.entry->onStopTimeout) pending.entry->onStopTimeout();
+        else {
+          logFailure(logger, "service shutdown operation timed out", *pending.entry);
         }
+        continue;
       }
-    } else {
-      for (auto& task : tasks) task.wait();
+      reportStop(pending, pending.task.get(), logger);
     }
+  }
 
-    if (!ready) {
-      for (std::size_t i = 0; i < tasks.size(); ++i) {
-        if (tasks[i].wait_for(std::chrono::steady_clock::duration::zero()) !=
-            std::future_status::ready) {
-          if (entries[i]->onStopTimeout) {
-            entries[i]->onStopTimeout();
-          } else {
-            logFailure(logger, "service shutdown operation timed out",
-                       *entries[i]);
-          }
-        }
-      }
-    }
-
-    // Never release component or graph ownership while stop() is still using
-    // it. The deadline is reported above; the process supervisor remains the
-    // hard upper bound if foreign or user code refuses to quiesce.
-    for (auto& task : tasks) task.wait();
-
-    for (std::size_t i = 0; i < tasks.size(); ++i) {
-      const auto error = tasks[i].get();
-      if (!error) continue;
+  static void reportStop(PendingStop& pending, std::exception_ptr error,
+                         log::Logger& logger) {
+    if (pending.reported) return;
+    pending.reported = true;
+    if (error) {
       try {
         std::rethrow_exception(error);
       } catch (const std::exception& ex) {
-        logFailure(logger, "service shutdown operation failed", *entries[i],
+        logFailure(logger, "service shutdown operation failed", *pending.entry,
                    ex.what());
       } catch (...) {
-        logFailure(logger, "service shutdown operation failed", *entries[i],
+        logFailure(logger, "service shutdown operation failed", *pending.entry,
                    "unknown exception");
       }
     }
@@ -394,6 +471,7 @@ class ServiceLifecycle final {
              static_cast<std::size_t>(ServiceComponentKind::kCount)>
       entries_;
   std::vector<Entry*> started_;
+  std::vector<PendingStop> pendingStops_;
   State state_{State::kCreated};
 };
 
@@ -403,6 +481,7 @@ class ServiceLifecycle final {
 template <typename TService, typename TDataTypeFactory>
 class ServiceApp
     : public ServiceExecutionEnvironment<TService, TDataTypeFactory>,
+      public std::enable_shared_from_this<TService>,
       public status::Provider {
  public:
   using ExecutionEnvironment =
@@ -493,18 +572,44 @@ class ServiceApp
     }
   }
 
+  void setShutdownLifetime(const std::shared_ptr<void>& lifetime) {
+    if (running_) throw std::logic_error("shutdown lifetime must be set before start");
+    shutdownLifetime_ = lifetime;
+  }
+
+  [[nodiscard]] std::shared_ptr<void> getShutdownLifetime() {
+    if (auto lifetime = shutdownLifetime_.lock()) return lifetime;
+    return this->weak_from_this().lock();
+  }
+
+  // Hosts keep their executor running until deferred shutdown work retires.
+  // Call after stop; a service whose startup failed has no shutdown to await.
+  void waitForShutdown() {
+    if (auto completed = shutdownComplete_.load(std::memory_order_acquire)) {
+      completed->Wait();
+    }
+  }
+
   void stop(Context context = {}) {
     if (!running_) return;
+    if (const auto service = this->getServiceConfigSnapshot();
+        service && service->shutdownTimeout > 0) {
+      context = context.bounded(std::chrono::milliseconds{service->shutdownTimeout});
+    }
+    auto lifetime = shutdownLifetime_.lock();
+    if (!lifetime) lifetime = this->weak_from_this().lock();
+    bool cancellable = context.deadline().has_value() || context.stopToken().stop_possible();
+    for (auto token : context.externalStopTokens()) cancellable |= token.stop_possible();
+    if (cancellable && !lifetime) {
+      throw std::logic_error("bounded service shutdown requires shared lifetime ownership");
+    }
+    shutdownComplete_.store(std::make_shared<detail::SingleUseEvent>(),
+                            std::memory_order_release);
     running_ = false;
     status::Registry::Unregister(*this);
 
     std::exception_ptr lifecycleError;
     try {
-      if (const auto service = this->getServiceConfigSnapshot();
-          service && service->shutdownTimeout > 0) {
-        context = context.bounded(
-            std::chrono::milliseconds{service->shutdownTimeout});
-      }
       lifecycle_.stopBeforeGraphDrain(context, this->getLogger());
     } catch (...) {
       lifecycleError = std::current_exception();
@@ -523,8 +628,18 @@ class ServiceApp
     } catch (...) {
       if (!lifecycleError) lifecycleError = std::current_exception();
     }
-    this->stopExecutionRuntime();
-    releaseOwnedRuntimeObjects();
+    if (lifecycle_.hasPendingShutdown() || !this->drainExecutionRuntime(context)) {
+      // Retain the complete host, including telemetry and transport runtime.
+      // The strong field also preserves safety if the control thread cannot start.
+      deferredLifetime_ = lifetime;
+      [[maybe_unused]] detail::ShutdownTask cleanup(
+          [this, lifetime = std::move(lifetime)] {
+            finishShutdown();
+            deferredLifetime_.reset();
+          });
+    } else {
+      finishShutdown();
+    }
     if (lifecycleError) std::rethrow_exception(lifecycleError);
   }
 
@@ -634,7 +749,19 @@ class ServiceApp
     priorityTaskPools_.clear();
   }
 
+  void finishShutdown() {
+    lifecycle_.finishShutdown(this->getLogger());
+    this->stopExecutionRuntime();
+    releaseOwnedRuntimeObjects();
+    if (auto completed = shutdownComplete_.load(std::memory_order_acquire)) {
+      completed->Send();
+    }
+  }
+
   ServiceLifecycle lifecycle_;
+  std::weak_ptr<void> shutdownLifetime_;
+  std::shared_ptr<void> deferredLifetime_;
+  std::atomic<std::shared_ptr<detail::SingleUseEvent>> shutdownComplete_;
   std::shared_ptr<pool::IDelayPool> delayPool_;
   std::unordered_map<std::string, std::shared_ptr<pool::ITaskPool>> taskPools_;
   std::unordered_map<std::string, std::shared_ptr<pool::IPriorityTaskPool>>

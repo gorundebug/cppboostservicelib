@@ -28,7 +28,7 @@ struct PendingResult final {
   servicelib::detail::SingleUseEvent done;
   std::atomic<bool> wakeSent{false};
   std::atomic<bool> completed{false};
-  std::shared_mutex lifetimeMutex;
+  servicelib::detail::CooperativeSharedMutex lifetimeMutex;
   std::mutex callbacksMutex;
   std::unordered_map<std::string, std::shared_ptr<Callback>> callbacks;
 };

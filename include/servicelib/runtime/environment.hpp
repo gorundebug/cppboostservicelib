@@ -6,17 +6,18 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <stop_token>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include <servicelib/runtime/caller.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
 #include <servicelib/runtime/status/status.hpp>
 
 namespace servicelib {
@@ -144,17 +145,19 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
       detail::ParallelExecutorRegistry::Post(
           [this, task = std::move(task)]() mutable {
             try {
-              std::invoke(std::move(task));
+              // Dispose of callback captures before declaring the graph work
+              // finished, including when the callback throws. Leaving them in
+              // the outer executor closure can outlive graph shutdown.
+              auto invocation = std::exchange(task, {});
+              std::invoke(std::move(invocation));
             } catch (...) {
               // ParallelCall has no synchronous error channel, matching the
               // canonical goroutine-per-message semantics.
             }
-            std::lock_guard lock(parallelMutex_);
-            if (--parallelActive_ == 0) parallelDrained_.notify_all();
+            finishParallelInvocation();
           });
     } catch (...) {
-      std::lock_guard lock(parallelMutex_);
-      if (--parallelActive_ == 0) parallelDrained_.notify_all();
+      finishParallelInvocation();
       throw;
     }
   }
@@ -290,21 +293,46 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
 
   bool drainExecutionRuntime(Context context = {}) noexcept {
     if (!activeRuntime_) return true;
-    bool drained = true;
-    {
-      std::unique_lock lock(parallelMutex_);
-      inputClosed_ = true;
-      const auto isDrained = [this] {
-        return inputInvocations_ == 0 && parallelActive_ == 0;
-      };
-      if (context.deadline()) {
-        drained = parallelDrained_.wait_until(lock, *context.deadline(),
-                                              isDrained);
-      } else {
-        parallelDrained_.wait(lock, isDrained);
+    std::unique_lock lock(parallelMutex_);
+    inputClosed_ = true;
+    const auto isDrained = [this] {
+      return inputInvocations_ == 0 && parallelActive_ == 0;
+    };
+    while (!isDrained()) {
+      // Allocate only while shutdown has outstanding graph work. A caller on
+      // the reactor must yield so admitted work and its children can finish.
+      if (!parallelDrained_) parallelDrained_ = std::make_shared<detail::SingleUseEvent>();
+      auto notification = parallelDrained_;
+      lock.unlock();
+      bool ready = !context.cancelled();
+      {
+        using Callback = std::stop_callback<std::function<void()>>;
+        std::vector<std::unique_ptr<Callback>> cancellations;
+        const auto subscribe = [&](std::stop_token token) {
+          if (token.stop_possible()) {
+            cancellations.push_back(std::make_unique<Callback>(
+                token, [notification] { notification->Send(); }));
+          }
+        };
+        subscribe(context.stopToken());
+        for (auto token : context.externalStopTokens()) subscribe(token);
+        if (ready) {
+          if (context.deadline()) {
+            ready = notification->WaitUntil(*context.deadline());
+          } else {
+            notification->Wait();
+          }
+        }
+      }
+      lock.lock();
+      if (!ready || context.cancelled()) {
+        // Cancellation wakes a waiter, not the graph-drained condition.
+        // Deferred cleanup must get a fresh event if work remains.
+        if (parallelDrained_ == notification) parallelDrained_.reset();
+        return isDrained();
       }
     }
-    return drained;
+    return true;
   }
 
   void stopExecutionRuntime() noexcept {
@@ -334,18 +362,30 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
                   "config-driven C++ graph directly");
     buildTopology();
     verifyTopology();
-    static ExecutionRuntime runtime(*this);
-    return runtime;
+    return executionRuntime_;
   }
 
  private:
   void finishInputInvocation() noexcept {
-    bool drained;
+    std::shared_ptr<detail::SingleUseEvent> notification;
     {
       std::lock_guard lock(parallelMutex_);
-      drained = --inputInvocations_ == 0;
+      --inputInvocations_;
+      if (inputInvocations_ == 0 && parallelActive_ == 0)
+        notification = std::move(parallelDrained_);
     }
-    if (drained) parallelDrained_.notify_all();
+    if (notification) notification->Send();
+  }
+
+  void finishParallelInvocation() noexcept {
+    std::shared_ptr<detail::SingleUseEvent> notification;
+    {
+      std::lock_guard lock(parallelMutex_);
+      --parallelActive_;
+      if (inputInvocations_ == 0 && parallelActive_ == 0)
+        notification = std::move(parallelDrained_);
+    }
+    if (notification) notification->Send();
   }
 
   static constexpr std::uint64_t kMaxInputInvocations =
@@ -362,7 +402,7 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
   }
 
   std::mutex parallelMutex_;
-  std::condition_variable parallelDrained_;
+  std::shared_ptr<detail::SingleUseEvent> parallelDrained_;
   std::uint64_t inputInvocations_{};
   bool inputClosed_{};
   std::size_t parallelActive_{};
@@ -400,6 +440,7 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
   mutable std::shared_mutex callersMutex_;
   std::string topologyCode_;
   bool topologyBuilt_{false};
+  ExecutionRuntime executionRuntime_{*this};
   ExecutionRuntime* activeRuntime_{nullptr};
 };
 

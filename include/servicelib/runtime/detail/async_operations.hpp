@@ -1,9 +1,10 @@
 #pragma once
 
-#include <condition_variable>
 #include <cstddef>
 #include <memory>
 #include <mutex>
+
+#include <servicelib/runtime/detail/sync.hpp>
 
 namespace servicelib::detail {
 
@@ -15,7 +16,7 @@ class AsyncOperations final {
  private:
   struct State final {
     std::mutex mutex;
-    std::condition_variable drained;
+    std::shared_ptr<SingleUseEvent> drained;
     std::size_t active{};
     bool accepting{true};
   };
@@ -26,8 +27,12 @@ class AsyncOperations final {
     Token(const Token&) = delete;
     Token& operator=(const Token&) = delete;
     ~Token() {
-      std::lock_guard lock(state_->mutex);
-      if (--state_->active == 0) state_->drained.notify_all();
+      std::shared_ptr<SingleUseEvent> drained;
+      {
+        std::lock_guard lock(state_->mutex);
+        if (--state_->active == 0) drained = std::move(state_->drained);
+      }
+      if (drained) drained->Send();
     }
 
    private:
@@ -51,7 +56,15 @@ class AsyncOperations final {
   void stopAndWait() {
     std::unique_lock lock(state_->mutex);
     state_->accepting = false;
-    state_->drained.wait(lock, [this] { return state_->active == 0; });
+    while (state_->active != 0) {
+      // Allocate only when shutdown actually has work to drain. Wait releases
+      // a cooperative worker, while ordinary callers still wait synchronously.
+      if (!state_->drained) state_->drained = std::make_shared<SingleUseEvent>();
+      auto drained = state_->drained;
+      lock.unlock();
+      drained->Wait();
+      lock.lock();
+    }
   }
 
  private:

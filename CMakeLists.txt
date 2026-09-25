@@ -42,7 +42,7 @@ function(_servicelib_mark_dependency_includes_system target_name)
 endfunction()
 
 foreach(dependency_target
-    Boost::headers Boost::asio Boost::beast Boost::json)
+    Boost::headers Boost::asio Boost::beast Boost::json Boost::context)
   _servicelib_mark_dependency_includes_system("${dependency_target}")
 endforeach()
 
@@ -62,7 +62,7 @@ target_include_directories(cppboostservicelib INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 if(CPPBOOSTSERVICELIB_DEPENDENCY_MODE MATCHES "^(CONAN|SYSTEM)$")
   target_link_libraries(cppboostservicelib INTERFACE
-      Boost::headers Boost::json Threads::Threads
+      Boost::headers Boost::json Boost::context Threads::Threads
       ${CPPBOOSTSERVICELIB_YAML_TARGET})
 else()
   # FETCH/LOCAL targets belong to their own projects and cannot be members of
@@ -77,6 +77,7 @@ else()
       $<BUILD_INTERFACE:Boost::asio>
       $<BUILD_INTERFACE:Boost::beast>
       $<BUILD_INTERFACE:Boost::json>
+      $<BUILD_INTERFACE:Boost::context>
       $<BUILD_INTERFACE:${CPPBOOSTSERVICELIB_YAML_TARGET}>)
 endif()
 target_link_libraries(cppboostservicelib INTERFACE
@@ -277,6 +278,14 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
   add_test(NAME cppboostservicelib_direct_caller_queue_test
       COMMAND cppboostservicelib_direct_caller_queue_test)
   add_executable(cppboostservicelib_substream_test tests/substream_test.cpp)
+  add_executable(cppboostservicelib_cooperative_execution_test
+      tests/cooperative_execution_test.cpp)
+  target_link_libraries(cppboostservicelib_cooperative_execution_test PRIVATE
+      servicelib::servicelib GTest::gtest_main)
+  add_test(NAME cppboostservicelib_cooperative_execution_test
+      COMMAND cppboostservicelib_cooperative_execution_test)
+  set_tests_properties(cppboostservicelib_cooperative_execution_test PROPERTIES
+      TIMEOUT 30)
   target_link_libraries(cppboostservicelib_substream_test PRIVATE
       servicelib::servicelib GTest::gtest_main)
   add_test(NAME cppboostservicelib_substream_test
@@ -420,9 +429,10 @@ if(CPPBOOSTSERVICELIB_BUILD_TESTS)
         COMMAND cppboostservicelib_grpc_runtime_test)
 
     add_executable(cppboostservicelib_grpc_endpoints_test
-        tests/grpc_endpoints_test.cpp)
+        tests/grpc_endpoints_test.cpp
+        tests/grpc_streaming_lifecycle_test.cpp)
     target_link_libraries(cppboostservicelib_grpc_endpoints_test PRIVATE
-        servicelib::grpc GTest::gtest_main)
+        servicelib::grpc cppboostservicelib_test_proto GTest::gtest_main)
     add_test(NAME cppboostservicelib_grpc_endpoints_test
         COMMAND cppboostservicelib_grpc_endpoints_test)
 

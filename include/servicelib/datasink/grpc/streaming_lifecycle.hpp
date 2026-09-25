@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <servicelib/runtime/detail/sync.hpp>
 
@@ -67,8 +69,12 @@ class StreamingActivity final {
   std::shared_ptr<State> state_{std::make_shared<State>()};
 };
 
+template <typename Cell>
+class StreamingRegistry;
+
 template <typename Session>
 struct StreamingCell final {
+  typename StreamingRegistry<StreamingCell<Session>>::Registration registration;
   servicelib::detail::SingleUseEvent ready;
   std::shared_ptr<Session> session;
   std::exception_ptr error;
@@ -92,48 +98,78 @@ struct StreamingCell final {
   }
 };
 
-// Publish before starting RPC. Closing detaches every accepted registration
-// under the mutex; cancellation runs outside it. A racing publisher observes
-// the closed sentinel and cancels
-// its own cell. Weak registrations retain no finished sessions. Nodes, like
-// the previous registration vector, are reclaimed at endpoint shutdown.
+// Publish before starting RPC. Each cell owns its registration so destruction
+// removes the weak entry, including its control block, without waiting for Stop.
+// Closing detaches the entries under the mutex and cancels outside it. The shared
+// state also lets a registration safely outlive its endpoint's registry.
 template <typename Cell>
 class StreamingRegistry final {
-  struct Node final {
-    Node* next{};
-    std::weak_ptr<Cell> cell;
+  struct State final {
+    std::mutex mutex;
+    std::unordered_map<Cell*, std::weak_ptr<Cell>> cells;
+    bool closed{};
   };
  public:
+  class Registration final {
+   public:
+    Registration() = default;
+    Registration(const Registration&) = delete;
+    Registration& operator=(const Registration&) = delete;
+    Registration(Registration&& other) noexcept
+        : state_(std::move(other.state_)), cell_(std::exchange(other.cell_, nullptr)) {}
+    Registration& operator=(Registration&& other) noexcept {
+      if (this != &other) {
+        reset();
+        state_ = std::move(other.state_);
+        cell_ = std::exchange(other.cell_, nullptr);
+      }
+      return *this;
+    }
+    ~Registration() { reset(); }
+
+    void reset() {
+      if (!state_) return;
+      auto state = std::move(state_);
+      std::lock_guard lock(state->mutex);
+      state->cells.erase(std::exchange(cell_, nullptr));
+    }
+
+   private:
+    friend class StreamingRegistry;
+    Registration(std::shared_ptr<State> state, Cell* cell) noexcept
+        : state_(std::move(state)), cell_(cell) {}
+    std::shared_ptr<State> state_;
+    Cell* cell_{};
+  };
+
+  StreamingRegistry() = default;
+  StreamingRegistry(const StreamingRegistry&) = delete;
+  StreamingRegistry& operator=(const StreamingRegistry&) = delete;
   ~StreamingRegistry() { close(); }
-  void add(const std::shared_ptr<Cell>& cell) {
-    auto node = std::make_unique<Node>();
-    node->cell = cell;
+  [[nodiscard]] Registration add(const std::shared_ptr<Cell>& cell) {
     {
-      std::lock_guard lock(mutex_);
-      if (head_ != &closed_) {
-        node->next = head_;
-        head_ = node.release();
-        return;
+      std::lock_guard lock(state_->mutex);
+      if (!state_->closed) {
+        if (!state_->cells.emplace(cell.get(), cell).second)
+          throw std::logic_error("streaming session already registered");
+        return Registration{state_, cell.get()};
       }
     }
     cell->cancel();
+    return {};
   }
   void close() {
-    Node* node;
+    decltype(state_->cells) cells;
     {
-      std::lock_guard lock(mutex_);
-      node = std::exchange(head_, &closed_);
+      std::lock_guard lock(state_->mutex);
+      state_->closed = true;
+      cells.swap(state_->cells);
     }
-    while (node && node != &closed_) {
-      auto* next = node->next;
-      if (auto cell = node->cell.lock()) cell->cancel();
-      delete node;
-      node = next;
+    for (const auto& entry : cells) {
+      if (auto cell = entry.second.lock()) cell->cancel();
     }
   }
  private:
-  Node closed_;
-  std::mutex mutex_;
-  Node* head_{};
+  std::shared_ptr<State> state_{std::make_shared<State>()};
 };
 }  // namespace servicelib::datasink::grpc::detail

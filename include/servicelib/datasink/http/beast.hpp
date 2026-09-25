@@ -19,11 +19,14 @@
 #include <servicelib/runtime/datasink.hpp>
 #include <servicelib/runtime/detail/asio_dispatch.hpp>
 #include <servicelib/runtime/detail/async_operations.hpp>
+#include <servicelib/runtime/detail/sync.hpp>
+#include <servicelib/runtime/detail/cooperative_execution.hpp>
 #include <servicelib/runtime/environment/environment.hpp>
 #include <servicelib/runtime/environment/tracing/tracing.hpp>
 
 #include <chrono>
 #include <exception>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -211,9 +214,20 @@ class BeastEndpoint final : public IEndpoint {
                  connectorConfig(environment_, endpointId_).name,
                  endpointName_) {
     const auto endpoint = endpointConfig();
-    if (endpoint.httpMethodType != api::HTTPMethodType::kGET &&
-        endpoint.httpMethodType != api::HTTPMethodType::kPOST) {
-      throw std::invalid_argument("HTTP sink endpoint method is undefined");
+    switch (endpoint.httpMethodType) {
+      case api::HTTPMethodType::kGET:
+      case api::HTTPMethodType::kPOST:
+      case api::HTTPMethodType::kPUT:
+      case api::HTTPMethodType::kPATCH:
+      case api::HTTPMethodType::kDELETE:
+      case api::HTTPMethodType::kHEAD:
+      case api::HTTPMethodType::kOPTIONS:
+      case api::HTTPMethodType::kTRACE:
+      case api::HTTPMethodType::kCONNECT:
+        break;
+      case api::HTTPMethodType::kUndefined:
+      default:
+        throw std::invalid_argument("HTTP sink endpoint method is undefined");
     }
   }
 
@@ -227,13 +241,7 @@ class BeastEndpoint final : public IEndpoint {
     auto operation = operations_.acquire();
     if (!operation) return;
     auto completion = context.retainCompletionToken();
-    boost::asio::co_spawn(
-        executor_, run(std::move(context), std::move(payload)),
-        [operation = std::move(operation),
-         completion = std::move(completion)](std::exception_ptr) mutable {
-          completion.reset();
-          operation.reset();
-        });
+    run(std::move(context), std::move(payload));
   }
 
   [[nodiscard]] config::HttpEndpointConfig endpointConfig() const {
@@ -244,7 +252,7 @@ class BeastEndpoint final : public IEndpoint {
   }
 
  private:
-  boost::asio::awaitable<void> run(MessageContext context, Payload<T> payload) {
+  void run(MessageContext context, Payload<T> payload) {
     auto startedSpan = startTrace(context);
     std::stop_source externalCancellation;
     context = std::move(context).withExternalCancellation(
@@ -256,7 +264,7 @@ class BeastEndpoint final : public IEndpoint {
       const auto error = std::current_exception();
       traceError(startedSpan.span(), error, "begin_request.error");
       metrics_.beginRequestFailed(tracing::ExceptionMessage(error));
-      co_return;
+      return;
     }
     if (auto* traceSpan = startedSpan.span()) traceSpan->addEvent("begin_request");
     auto begin = std::move(*beginResult);
@@ -290,7 +298,8 @@ class BeastEndpoint final : public IEndpoint {
       std::optional<Response> response;
       try {
         response.emplace(
-            co_await client_.perform(std::move(*request), requestContext));
+            servicelib::detail::CooperativeExecution::Await(
+                executor_, [&] { return client_.perform(std::move(*request), requestContext); }));
         if (auto* traceSpan = 
             startedSpan.span()) traceSpan->addEvent("http_call",
             {tracing::Attribute::Int64("status_code", response->status)});
@@ -471,7 +480,29 @@ class BeastDataSink final {
   }
 
   void stop(Context context) {
-    for (const auto& endpoint : endpoints_) endpoint->stop(context);
+    // Go stops different endpoint IDs concurrently, but each endpoint stops
+    // its registered consumers sequentially in reverse registration order.
+    std::unordered_map<int, std::vector<std::shared_ptr<IEndpoint>>> groups;
+    for (const auto& endpoint : endpoints_) groups[endpoint->id()].push_back(endpoint);
+    std::vector<servicelib::detail::ControlTask<void>> stops;
+    stops.reserve(groups.size());
+    for (auto& group : groups) {
+      stops.emplace_back(
+          [entries = std::move(group.second), context] {
+            for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+              (*it)->stop(context);
+            }
+          });
+    }
+    std::exception_ptr failure;
+    for (auto& stop : stops) {
+      try {
+        stop.get();
+      } catch (...) {
+        if (!failure) failure = std::current_exception();
+      }
+    }
+    if (failure) std::rethrow_exception(failure);
   }
 
  private:

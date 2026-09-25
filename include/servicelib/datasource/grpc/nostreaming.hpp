@@ -72,6 +72,14 @@ class NoStreamingEndpoint final : public Endpoint<Req, Res, T, R, Handler, E> {
   // result traverses the graph.
   boost::asio::awaitable<Res> asyncHandle(MessageContext context,
                                            const Req& value) {
+    co_return co_await servicelib::detail::CooperativeExecution::Run(
+        [this, context = std::move(context), &value]() mutable {
+          return handleCooperative(std::move(context), value);
+        });
+  }
+
+ private:
+  Res handleCooperative(MessageContext context, const Req& value) {
     auto startedSpan = this->startTrace(context);
     std::optional<Res> response;
     servicelib::detail::SingleUseEvent responseReady;
@@ -93,7 +101,8 @@ class NoStreamingEndpoint final : public Endpoint<Req, Res, T, R, Handler, E> {
       this->eof(request);
       if (this->hasResult()) {
         resultWaitFailed = true;
-        co_await responseReady.AsyncWait(request->context);
+        servicelib::detail::CooperativeExecution::Await(
+            [&] { return responseReady.AsyncWait(request->context); });
         if (request->context.cancelled() && !responseReady.IsReady()) {
           throw RpcCancelledError{};
         }
@@ -116,8 +125,10 @@ class NoStreamingEndpoint final : public Endpoint<Req, Res, T, R, Handler, E> {
     if (error && resultWaitFailed) this->recordFailure(request, error);
     this->metrics().requestEnd(startedAt, error);
     if (error) std::rethrow_exception(error);
-    co_return response ? std::move(*response) : Res{};
+    return response ? std::move(*response) : Res{};
   }
+
+ public:
 
   Res handle(::grpc::ServerContext& call, Req&& value) {
     return handle(messageContext(call, this->tracingEnabled()), value);

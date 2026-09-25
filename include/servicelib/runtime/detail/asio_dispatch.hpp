@@ -2,6 +2,7 @@
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/post.hpp>
+#include <servicelib/runtime/detail/cooperative_execution.hpp>
 
 #include <functional>
 #include <mutex>
@@ -34,7 +35,8 @@ class ParallelExecutorRegistry final {
   }
 
   static void Post(std::function<void()> task) {
-    boost::asio::post(Get(), std::move(task));
+    boost::asio::co_spawn(Get(), CooperativeExecution::Run(std::move(task)),
+        [](std::exception_ptr error) { if (error) std::rethrow_exception(error); });
   }
 
  private:

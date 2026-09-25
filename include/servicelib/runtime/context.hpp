@@ -50,10 +50,6 @@ class ContextKey final {
 
 class AsyncCompletionState;
 
-// A service-local invocation owns an independent synchronous dispatch queue.
-// This identity is never a message/transport ID and is not serialized.
-struct LocalExecutionScope {};
-
 // A retained logical call-frame. Asynchronous transport adapters keep one
 // token until their operation has really completed; synchronous consumers do
 // not need to know that the mechanism exists.
@@ -314,22 +310,11 @@ struct ContextState final : ContextStateBase {
   tracing::SpanContext trace;
   std::shared_ptr<AsyncCompletionState> completion;
   std::shared_ptr<const detail::LocalContextValue> localValues;
-  std::shared_ptr<const LocalExecutionScope> executionScope;
 };
 
 class MessageContext final : public Context {
  public:
   MessageContext() : Context(std::make_shared<ContextState>()) {}
-
-  [[nodiscard]] const std::shared_ptr<const LocalExecutionScope>& executionScope() const noexcept {
-    return derived()->executionScope;
-  }
-  [[nodiscard]] MessageContext withExecutionScope(
-      std::shared_ptr<const LocalExecutionScope> scope) && {
-    auto state = takeOrCloneDerived();
-    state->executionScope = std::move(scope);
-    return MessageContext(std::move(state));
-  }
 
   template <typename T>
   [[nodiscard]] MessageContext withLocalValue(
@@ -393,10 +378,12 @@ class MessageContext final : public Context {
   }
 
   [[nodiscard]] MessageContext withoutCompletion() const & {
+    if (!derived()->completion) return *this;
     return withCompletion({});
   }
 
   [[nodiscard]] MessageContext withoutCompletion() && {
+    if (!derived()->completion) return std::move(*this);
     return std::move(*this).withCompletion({});
   }
 

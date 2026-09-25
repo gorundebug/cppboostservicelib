@@ -3,15 +3,17 @@
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
 #include <atomic>
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <ctime>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 
@@ -123,7 +125,40 @@ void CheckSchedulerIsolation() {
           "Multiple gRPC workers must progress independently of busy Asio workers");
 }
 
+asio::awaitable<void> HoldStateUntilShutdown(
+    std::shared_ptr<int> state, std::promise<void>& entered) {
+  asio::steady_timer timer(co_await asio::this_coro::executor);
+  timer.expires_after(1h);
+  entered.set_value();
+  co_await timer.async_wait(asio::use_awaitable);
+  // Keep the state part of the suspended operation, not an unrelated owner.
+  Require(*state == 42, "suspended operation state changed");
+}
+
+void CheckJoinReleasesSuspendedState() {
+  for (const auto workers : {std::size_t{1}, std::size_t{4}}) {
+    servicelib::async::GrpcRuntime runtime({.workers = workers});
+    runtime.Start();
+    auto state = std::make_shared<int>(42);
+    std::weak_ptr<int> retained = state;
+    std::promise<void> entered;
+    auto ready = entered.get_future();
+    runtime.SpawnIo(HoldStateUntilShutdown(std::move(state), entered));
+    const bool started = ready.wait_for(2s) == std::future_status::ready;
+    const bool heldBeforeStop = !retained.expired();
+    runtime.Stop();
+    runtime.Join();
+    Require(started, "shutdown ownership test did not enter its operation");
+    Require(heldBeforeStop, "active operation released its state prematurely");
+    Require(retained.expired(), "Join retained suspended operation state");
+    // A completed shutdown remains safe to repeat, including destruction.
+    runtime.Stop();
+    runtime.Join();
+  }
+}
+
 int main() {
+  CheckJoinReleasesSuspendedState();
   CheckSchedulerIsolation();
   CheckIdleAndWakeup(1);
   CheckIdleAndWakeup(18);
@@ -142,18 +177,24 @@ int main() {
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(1ms);
   }
-  assert(completed.load(std::memory_order_acquire) == 2);
-  assert(runtime.workers() == 2);
-  assert(runtime.state() == servicelib::async::GrpcRuntime::State::kRunning);
+  Require(completed.load(std::memory_order_acquire) == 2,
+          "both runtime spawn methods must complete their operations");
+  Require(runtime.workers() == 2, "runtime worker count changed");
+  Require(runtime.state() == servicelib::async::GrpcRuntime::State::kRunning,
+          "runtime stopped before shutdown was requested");
   const auto registered = metrics.registeredNames();
-  assert(std::find(registered.begin(), registered.end(),
-                   "runtime.active_work") != registered.end());
-  assert(std::find(registered.begin(), registered.end(),
-                   "runtime.event_loop_lag_seconds") != registered.end());
-  assert(std::find(registered.begin(), registered.end(),
-                   "runtime.worker_utilization") != registered.end());
+  Require(std::find(registered.begin(), registered.end(),
+                    "runtime.active_work") != registered.end(),
+          "runtime active-work metric is not registered");
+  Require(std::find(registered.begin(), registered.end(),
+                    "runtime.event_loop_lag_seconds") != registered.end(),
+          "runtime event-loop lag metric is not registered");
+  Require(std::find(registered.begin(), registered.end(),
+                    "runtime.worker_utilization") != registered.end(),
+          "runtime worker utilization metric is not registered");
 
   runtime.Stop();
   runtime.Join();
-  assert(runtime.state() == servicelib::async::GrpcRuntime::State::kStopped);
+  Require(runtime.state() == servicelib::async::GrpcRuntime::State::kStopped,
+          "runtime did not finish shutdown");
 }

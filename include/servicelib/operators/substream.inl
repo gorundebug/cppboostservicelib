@@ -17,7 +17,7 @@ namespace servicelib {
 namespace detail {
 
 template <typename R>
-class SubStreamCall final : public LocalExecutionScope {
+class SubStreamCall final {
  public:
   SubStreamCall(MessageContext context,
                 std::shared_ptr<SubStreamCollector<R>> collector)
@@ -34,7 +34,9 @@ class SubStreamCall final : public LocalExecutionScope {
     if (context_->cancelled()) { close(); return; }
     try {
       if (collector_->out(*context_, value)) {
-        completed_ = !closed_.exchange(true, std::memory_order_acq_rel);
+        // Cancellation stops new deliveries, not an admitted successful callback.
+        completed_ = true;
+        closed_.store(true, std::memory_order_release);
         done_.Send();
       }
     } catch (...) {
@@ -66,7 +68,7 @@ class SubStreamCall final : public LocalExecutionScope {
 
  private:
   std::atomic<bool> closed_{false};
-  std::mutex callbackMutex_;
+  CooperativeMutex callbackMutex_;
   SingleUseEvent done_;
   std::optional<MessageContext> context_;
   std::shared_ptr<SubStreamCollector<R>> collector_;
@@ -128,9 +130,9 @@ class SubStream final : public Stream<T, StreamConsumer<T>, Context>,
 
   void consume(MessageContext context, Payload<T> value,
                std::shared_ptr<SubStreamCollector<R>> collector) override {
+    if (context.cancelled()) throw std::runtime_error("SubStream invocation cancelled");
     if (!collector) throw std::invalid_argument("SubStream collector is required");
     if (!source_ || !this->hasConsumer()) throw std::logic_error("SubStream body or result source is missing");
-    if (context.cancelled()) throw std::runtime_error("SubStream invocation cancelled");
     [[maybe_unused]] auto invocation = this->context().beginInputInvocation();
     auto call = std::make_shared<Call>(context, std::move(collector));
     struct Guard {
@@ -145,7 +147,7 @@ class SubStream final : public Stream<T, StreamConsumer<T>, Context>,
     for (const auto& token : context.externalStopTokens()) {
       if (token.stop_possible()) externalCancellations.push_back(std::make_unique<StopCallback>(token, cancel));
     }
-    auto bodyContext = context.withLocalValue(key_, call).withExecutionScope(call);
+    auto bodyContext = context.withLocalValue(key_, call);
     tracing::ActiveSpan span;
     if (this->getStreamTracer() && tracing::SamplingEnabled(bodyContext)) {
       span = tracing::StartStreamSpan(bodyContext, *this, "stream.substream");
