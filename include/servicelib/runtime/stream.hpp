@@ -12,6 +12,7 @@
 
 #include <functional>
 
+#include <servicelib/runtime/caller.hpp>
 #include <servicelib/runtime/config/stream_types.hpp>
 #include <servicelib/runtime/datasink.hpp>
 #include <servicelib/runtime/detail/storage.hpp>
@@ -74,7 +75,7 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
 
  private:
   unique_ptr<_Cp> consumer_;
-  std::function<void(MessageContext, Payload<_Tp>)> preparedCaller_;
+  Caller<_Tp>* preparedCaller_{nullptr};
   decltype(_Context::getExecutionEnvironment())& context_{
       _Context::getExecutionEnvironment()};
 
@@ -112,11 +113,11 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
   auto& context() noexcept { return context_; }
 
   bool hasPreparedCaller() const noexcept {
-    return static_cast<bool>(preparedCaller_);
+    return preparedCaller_ != nullptr;
   }
 
   void dispatchPrepared(MessageContext context, Payload<_Tp> payload) {
-    preparedCaller_(std::move(context), std::move(payload));
+    preparedCaller_->consume(std::move(context), std::move(payload));
   }
 
   // Topology construction is single-threaded. Resolve the edge once and keep
@@ -127,12 +128,8 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
     if constexpr (requires {
                     context_.template prepareCaller<_Tp>(*this, *consumer_);
                   }) {
-      auto* caller =
-          context_.template prepareCaller<_Tp>(*this, *consumer_);
       preparedCaller_ =
-          [caller](MessageContext context, Payload<_Tp> payload) {
-            caller->consume(std::move(context), std::move(payload));
-          };
+          context_.template prepareCaller<_Tp>(*this, *consumer_);
     }
   }
 
