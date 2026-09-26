@@ -107,29 +107,26 @@ class CaseBase : protected T, public StreamConsumer<_Tp>, public StreamBase {
   }
 
  protected:
-  std::array<std::function<void(MessageContext, Payload<_Tp>)>,
-             std::tuple_size_v<T>>
-      branchDispatchers_{};
-
-  explicit CaseBase(const T& t) : T(t) {
-    // Go CaseStream dispatches directly into the selected WhenStream.  The
-    // WhenStream then uses its own prepared Caller for the When -> consumer
-    // edge.  Keep the same boundary here: Case -> When is routing, not a
-    // separately metered/call-semantics edge.
-    std::apply(
-        [this, index = std::size_t{0}](auto&... consumer) mutable {
-          (([&] {
-             auto* branch = std::addressof(consumer);
-             branchDispatchers_[index++] =
-                 [branch](MessageContext context, Payload<_Tp> payload) {
-                   branch->dispatchPrepared(std::move(context),
-                                            std::move(payload));
-                 };
-           }()),
-           ...);
-        },
-        static_cast<T&>(*this));
+  // Case -> When is routing, not another metered edge. A compile-time
+  // decision tree retains each branch's concrete type without type erasure.
+  template <std::size_t Begin = 0, std::size_t End = std::tuple_size_v<T>>
+  void dispatchBranch(std::size_t index, MessageContext context,
+                      Payload<_Tp> payload) {
+    static_assert(Begin < End);
+    if constexpr (End - Begin == 1) {
+      std::get<Begin>(static_cast<T&>(*this)).dispatchPrepared(
+          std::move(context), std::move(payload));
+    } else {
+      constexpr auto middle = Begin + (End - Begin) / 2;
+      if (index < middle) {
+        dispatchBranch<Begin, middle>(index, std::move(context), std::move(payload));
+      } else {
+        dispatchBranch<middle, End>(index, std::move(context), std::move(payload));
+      }
+    }
   }
+
+  explicit CaseBase(const T& t) : T(t) {}
   ~CaseBase() override = default;
 
   void verifyTopology(StreamVerifyContext& ctx) const override {
@@ -265,18 +262,26 @@ class Case : protected std::array<V, N>, public CaseBase<T> {
   Case(const T& t, unique_ptr<C>... consumers)
       : std::array<V, N>{std::move(consumers)...}, CaseBase<T>(t) {}
 
+  template <typename... C>
+  explicit Case(unique_ptr<C>... consumers)
+      : std::array<V, N>{std::move(consumers)...},
+        CaseBase<T>(detail::make_tuple<unique_ptr, T, N>(
+            *static_cast<std::array<V, N>*>(this))) {
+    static_assert(sizeof...(C) == N);
+  }
+
   ~Case() override = default;
 
-  template <std::size_t I>
-  typename std::tuple_element<I, T>::type& get() const noexcept {
-    return std::get<I>(*static_cast<const CaseBase<T>*>(this));
-  }
+ public:
+  using CaseBase<T>::get;
 };
 
 // CaseImpl<T, SwitchFunction>: dispatches to one branch per value.
 // SwitchFunction: (const _Tp&) -> size_t  (0-based branch index)
 template <typename T, typename SwitchFunction>
 class CaseImpl final : public Case<T> {
+  template <typename, typename>
+  friend class StreamExecutionEnvironment;
   template <typename, typename, typename>
   friend class Stream;
   friend class StreamBuilderContext;
@@ -294,9 +299,7 @@ class CaseImpl final : public Case<T> {
     if (idx >= NBranches) {
       throw StreamException("Case selected a branch index outside its configured branches");
     }
-    if (idx < NBranches && this->branchDispatchers_[idx]) {
-      this->branchDispatchers_[idx](std::move(ctx), std::move(payload));
-    }
+    this->dispatchBranch(idx, std::move(ctx), std::move(payload));
   }
 
  protected:
@@ -313,6 +316,17 @@ class CaseImpl final : public Case<T> {
            serde::StreamSerde<_Tp>* serde, IRuntimeEnvironment* env,
            StreamFunction<SwitchFunction, Ctx>&& f) noexcept
       : Case<T>(), f_(std::move(f), *this) {
+    this->setConfigIdentity(cfg);
+    this->serde_ = serde;
+    this->setEnv(env);
+  }
+
+  template <typename Ctx, typename... C>
+  CaseImpl(const servicelib::config::CaseStreamConfig& cfg,
+           serde::StreamSerde<_Tp>* serde, IRuntimeEnvironment* env,
+           StreamFunction<SwitchFunction, Ctx>&& f,
+           unique_ptr<C>... consumers)
+      : Case<T>(std::move(consumers)...), f_(std::move(f), *this) {
     this->setConfigIdentity(cfg);
     this->serde_ = serde;
     this->setEnv(env);

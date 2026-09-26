@@ -70,6 +70,8 @@
       }
     }
 
+    _Merge& callerTarget() { return consumer(); }
+
     _Merge& consumer() const {
       if constexpr (isMaster) {
         return *consumer_;

@@ -40,12 +40,63 @@
     const std::string& getName() const noexcept override { return StreamBase::getName(); }
 
    protected:
-    struct BranchDispatcher {
-      bool async{false};
-      std::function<void(MessageContext, Payload<_Tp>)> consume;
-    };
+    template <std::size_t I>
+    using BranchConsumer = std::remove_reference_t<decltype(
+        std::declval<std::tuple_element_t<I, T>>().callerTarget())>;
 
-    std::array<BranchDispatcher, std::tuple_size_v<T>> dispatchers_{};
+    template <std::size_t I>
+    using BranchCaller = std::conditional_t<
+        std::is_same_v<BranchConsumer<I>, StreamConsumer<_Tp>>, Caller<_Tp>*,
+        std::optional<Caller<_Tp, BranchConsumer<I>>>>;
+
+    template <std::size_t... I>
+    static auto dispatcherTypes(std::index_sequence<I...>)
+        -> std::tuple<BranchCaller<I>...>;
+
+    using Dispatchers = decltype(dispatcherTypes(
+        std::make_index_sequence<std::tuple_size_v<T>>{}));
+    Dispatchers dispatchers_{};
+    std::array<bool, std::tuple_size_v<T>> asyncBranches_{};
+
+    template <std::size_t I>
+    void prepareBranch() {
+      auto& branch = std::get<I>(static_cast<T&>(*this));
+      auto& consumer = branch.callerTarget();
+      auto& caller = std::get<I>(dispatchers_);
+      auto& environment = _Context::getExecutionEnvironment();
+      if constexpr (std::is_same_v<BranchConsumer<I>, StreamConsumer<_Tp>>) {
+        caller = environment.template prepareCaller<_Tp>(
+            *this, consumer, branch.getName());
+      } else {
+        caller.emplace(environment.template prepareTypedCaller<_Tp>(
+            *this, consumer, branch.getName()));
+      }
+      asyncBranches_[I] = caller->isAsync();
+    }
+
+    template <std::size_t... I>
+    void prepareBranches(std::index_sequence<I...>) {
+      (prepareBranch<I>(), ...);
+    }
+
+    template <std::size_t... I>
+    void dispatchBranches(MessageContext context, Payload<_Tp> payload,
+                          std::index_sequence<I...>) {
+      std::size_t remaining = sizeof...(I);
+      // Two stable passes preserve async-first ordering without sorting away
+      // the branch types or scheduling any extra work.
+      for (const bool async : {true, false}) {
+        (([&] {
+          if (asyncBranches_[I] != async) return;
+          auto& caller = *std::get<I>(dispatchers_);
+          if (--remaining == 0) {
+            caller.consume(std::move(context), std::move(payload));
+          } else {
+            caller.consume(context, payload);
+          }
+        }()), ...);
+      }
+    }
 
     explicit SplitBase(const T& t) : T(t) {}
     ~SplitBase() override = default;
@@ -117,27 +168,7 @@
       // through Stream::consumer_, so buildTopologyCommon() cannot prepare
       // these edges for us. Prepare them while userver still permits metric
       // registration; lazy preparation from the first request is too late.
-      std::apply(
-          [this, index = std::size_t{0}](auto&... consumer) mutable {
-            (([&] {
-               auto* caller = _Context::getExecutionEnvironment()
-                                  .template prepareCaller<_Tp>(
-                                      *this, consumer, consumer.getName());
-               auto& dispatcher = dispatchers_[index++];
-               dispatcher.async = caller->isAsync();
-               dispatcher.consume =
-                   [caller](MessageContext context, Payload<_Tp> payload) {
-                     caller->consume(std::move(context), std::move(payload));
-                   };
-             }()),
-             ...);
-          },
-          static_cast<T&>(*this));
-      std::stable_sort(
-          dispatchers_.begin(), dispatchers_.end(),
-          [](const BranchDispatcher& left, const BranchDispatcher& right) {
-            return left.async && !right.async;
-          });
+      prepareBranches(std::make_index_sequence<std::tuple_size_v<T>>{});
       return next_id;
     }
 
@@ -187,6 +218,13 @@
    protected:
     SplitLink() = default;
     ~SplitLink() override = default;
+
+    auto& callerTarget() {
+      if (!this->consumer()) {
+        throw StreamException("Split branch must not have an empty consumer.");
+      }
+      return Stream::callerConsumer(*this->consumer());
+    }
   };
 
   template <typename _TTp, typename _CCp, typename _Ctx>
@@ -233,12 +271,18 @@
     template <typename... C>
     Split(const T& t, unique_ptr<C>... consumers) : std::array<V, N>{std::move(consumers)...}, SplitBase<T>(t) {}
 
+    template <typename... C>
+    explicit Split(unique_ptr<C>... consumers)
+        : std::array<V, N>{std::move(consumers)...},
+          SplitBase<T>(detail::make_tuple<unique_ptr, T, N>(
+              *static_cast<std::array<V, N>*>(this))) {
+      static_assert(sizeof...(C) == N);
+    }
+
     ~Split() override = default;
 
-    template <std::size_t I>
-    typename std::tuple_element<I, T>::type& get() const noexcept {
-      return std::get<I>(*static_cast<const SplitBase<T>*>(this));
-    }
+   public:
+    using SplitBase<T>::get;
   };
 
   template <typename T>
@@ -255,14 +299,8 @@
       if (this->getStreamTracer() && tracing::SamplingEnabled(ctx)) {
         activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.split");
       }
-      for (std::size_t index = 0; index < this->dispatchers_.size(); ++index) {
-        auto& dispatcher = this->dispatchers_[index];
-        if (index + 1 == this->dispatchers_.size()) {
-          dispatcher.consume(std::move(ctx), std::move(payload));
-        } else {
-          dispatcher.consume(ctx, payload);
-        }
-      }
+      this->dispatchBranches(std::move(ctx), std::move(payload),
+                             std::make_index_sequence<std::tuple_size_v<T>>{});
     }
 
    protected:
@@ -273,6 +311,19 @@
                        serde::StreamSerde<_Tp>* serde,
                        IRuntimeEnvironment* env) noexcept
         : Split<T>() {
+      configure(cfg, serde, env);
+    }
+
+    template <typename... C>
+    SplitImpl(const servicelib::config::SplitStreamConfig& cfg,
+              serde::StreamSerde<_Tp>* serde, IRuntimeEnvironment* env,
+              unique_ptr<C>... consumers)
+        : Split<T>(std::move(consumers)...) {
+      configure(cfg, serde, env);
+    }
+
+    void configure(const servicelib::config::SplitStreamConfig& cfg,
+                   serde::StreamSerde<_Tp>* serde, IRuntimeEnvironment* env) {
       this->setConfigIdentity(cfg);
       this->serde_     = serde;
       this->setEnv(env);

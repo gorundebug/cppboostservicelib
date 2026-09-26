@@ -11,6 +11,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 
 #include <servicelib/runtime/caller.hpp>
 #include <servicelib/runtime/config/stream_types.hpp>
@@ -47,6 +48,11 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
   template <typename _T>
   using unique_ptr = StreamBase::unique_ptr<_T>;
 
+ public:
+  using topology_value_type = _Tp;
+
+  // Named concrete operators are available to compile-time graph builders.
+  // Their construction remains controlled by StreamExecutionEnvironment.
 #include <servicelib/operators/streamlink.inl>
 
 #include <servicelib/operators/case.inl>
@@ -66,6 +72,7 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
 #include <servicelib/operators/sink.inl>
 #include <servicelib/operators/split.inl>
 
+ private:
   template <typename T = _Tp>
   struct is_base_stream_consumer : std::false_type {};
 
@@ -74,8 +81,22 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
       : std::true_type {};
 
  private:
+  // Routing links may own or reference the same logical downstream node.
+  // Resolve that node at graph construction time, retaining its concrete type.
+  template <typename Consumer>
+  static auto& callerConsumer(Consumer& consumer) {
+    if constexpr (requires { consumer.callerTarget(); }) {
+      return consumer.callerTarget();
+    } else {
+      return consumer;
+    }
+  }
+
   unique_ptr<_Cp> consumer_;
-  Caller<_Tp>* preparedCaller_{nullptr};
+  using PreparedCaller = std::conditional_t<
+      std::is_same_v<_Cp, StreamConsumer<_Tp>>, Caller<_Tp>*,
+      std::optional<Caller<_Tp, _Cp>>>;
+  PreparedCaller preparedCaller_{};
   decltype(_Context::getExecutionEnvironment())& context_{
       _Context::getExecutionEnvironment()};
 
@@ -113,7 +134,7 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
   auto& context() noexcept { return context_; }
 
   bool hasPreparedCaller() const noexcept {
-    return preparedCaller_ != nullptr;
+    return static_cast<bool>(preparedCaller_);
   }
 
   void dispatchPrepared(MessageContext context, Payload<_Tp> payload) {
@@ -124,12 +145,17 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
   // a direct dispatcher on the producer; request processing must never look
   // the Caller up in Environment's registry.
   void prepareConsumerCaller() {
-    if (!consumer_) return;
+    if (!consumer_ || StreamBase::getConfigId() == 0) return;
     if constexpr (requires {
                     context_.template prepareCaller<_Tp>(*this, *consumer_);
                   }) {
-      preparedCaller_ =
-          context_.template prepareCaller<_Tp>(*this, *consumer_);
+      if constexpr (std::is_same_v<_Cp, StreamConsumer<_Tp>>) {
+        preparedCaller_ =
+            context_.template prepareCaller<_Tp>(*this, *consumer_);
+      } else {
+        preparedCaller_.emplace(
+            context_.template prepareTypedCaller<_Tp>(*this, *consumer_));
+      }
     }
   }
 
@@ -238,6 +264,15 @@ class Stream : public StreamBase, public virtual StreamConsumer<_Tp> {
   }
 
  public:
+  // Explicit two-phase wiring: construct configured nodes first, then transfer
+  // ownership from the leaves towards the source. No prototype graph is cloned.
+  template <typename Consumer>
+  Consumer& connect(unique_ptr<Consumer> consumer) {
+    static_assert(std::is_convertible_v<Consumer*, _Cp*>);
+    if (!consumer) throw std::invalid_argument("stream consumer must not be null");
+    return setConsumer(std::move(consumer));
+  }
+
   // Go: MakeCaseStream — routes each value to exactly one of N branches via
   // SwitchFunction: (MessageContext, StreamBase&, _Tp&) -> size_t.
   template <size_t N = 2, typename SwitchFunction, typename _FCtx>

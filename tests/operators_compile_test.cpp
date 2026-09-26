@@ -19,6 +19,8 @@
 // Most operators are templates, so compiling the header is the first parity
 // check: an operator that is not reachable from Stream fails this target.
 
+#include "typed_graph_test.hpp"
+
 TEST(Operators, PublicApiHeadersCompileTogether) { SUCCEED(); }
 
 namespace {
@@ -681,6 +683,130 @@ TEST(Operators, MergeDoesNotSerializeIndependentParentCalls) {
   secondCall.join();
   EXPECT_EQ(entered.load(), 2);
   EXPECT_EQ(total.load(), 3);
+}
+
+TEST(Operators, TypedCallerPreservesAllModesAndSharedStatistics) {
+  auto& app = operatorApp();
+  auto owner = inputStream<int>(app, 29100, "typed-owner");
+  std::vector<std::pair<int, std::string>> received;
+  auto& sink = owner->sink(
+      sinkConfig(29101, "typed-sink"), servicelib::StreamType<int>{},
+      servicelib::StreamFunction(
+          [&received](servicelib::MessageContext context, const int& value) {
+            if (value < 0) throw std::runtime_error("consumer failure");
+            received.emplace_back(value, context.streamId());
+          }));
+  using Consumer = std::remove_reference_t<decltype(sink)>;
+  using View = servicelib::Caller<int, Consumer>;
+  static_assert(std::is_copy_constructible_v<View>);
+  static_assert(!std::is_same_v<View, servicelib::Caller<int>>);
+
+  servicelib::DirectCaller<int, Consumer> direct{sink, callerParams()};
+  View typed{direct};
+  const auto copied = typed;
+  servicelib::Caller<int>& erased = direct;
+  typed.consume(servicelib::MessageContext{}.withStreamId("typed"),
+                servicelib::Payload<int>::make(1));
+  copied.consume(servicelib::MessageContext{}.withStreamId("copied"),
+                 servicelib::Payload<int>::make(2));
+  erased.consume(servicelib::MessageContext{}.withStreamId("erased"),
+                 servicelib::Payload<int>::make(3));
+  EXPECT_FALSE(typed.isAsync());
+  EXPECT_EQ(&typed.statistics(), &erased.statistics());
+  EXPECT_EQ(&copied.statistics(), &erased.statistics());
+  EXPECT_EQ(typed.statistics().count(), 3);
+  EXPECT_THROW(typed.consume(servicelib::MessageContext{},
+                            servicelib::Payload<int>::make(-1)),
+               std::runtime_error);
+  EXPECT_EQ(typed.statistics().count(), 4);
+
+  servicelib::DirectCaller<int, Consumer> metadataAsync{
+      sink, callerParams(), true};
+  View asyncView{metadataAsync};
+  asyncView.consume(servicelib::MessageContext{}.withStreamId("metadata"),
+                    servicelib::Payload<int>::make(4));
+  EXPECT_TRUE(asyncView.isAsync());
+  ASSERT_EQ(received.size(), 4);
+
+  ImmediateTaskPool pool;
+  servicelib::testlog::TestLog logger;
+  servicelib::TaskPoolCaller<int, Consumer> task{
+      sink, pool, logger, callerParams()};
+  View taskView{task};
+  taskView.consume(servicelib::MessageContext{}.withStreamId("task"),
+                   servicelib::Payload<int>::make(5));
+  EXPECT_TRUE(taskView.isAsync());
+  EXPECT_EQ(task.statistics().count(), 1);
+  EXPECT_EQ(&taskView.statistics(), &task.statistics());
+
+  ImmediatePriorityPool priorityPool;
+  servicelib::PriorityTaskPoolCaller<int, Consumer> priority{
+      sink, priorityPool, 17, logger, callerParams()};
+  View priorityView{priority};
+  priorityView.consume(servicelib::MessageContext{}.withStreamId("priority"),
+                       servicelib::Payload<int>::make(6));
+  EXPECT_EQ(priorityPool.lastPriority, 17);
+  priorityView.consume(servicelib::MessageContext{}.withStreamId("zero").withPriority(0),
+                       servicelib::Payload<int>::make(7));
+  EXPECT_EQ(priorityPool.lastPriority, 0);
+  EXPECT_TRUE(priorityView.isAsync());
+  EXPECT_EQ(priorityView.statistics().count(), 2);
+
+  // OperatorApp executes parallel callbacks inline: this checks dispatch,
+  // while the existing pool tests cover actual worker scheduling.
+  servicelib::ParallelCaller<int, Consumer> parallel{
+      sink, app, callerParams()};
+  View parallelView{parallel};
+  parallelView.consume(servicelib::MessageContext{}.withStreamId("parallel"),
+                       servicelib::Payload<int>::make(8));
+  EXPECT_TRUE(parallelView.isAsync());
+  EXPECT_EQ(parallelView.statistics().count(), 1);
+  EXPECT_EQ(received, (std::vector<std::pair<int, std::string>>{
+      {1, "typed"}, {2, "copied"}, {3, "erased"}, {4, "metadata"},
+      {5, "task"}, {6, "priority"}, {7, "zero"}, {8, "parallel"}}));
+
+  servicelib::DirectCaller<int> legacy{sink, callerParams()};
+  EXPECT_THROW((View{legacy}), std::logic_error);
+}
+
+TEST(Operators, TypedCallerFactoryIsOptInAndRegistrySharesTheEdge) {
+  auto& app = operatorApp();
+  auto owner = inputStream<int>(app, 29200, "typed-factory-owner");
+  int total = 0;
+  auto& sink = owner->sink(
+      sinkConfig(29201, "typed-factory-sink"), servicelib::StreamType<int>{},
+      servicelib::StreamFunction(
+          [&total](servicelib::MessageContext, const int& value) { total += value; }));
+  using Consumer = std::remove_reference_t<decltype(sink)>;
+  using Producer = std::remove_reference_t<decltype(*owner)>;
+  using View = servicelib::Caller<int, Consumer>;
+
+  auto legacy = servicelib::makeCallerFromEnv<int>(
+      *owner, sink, nullptr, {29200, 29201});
+  EXPECT_NE(dynamic_cast<servicelib::DirectCaller<int>*>(legacy.get()), nullptr);
+  EXPECT_THROW((View{*legacy}), std::logic_error);
+  auto concrete = servicelib::makeCallerFromEnv<int, Producer, Consumer>(
+      *owner, sink, nullptr, {29200, 29201});
+  View concreteView{*concrete};
+  concreteView.consume(servicelib::MessageContext{}, servicelib::Payload<int>::make(1));
+  EXPECT_EQ(concrete->statistics().count(), 1);
+
+  auto source = inputStream<int>(app, 29202, "typed-registry-source");
+  auto typed = app.prepareTypedCaller<int>(*source, sink);
+  auto again = app.prepareTypedCaller<int>(*source, sink);
+  auto* erased = app.prepareCaller<int>(*source, sink);
+  EXPECT_EQ(&typed.statistics(), &erased->statistics());
+  EXPECT_EQ(&again.statistics(), &erased->statistics());
+  typed.consume(servicelib::MessageContext{}, servicelib::Payload<int>::make(2));
+  erased->consume(servicelib::MessageContext{}, servicelib::Payload<int>::make(3));
+  EXPECT_EQ(again.statistics().count(), 2);
+  EXPECT_EQ(total, 6);
+
+  auto erasedSource = inputStream<int>(app, 29203, "erased-registry-source");
+  auto* old = app.prepareCaller<int>(*erasedSource, sink);
+  EXPECT_THROW(app.prepareTypedCaller<int>(*erasedSource, sink), std::logic_error);
+  EXPECT_EQ(app.prepareCaller<int>(*erasedSource, sink), old);
+  EXPECT_EQ(old->statistics().count(), 0);
 }
 
 TEST(Operators, CallerSemanticsDispatchPreserveContextPriorityAndStatistics) {

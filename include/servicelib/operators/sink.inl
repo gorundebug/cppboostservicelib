@@ -116,7 +116,11 @@ class Sink final : public StreamConsumer<_Tp>,
 
   template <typename Ctx>
   static auto build(Sink& stream, StreamFunction<SinkFunction, Ctx>&& f) {
-    auto result = make(std::move(f));
+    servicelib::config::SinkStreamConfig cfg;
+    cfg.id = static_cast<int>(stream.getConfigId());
+    cfg.name = stream.getName();
+    cfg.idEndpoint = stream.endpointId_;
+    auto result = make(cfg, stream.getSerde(), stream.getEnv(), std::move(f));
     result->copySettings(stream);
     result->copyConsumerSettings(stream);
     result->endpointId_ = stream.endpointId_;

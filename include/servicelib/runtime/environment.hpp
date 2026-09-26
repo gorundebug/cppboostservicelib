@@ -162,6 +162,15 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
     }
   }
 
+  // Configured construction without connecting or registering a temporary edge.
+  // The concrete Operator determines dispatch at compile time. Existing fluent
+  // factories remain unchanged; generated typed graphs can use this entry point.
+  template <typename Operator, typename... Args>
+  auto makeStream(Args&&... args) {
+    return typename StreamBase::template unique_ptr<Operator>(
+        new Operator(std::forward<Args>(args)...));
+  }
+
   void registerStream(std::shared_ptr<StreamBase> stream) override {
     if (!stream) {
       throw std::invalid_argument("registered stream must not be null");
@@ -172,7 +181,9 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
     streams_.push_back(std::move(stream));
   }
 
-  template <typename Value, typename Producer, typename Consumer>
+  // StoredConsumer is erased by default; only prepareTypedCaller opts in.
+  template <typename Value, typename Producer, typename Consumer,
+            typename StoredConsumer = StreamConsumer<Value>>
   Caller<Value>* prepareCaller(Producer& producer, Consumer& consumer,
                                std::string sourceNameOverride = {}) {
     const config::LinkID link{
@@ -195,10 +206,22 @@ class StreamExecutionEnvironment : public NotCopyableOrMovable,
     std::unique_lock lock(callersMutex_);
     if (!callers_.contains(link)) {
       callers_.emplace(link,
-                       makeCallerFromEnv<Value>(producer, consumer, this, link,
+                       makeCallerFromEnv<Value, Producer, StoredConsumer>(producer, consumer, this, link,
                                                 std::move(sourceNameOverride)));
     }
     return static_cast<Caller<Value>*>(callers_.at(link).get());
+  }
+
+  // Build typed edges before using their erased entry points. Both views
+  // share one registry entry, scheduling policy and set of counters.
+  template <typename Value, typename Producer, typename Consumer>
+    requires (!std::is_same_v<Consumer, StreamConsumer<Value>>)
+  Caller<Value, Consumer> prepareTypedCaller(
+      Producer& producer, Consumer& consumer,
+      std::string sourceNameOverride = {}) {
+    auto* caller = prepareCaller<Value, Producer, Consumer, Consumer>(
+        producer, consumer, std::move(sourceNameOverride));
+    return Caller<Value, Consumer>(*caller);
   }
 
   template <typename Value, typename Producer, typename Consumer>

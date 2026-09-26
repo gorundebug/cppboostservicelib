@@ -11,7 +11,7 @@
 
     StreamConsumer<_Tp>* consumer_;
     decltype(_Context::getExecutionEnvironment())& context_{_Context::getExecutionEnvironment()};
-    std::function<void(MessageContext, Payload<_Tp>)> preparedCaller_;
+    Caller<_Tp>* preparedCaller_{nullptr};
 
    public:
     void consume(MessageContext ctx, Payload<_Tp> payload) override {
@@ -20,7 +20,7 @@
         activeSpan = tracing::StartStreamSpan(ctx, *this, "stream.link");
       }
       if (this->hasConsumer()) {
-        preparedCaller_(ctx, std::move(payload));
+        preparedCaller_->consume(std::move(ctx), std::move(payload));
       }
     }
 
@@ -56,12 +56,8 @@
       os << "auto &stream" << id << "r = *stream" << id << "c;" << std::endl;
       os << "stream" << id << "r.setId(" << id << ");" << std::endl;
       ctx.addLink(id, consumer_->getBase());
-      auto* caller =
-          context_.template prepareCaller<_Tp>(*this, *consumer_);
       preparedCaller_ =
-          [caller](MessageContext context, Payload<_Tp> payload) {
-            caller->consume(std::move(context), std::move(payload));
-          };
+          context_.template prepareCaller<_Tp>(*this, *consumer_);
       return id + 1;
     }
 

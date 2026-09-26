@@ -19,6 +19,9 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include <servicelib/runtime/config/config.hpp>
@@ -164,8 +167,11 @@ class CallerBase {
 // Caller<T> — typed virtual interface
 // Go analog: Caller[T] interface = Consumer[T] + IsAsync()
 // ──────────────────────────────────────────────────────────────
+template <typename T, typename Consumer = StreamConsumer<T>>
+class Caller;
+
 template <typename T>
-class Caller : public CallerBase {
+class Caller<T, StreamConsumer<T>> : public CallerBase {
  public:
   using CallerBase::CallerBase;
   virtual void consume(MessageContext ctx, Payload<T> payload) = 0;
@@ -175,10 +181,10 @@ class Caller : public CallerBase {
 // DirectCaller<T> — synchronous dispatch, no thread/pool
 // Go analog: directCaller[T]
 // ──────────────────────────────────────────────────────────────
-template <typename T>
+template <typename T, typename Consumer = StreamConsumer<T>>
 class DirectCaller final : public Caller<T> {
  public:
-  DirectCaller(StreamConsumer<T>& consumer, CallerBase::Params params,
+  DirectCaller(Consumer& consumer, CallerBase::Params params,
                bool async = false)
       : Caller<T>(std::move(params)), consumer_(consumer), async_(async) {}
 
@@ -194,7 +200,7 @@ class DirectCaller final : public Caller<T> {
   bool isAsync() const noexcept override { return async_; }
 
  private:
-  StreamConsumer<T>& consumer_;
+  Consumer& consumer_;
   bool async_{};
 };
 
@@ -202,10 +208,10 @@ class DirectCaller final : public Caller<T> {
 // TaskPoolCaller<T> — dispatch via ITaskPool (async, ordered by pool)
 // Go analog: taskPoolCaller[T]
 // ──────────────────────────────────────────────────────────────
-template <typename T>
+template <typename T, typename Consumer = StreamConsumer<T>>
 class TaskPoolCaller final : public Caller<T> {
  public:
-  TaskPoolCaller(StreamConsumer<T>& consumer, pool::ITaskPool& pool,
+  TaskPoolCaller(Consumer& consumer, pool::ITaskPool& pool,
                  log::Logger& logger, CallerBase::Params params)
       : Caller<T>(std::move(params)),
         consumer_(consumer),
@@ -241,7 +247,7 @@ class TaskPoolCaller final : public Caller<T> {
   bool isAsync() const noexcept override { return true; }
 
  private:
-  StreamConsumer<T>& consumer_;
+  Consumer& consumer_;
   pool::ITaskPool& pool_;
   log::Logger& logger_;
 };
@@ -252,10 +258,10 @@ class TaskPoolCaller final : public Caller<T> {
 // otherwise it falls back to the configured default.
 // Go analog: priorityTaskPoolCaller[T]
 // ──────────────────────────────────────────────────────────────
-template <typename T>
+template <typename T, typename Consumer = StreamConsumer<T>>
 class PriorityTaskPoolCaller final : public Caller<T> {
  public:
-  PriorityTaskPoolCaller(StreamConsumer<T>& consumer,
+  PriorityTaskPoolCaller(Consumer& consumer,
                          pool::IPriorityTaskPool& pool, int priority,
                          log::Logger& logger, CallerBase::Params params)
       : Caller<T>(std::move(params)),
@@ -296,7 +302,7 @@ class PriorityTaskPoolCaller final : public Caller<T> {
   bool isAsync() const noexcept override { return true; }
 
  private:
-  StreamConsumer<T>& consumer_;
+  Consumer& consumer_;
   pool::IPriorityTaskPool& pool_;
   int priority_;
   log::Logger& logger_;
@@ -306,10 +312,10 @@ class PriorityTaskPoolCaller final : public Caller<T> {
 // ParallelCaller<T> — post one service-lifetime-tracked Asio task per message
 // Go analog: parallelCaller[T] (goroutine per message)
 // ──────────────────────────────────────────────────────────────
-template <typename T>
+template <typename T, typename Consumer = StreamConsumer<T>>
 class ParallelCaller final : public Caller<T> {
  public:
-  ParallelCaller(StreamConsumer<T>& consumer, IRuntimeEnvironment& environment,
+  ParallelCaller(Consumer& consumer, IRuntimeEnvironment& environment,
                  CallerBase::Params params)
       : Caller<T>(std::move(params)),
         consumer_(consumer),
@@ -335,7 +341,7 @@ class ParallelCaller final : public Caller<T> {
   bool isAsync() const noexcept override { return true; }
 
  private:
-  StreamConsumer<T>& consumer_;
+  Consumer& consumer_;
   IRuntimeEnvironment& environment_;
 };
 
@@ -344,9 +350,70 @@ class ParallelCaller final : public Caller<T> {
 // from RuntimeConfig link settings (or service default), and wiring up
 // metrics/tracing for the edge. Go analog: MakeCaller[T]
 // ──────────────────────────────────────────────────────────────
-template <typename T, typename Producer>
+// Non-owning typed view of a registered edge. The environment still owns the
+// implementation and its telemetry. Copying this view never creates a second
+// edge; it must not outlive the environment's callers or the consumer.
+template <typename T, typename Consumer>
+class Caller final {
+  static_assert(std::is_base_of_v<StreamConsumer<T>, Consumer>);
+
+  using Dispatch = std::variant<
+      DirectCaller<T, Consumer>*, TaskPoolCaller<T, Consumer>*,
+      PriorityTaskPoolCaller<T, Consumer>*, ParallelCaller<T, Consumer>*>;
+
+ public:
+  explicit Caller(Caller<T>& caller) : dispatch_(resolve(caller)) {}
+
+  void consume(MessageContext context, Payload<T> payload) const {
+    std::visit(
+        [&](auto* caller) {
+          caller->consume(std::move(context), std::move(payload));
+        },
+        dispatch_);
+  }
+
+  bool isAsync() const noexcept {
+    return std::visit(
+        [](auto* caller) { return caller->isAsync(); }, dispatch_);
+  }
+
+  ConsumeStatistics& statistics() const noexcept {
+    return std::visit(
+        [](auto* caller) -> ConsumeStatistics& {
+          return caller->statistics();
+        },
+        dispatch_);
+  }
+
+ private:
+  // Resolve once while building the graph, never on the message path. An edge
+  // first registered with an erased consumer cannot become statically typed
+  // without rebuilding it; reject that mismatch rather than duplicating it.
+  static Dispatch resolve(Caller<T>& caller) {
+    if (auto* value = dynamic_cast<DirectCaller<T, Consumer>*>(&caller)) {
+      return value;
+    }
+    if (auto* value = dynamic_cast<TaskPoolCaller<T, Consumer>*>(&caller)) {
+      return value;
+    }
+    if (auto* value =
+            dynamic_cast<PriorityTaskPoolCaller<T, Consumer>*>(&caller)) {
+      return value;
+    }
+    if (auto* value = dynamic_cast<ParallelCaller<T, Consumer>*>(&caller)) {
+      return value;
+    }
+    throw std::logic_error("stream link was prepared with a different consumer type");
+  }
+
+  Dispatch dispatch_;
+};
+
+// Preserve erased dispatch by default. A concrete Consumer is an explicit
+// opt-in, so existing factory calls retain their previous instantiations.
+template <typename T, typename Producer, typename Consumer = StreamConsumer<T>>
 std::unique_ptr<Caller<T>> makeCallerFromEnv(
-    Producer& producer, StreamConsumer<T>& consumer, IRuntimeEnvironment* env,
+    Producer& producer, std::type_identity_t<Consumer>& consumer, IRuntimeEnvironment* env,
     config::LinkID link, std::string sourceNameOverride = {}) {
   const config::CallSemanticsGroup* semantics = nullptr;
   const config::ServiceConfig* serviceConfig = nullptr;
@@ -412,7 +479,7 @@ std::unique_ptr<Caller<T>> makeCallerFromEnv(
 
   if (!semantics || semantics->functionCall.has_value()) {
     const bool async = semantics && semantics->functionCall->async;
-    return std::make_unique<DirectCaller<T>>(consumer, std::move(params),
+    return std::make_unique<DirectCaller<T, Consumer>>(consumer, std::move(params),
                                              async);
   }
 
@@ -422,7 +489,7 @@ std::unique_ptr<Caller<T>> makeCallerFromEnv(
       throw std::runtime_error("task pool not found: " +
                                semantics->taskPool->poolName);
     }
-    return std::make_unique<TaskPoolCaller<T>>(consumer, *p, env->getLogger(),
+    return std::make_unique<TaskPoolCaller<T, Consumer>>(consumer, *p, env->getLogger(),
                                                std::move(params));
   }
 
@@ -432,13 +499,13 @@ std::unique_ptr<Caller<T>> makeCallerFromEnv(
       throw std::runtime_error("priority task pool not found: " +
                                semantics->priorityTaskPool->poolName);
     }
-    return std::make_unique<PriorityTaskPoolCaller<T>>(
+    return std::make_unique<PriorityTaskPoolCaller<T, Consumer>>(
         consumer, *p, semantics->priorityTaskPool->priority, env->getLogger(),
         std::move(params));
   }
 
   if (semantics->parallelCall.has_value()) {
-    return std::make_unique<ParallelCaller<T>>(consumer, *env,
+    return std::make_unique<ParallelCaller<T, Consumer>>(consumer, *env,
                                                 std::move(params));
   }
 
