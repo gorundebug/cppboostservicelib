@@ -43,6 +43,161 @@
 
 namespace {
 
+TEST(HttpTypes, NativeHeadersOwnStorageWithoutCopyingHeaderStrings) {
+  servicelib::http::Headers headers;
+  const char* originalValue{};
+  const std::string payload(256, 'v');
+  {
+    boost::beast::http::fields fields;
+    fields.insert("X-Owned", payload);
+    originalValue = fields.begin()->value().data();
+    headers = servicelib::http::Headers::FromBeast(std::move(fields));
+  }
+  const auto value = servicelib::http::Header(headers, "x-OWNED");
+  ASSERT_TRUE(value);
+  EXPECT_EQ(value->data(), originalValue);
+  EXPECT_EQ(*value, payload);
+  EXPECT_FALSE(headers.contains("missing"));
+}
+
+TEST(HttpTypes, NativeHeadersPreserveDuplicateAndMapSemantics) {
+  boost::beast::http::fields fields;
+  fields.insert("X-Duplicate", "first");
+  fields.insert("x-duplicate", "last");
+  fields.insert("A-First", "sorted");
+  auto headers = servicelib::http::Headers::FromBeast(std::move(fields));
+  ASSERT_TRUE(headers.lookup("X-DUPLICATE"));
+  EXPECT_EQ(*headers.lookup("X-DUPLICATE"), "last");
+  const auto& readonly = std::as_const(headers);
+  EXPECT_EQ(readonly.size(), 2);
+  EXPECT_EQ(readonly.begin()->first, "A-First");
+  EXPECT_EQ(readonly.find("x-duplicate")->first, "X-Duplicate");
+  EXPECT_EQ(readonly.at("x-duplicate"), "last");
+  headers["X-Duplicate"] = "changed";
+  EXPECT_EQ(*headers.lookup("x-duplicate"), "changed");
+  EXPECT_EQ(headers.erase("x-duplicate"), 1);
+  EXPECT_FALSE(headers.lookup("x-duplicate"));
+}
+
+TEST(HttpTypes, NativeHeaderKeysSurviveEveryMutableLookup) {
+  const std::string name = "x-" + std::string(256, 'k');
+  for (int operation = 0; operation < 8; ++operation) {
+    SCOPED_TRACE(operation);
+    boost::beast::http::fields fields;
+    fields.insert(name, name);
+    auto headers = servicelib::http::Headers::FromBeast(std::move(fields));
+    const auto key = headers.lookup(name);
+    ASSERT_TRUE(key);
+    switch (operation) {
+      case 0: {
+        const auto found = headers.find(*key);
+        ASSERT_NE(found, headers.end());
+        EXPECT_EQ(found->second, name);
+        break;
+      }
+      case 1: {
+        const auto found = headers.lower_bound(*key);
+        ASSERT_NE(found, headers.end());
+        EXPECT_EQ(found->second, name);
+        break;
+      }
+      case 2: {
+        EXPECT_EQ(headers.upper_bound(*key), headers.end());
+        break;
+      }
+      case 3: {
+        const auto range = headers.equal_range(*key);
+        ASSERT_NE(range.first, range.second);
+        EXPECT_EQ(range.first->second, name);
+        break;
+      }
+      case 4: {
+        EXPECT_EQ(headers.erase(*key), 1);
+        EXPECT_TRUE(headers.empty());
+        break;
+      }
+      case 5: {
+        const auto& cachedKey = std::as_const(headers).at(name);
+        EXPECT_EQ(headers.at(cachedKey), name);
+        break;
+      }
+      case 6: {
+        const auto& cachedKey = std::as_const(headers).at(name);
+        headers[cachedKey] = "changed";
+        EXPECT_EQ(*headers.lookup(name), "changed");
+        break;
+      }
+      case 7: {
+        const auto& cachedKey = std::as_const(headers).at(name);
+        headers.insert_or_assign(cachedKey, "changed");
+        EXPECT_EQ(*headers.lookup(name), "changed");
+        break;
+      }
+    }
+    // Materialization and writes must not free the native storage whose
+    // views were passed into the operation.
+    EXPECT_EQ(*key, name);
+  }
+}
+
+TEST(HttpTypes, NativeHeadersCopiesDetachAndOutliveOriginalRequest) {
+  const auto delayed = [] {
+    servicelib::http::Request request;
+    boost::beast::http::fields fields;
+    fields.insert("X-Owned", std::string(256, 'v'));
+    request.headers = servicelib::http::Headers::FromBeast(std::move(fields));
+    auto copy = request;
+    request.headers["X-Owned"] = "changed";
+    EXPECT_EQ(*copy.headers.lookup("X-Owned"), std::string(256, 'v'));
+    request.headers.clear();
+    return [copy = std::move(copy)] {
+      return std::string(*copy.headers.lookup("X-Owned"));
+    };
+  }();
+  EXPECT_EQ(delayed(), std::string(256, 'v'));
+}
+
+TEST(HttpTypes, NativeHeadersMoveSwapAndClearPreserveActiveStorage) {
+  boost::beast::http::fields fields;
+  fields.insert("X-Owned", "original");
+  auto headers = servicelib::http::Headers::FromBeast(std::move(fields));
+  headers["X-Owned"] = "changed";
+  auto copy = headers;
+  headers["X-Owned"] = "changed-again";
+  EXPECT_EQ(*copy.lookup("X-Owned"), "changed");
+  auto moved = std::move(headers);
+  servicelib::http::Headers other{{"X-Other", "other"}};
+  moved.swap(other);
+  EXPECT_EQ(*other.lookup("X-Owned"), "changed-again");
+  EXPECT_EQ(*moved.lookup("X-Other"), "other");
+  other.clear();
+  EXPECT_TRUE(other.empty());
+  EXPECT_FALSE(other.lookup("X-Owned"));
+  other["X-New"] = "new";
+  EXPECT_EQ(*other.lookup("X-New"), "new");
+}
+
+TEST(HttpTypes, NativeHeadersSupportConcurrentConstReadsAndMaterialization) {
+  boost::beast::http::fields fields;
+  fields.insert("X-Owned", std::string(256, 'v'));
+  const auto headers = servicelib::http::Headers::FromBeast(std::move(fields));
+  std::atomic<bool> valid{true};
+  std::vector<std::jthread> readers;
+  for (int index = 0; index < 8; ++index) {
+    readers.emplace_back([&] {
+      for (int attempt = 0; attempt < 100; ++attempt) {
+        const auto value = headers.lookup("x-owned");
+        if (!value || *value != std::string(256, 'v') ||
+            headers.at("X-Owned") != *value || headers.size() != 1) {
+          valid.store(false);
+        }
+      }
+    });
+  }
+  readers.clear();
+  EXPECT_TRUE(valid.load());
+}
+
 TEST(HttpTypes, GeneratedStreamIdsPreserveHexFormatAndUniqueness) {
   std::unordered_set<std::string> ids;
   for (std::size_t index = 0; index < 4096; ++index) {

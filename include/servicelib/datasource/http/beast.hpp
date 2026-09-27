@@ -257,10 +257,9 @@ class Server final {
         request.path = request.target.substr(0, request.target.find('?'));
         request.body = std::move(message.body());
         request.keepAlive = message.keep_alive();
-        for (const auto& field : message.base())
-          request.headers[std::string(field.name_string())] =
-              std::string(field.value());
         const auto version = message.version();
+        const bool requestKeepAlive = request.keepAlive;
+        request.headers = Headers::FromBeast(std::move(message.base()));
         auto context = ContextFromHeaders(request.headers,
                                           options_.tracingEnabled);
         std::shared_ptr<RequestCancellation> requestCancellation;
@@ -291,7 +290,7 @@ class Server final {
           requestCancellation->observer.emit(
               boost::asio::cancellation_type::all);
         }
-        const bool keepAlive = response.keepAlive && message.keep_alive();
+        const bool keepAlive = response.keepAlive && requestKeepAlive;
         if (!(co_await Write(std::move(response), version, keepAlive))) break;
         requestInProgress_ = false;
         if (shuttingDown_) break;
@@ -1071,7 +1070,7 @@ class BeastDataSource final {
       const auto config = endpoint->endpointConfig();
       const std::string method =
           config.httpMethodType == api::HTTPMethodType::kGET ? "GET" : "POST";
-      router.Add(method, config.path,
+      router.AddShared(method, config.path,
                  [endpoint](servicelib::http::Request request,
                             MessageContext context) {
                    return endpoint->handle(std::move(request),

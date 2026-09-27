@@ -27,7 +27,14 @@ class Router final {
     AddRoute(std::move(method), std::move(path), std::move(handler), true);
   }
 
+  // The caller explicitly opts into reusing the handler object concurrently.
+  // Add() retains per-request copies for closures with mutable local state.
+  void AddShared(std::string method, std::string path, Handler handler) {
+    AddRoute(std::move(method), std::move(path), std::move(handler), true, true);
+  }
+
   void AddSync(std::string method, std::string path, SyncHandler handler) {
+
     if (!handler) throw std::invalid_argument("HTTP handler is required");
     AddRoute(
         std::move(method), std::move(path),
@@ -67,15 +74,23 @@ class Router final {
 
   [[nodiscard]] boost::asio::awaitable<Response> Dispatch(
       Request request, MessageContext context) const {
-    Route route;
+    Route routeCopy;
+    const Route* route{};
     bool pathExists{};
-    const auto lookup = [&] {
+    const auto lookup = [&](bool immutable) {
       const auto methodIt = routes_.find(request.method);
       if (methodIt != routes_.end()) {
         const auto routeIt = methodIt->second.find(request.path);
-        if (routeIt != methodIt->second.end()) route = routeIt->second;
+        if (routeIt != methodIt->second.end()) {
+          if (immutable && routeIt->second.sharedHandler) {
+            route = &routeIt->second;
+          } else {
+            routeCopy = routeIt->second;
+            route = &routeCopy;
+          }
+        }
       }
-      if (!route.handler) {
+      if (!route) {
         for (const auto& [unusedMethod, methodRoutes] : routes_) {
           if (methodRoutes.contains(request.path)) {
             pathExists = true;
@@ -85,26 +100,27 @@ class Router final {
       }
     };
     if (frozen_.load(std::memory_order_acquire)) {
-      lookup();
+      lookup(true);
     } else {
       std::lock_guard lock(mutex_);
-      lookup();
+      lookup(false);
     }
-    if (!route.handler)
+    if (!route)
       co_return Response{pathExists ? 405 : 404, {},
                          pathExists ? "method not allowed\n" : "not found\n",
                          "text/plain; charset=utf-8", request.keepAlive};
-    co_return co_await route.handler(std::move(request), std::move(context));
+    co_return co_await route->handler(std::move(request), std::move(context));
   }
 
  private:
   struct Route final {
     Handler handler;
     bool observeDisconnect{};
+    bool sharedHandler{};
   };
 
   void AddRoute(std::string method, std::string path, Handler handler,
-                bool observeDisconnect) {
+                bool observeDisconnect, bool sharedHandler = false) {
     if (method.empty() || path.empty() || !handler)
       throw std::invalid_argument("HTTP route method, path and handler are required");
     if (path.front() != '/') path.insert(path.begin(), '/');
@@ -114,7 +130,7 @@ class Router final {
     }
     auto& methodRoutes = routes_[method];
     if (!methodRoutes
-             .emplace(path, Route{std::move(handler), observeDisconnect})
+             .emplace(path, Route{std::move(handler), observeDisconnect, sharedHandler})
              .second) {
       throw std::invalid_argument("duplicate HTTP route: " + method + " " +
                                   path);
